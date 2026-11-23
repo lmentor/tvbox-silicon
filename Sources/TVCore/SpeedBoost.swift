@@ -65,16 +65,22 @@ extension SpeedBoost {
 
         public var limited: Bool { rate < wanted }
 
-        /// `ahead`: seconds of video buffered past the playhead; `waiting`: playback stopped to buffer.
-        public mutating func update(ahead: Double, waiting: Bool) {
+        /// A full network/disk buffer does not imply the decoder can keep up.
+        /// `videoLag` uses the actual clock-to-picture difference, with the
+        /// configured A/V delay removed; absent picture evidence stays nil.
+        public mutating func update(ahead: Double, waiting: Bool, videoLag: Double? = nil) {
             guard wanted > 1, ahead.isFinite else { return }
             let steps = SpeedBoost.rates.filter { $0 >= 1 && $0 <= wanted }
             guard let index = steps.firstIndex(of: rate) else { return }
-            if waiting || ahead / rate < Self.low {
+            let lag = videoLag.flatMap { $0.isFinite ? max(0, $0) : nil } ?? 0
+            if waiting || ahead / rate < Self.low || lag >= 0.5 {
                 if index > 0 { rate = steps[index - 1] }
                 mark = nil
                 return
             }
+            // Hysteresis prevents a full cache increasing speed again before
+            // the video catches up after a resource-heavy held-speed interval.
+            if lag > 0.15 { mark = nil; samples = 0; return }
             guard let start = mark else { mark = ahead; samples = 0; return }
             samples += 1
             guard samples >= Self.settle else { return }

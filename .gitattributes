@@ -12,3 +12,6 @@
 *.jpg binary
 *.webp binary
 *.pdf binary
+
+# Preserve the upstream license bytes used by SOURCE-MANIFEST.json.
+Vendor/NativeASR/licenses/cargs-LICENSE.txt -text whitespace=cr-at-eol

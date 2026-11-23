@@ -49,15 +49,22 @@ public struct LocalHTMLHomeStore: Codable, Equatable, Sendable {
     /// always means built-in; only Last HTML restores the previous HTML source.
     public mutating func restoreStartup(_ destination: LocalHomeDestination, directory: URL = Self.directory) {
         activeID = "builtin"
-        guard destination == .lastHTML, let source = sources.first(where: { $0.id == lastHTMLID }) else { return }
+        guard destination == .lastHTML, let id = lastHTMLID, canOpen(id, directory: directory) else { return }
+        activeID = id
+    }
+    /// A shortcut must not open a missing/corrupt managed file just because its
+    /// library entry survived. Remote reachability is left to WebKit; this check
+    /// validates only local data and never waits for a network request.
+    public func canOpen(_ id: String, directory: URL = Self.directory) -> Bool {
+        guard let source = sources.first(where: { $0.id == id }) else { return false }
         if source.isFile {
-            guard (try? html(for: source, directory: directory)) != nil else { return }
+            return (try? html(for: source, directory: directory)) != nil
         } else {
             guard let address = source.address, let url = URL(string: address),
                   ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-                  let host = url.host, !host.isEmpty, url.user == nil, url.password == nil else { return }
+                  let host = url.host, !host.isEmpty, url.user == nil, url.password == nil else { return false }
+            return true
         }
-        activeID = source.id
     }
     public mutating func addRemote(name: String, address: String) throws {
         let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -79,8 +86,17 @@ public struct LocalHTMLHomeStore: Codable, Equatable, Sendable {
     public mutating func remove(_ id: String, directory: URL = Self.directory, defaults: UserDefaults = .standard) throws {
         guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
         if let filename = sources[index].filename {
-            let file = try Self.managedFile(filename, directory: directory)
-            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            let files = [try Self.managedFile(filename, directory: directory),
+                         try Self.executionFile(filename, directory: directory)]
+            var existing: [URL] = []
+            for file in files {
+                if let attributes = try? FileManager.default.attributesOfItem(atPath: file.path) {
+                    guard let type = attributes[.type] as? FileAttributeType,
+                          type == .typeRegular || type == .typeSymbolicLink else { throw HTMLHomeError.invalidFile }
+                    existing.append(file)
+                }
+            }
+            for file in existing { try FileManager.default.removeItem(at: file) }
         }
         sources.remove(at: index)
         defaults.removeObject(forKey: Self.cacheKey(id))
@@ -100,14 +116,33 @@ public struct LocalHTMLHomeStore: Codable, Equatable, Sendable {
         move(id, by: to - from)
     }
     public func html(for source: LocalHTMLHomeSource, directory: URL = Self.directory) throws -> String {
-        guard let filename = source.filename, sources.contains(where: { $0.id == source.id }) else { throw HTMLHomeError.invalidFile }
+        guard let filename = source.filename, sources.contains(source) else { throw HTMLHomeError.invalidFile }
         let file = try Self.managedFile(filename, directory: directory)
-        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true, let size = values.fileSize, size > 0, size <= 1024 * 1024 else { throw HTMLHomeError.invalidFile }
+        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size > 0, size <= 1024 * 1024 else { throw HTMLHomeError.invalidFile }
         let data = try Data(contentsOf: file, options: .mappedIfSafe)
         guard data.count <= 1024 * 1024, let html = Self.decode(data),
               !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HTMLHomeError.invalidFile }
         return html
+    }
+    /// A file gives WebKit a trustworthy context. Match loadHTMLString's explicit
+    /// UTF-8 decoding with a BOM on a separate execution file, including sources
+    /// without a charset or with a conflicting one. Imported bytes stay intact.
+    /// The caller grants WebKit read access to this execution file only.
+    public func fileURL(for source: LocalHTMLHomeSource, directory: URL = Self.directory) throws -> URL {
+        let html = try html(for: source, directory: directory)
+        guard let filename = source.filename else { throw HTMLHomeError.invalidFile }
+        let file = try Self.executionFile(filename, directory: directory)
+        var bytes = Data([0xEF, 0xBB, 0xBF])
+        bytes.append(contentsOf: (html.hasPrefix("\u{FEFF}") ? String(html.dropFirst()) : html).utf8)
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: file.path) {
+            guard attributes[.type] as? FileAttributeType == .typeRegular else { throw HTMLHomeError.invalidFile }
+            if (attributes[.size] as? NSNumber)?.intValue == bytes.count,
+               try Data(contentsOf: file, options: .mappedIfSafe) == bytes { return file }
+        }
+        try bytes.write(to: file, options: .atomic)
+        return file
     }
     public static func cache(for id: String, defaults: UserDefaults = .standard) -> [String: String] {
         guard let data = defaults.data(forKey: cacheKey(id)), data.count <= 2 * 1024 * 1024 else { return [:] }
@@ -127,6 +162,9 @@ public struct LocalHTMLHomeStore: Codable, Equatable, Sendable {
     private static func managedFile(_ name: String, directory: URL) throws -> URL {
         guard name == (name as NSString).lastPathComponent, UUID(uuidString: String(name.dropLast(5))) != nil, name.hasSuffix(".html") else { throw HTMLHomeError.invalidFile }
         return directory.appendingPathComponent(name)
+    }
+    private static func executionFile(_ name: String, directory: URL) throws -> URL {
+        try managedFile(name, directory: directory).deletingPathExtension().appendingPathExtension("execution.html")
     }
     private static func title(_ name: String, fallback: String) -> String {
         let value = name.trimmingCharacters(in: .whitespacesAndNewlines)

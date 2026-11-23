@@ -31,8 +31,14 @@ public struct MusicProber: Sendable {
         }
         let total = Self.totalLength(response)
         var result = Self.sniff(response.body, totalLength: total)
+        let oggContainer = response.body.starts(with: Data("OggS".utf8))
+        // A returned QQ encrypted file is not raw FLAC/Ogg. Only skip the platform
+        // inspector when its actual bytes also failed the audio-header check.
+        if result == nil, ["mflac", "mgg", "mgg1", "qmcflac", "qmc0", "qmc3"].contains(stream.url.pathExtension.lowercased()) {
+            throw MusicProviderError.unsupportedFormat("encrypted audio payload")
+        }
         let settled = result.map { $0.format.codec != .unknown && $0.duration != nil } ?? false
-        if !settled, let inspector {
+        if (!settled || oggContainer), let inspector {
             let left = Self.timeout - Date().timeIntervalSince(start)
             if left > 0.3, let deep = try? await MusicHTTP.withTimeout(left, { try await inspector(stream) }) {
                 if var header = result {
@@ -49,6 +55,9 @@ public struct MusicProber: Sendable {
         }
         guard var result, result.format.codec != .unknown else {
             throw MusicProviderError.unsupportedFormat("unrecognized audio header")
+        }
+        guard !oggContainer || result.evidence.contains(.decoder) else {
+            throw MusicProviderError.unsupportedFormat("Ogg container is not playable by the system decoder")
         }
         result.byteLength = total
         result.completeness = Self.completeness(duration: result.duration, expected: expected)
@@ -228,7 +237,16 @@ public enum AVFoundationMusicInspector {
 /// song starts a new cache: an address whose lifetime is unknown is resolved again next time.
 public actor MusicStreamCache {
     struct Entry { var stream: ResolvedMusicStream; var probe: MusicProbeResult }
+    private struct PlaybackRequest: Hashable {
+        let url: URL
+        let headers: [String: String]
+        init(_ stream: ResolvedMusicStream) {
+            url = stream.url
+            headers = Dictionary(stream.headers.map { ($0.key.lowercased(), $0.value) }, uniquingKeysWith: { _, last in last })
+        }
+    }
     private var entries: [String: Entry] = [:]
+    private var failedPlaybackRequests: Set<PlaybackRequest> = []
     public init() {}
     func get(_ id: String, now: Date = Date()) -> Entry? {
         guard let entry = entries[id] else { return nil }
@@ -238,10 +256,19 @@ public actor MusicStreamCache {
     }
     func put(_ id: String, _ entry: Entry) { entries[id] = entry }
     public func invalidate(_ id: String) { entries[id] = nil }
+    /// Different providers often return the identical CDN file. After an actual player
+    /// failure that request is not a new fallback, even under another source/quality key.
+    /// Keep signed queries and authentication headers distinct; a fresh playback owns a new cache.
+    public func recordPlaybackFailure(_ stream: ResolvedMusicStream) {
+        failedPlaybackRequests.insert(PlaybackRequest(stream))
+    }
+    func failedPlayback(_ stream: ResolvedMusicStream) -> Bool {
+        failedPlaybackRequests.contains(PlaybackRequest(stream))
+    }
 }
 
-/// Picks a channel using at most two provider candidates concurrently, with imported and built-in
-/// providers sharing the first wave. A validated stream of the requested kind starts immediately;
+/// Picks a channel using at most three candidates concurrently, refilling a slot as soon as
+/// it fails so an unavailable source cannot hold back all alternatives. A validated stream of the requested kind starts immediately;
 /// missing catalog duration does not force probing every remaining provider. Otherwise,
 /// the best found by completeness, losslessness and format, or a clear failure.
 public struct MusicResolver: Sendable {
@@ -251,8 +278,8 @@ public struct MusicResolver: Sendable {
     /// Finds the track in catalogs it was not found in, when every channel it has failed.
     let companions: MusicCompanionFinder?
     /// For one selection, resolution and probing together.
-    var budget: TimeInterval = 15
-    var parallel = 2
+    var budget: TimeInterval = 20
+    var parallel = 3
     /// Primary providers per catalog, then fallbacks. Migu's own servers and Kuwo through Nianxin
     /// lead: in the 2026-10-14 test they played songs VKeys and GD no longer reach (Jay Chou's).
     static let primaries: [(MusicPlatform, MusicProviderID)] = [(.migu, .migu), (.kuwo, .nianxin), (.qq, .vkeys), (.netease, .gdstudio)]
@@ -265,7 +292,7 @@ public struct MusicResolver: Sendable {
     }
 
     public init(providers: [any MusicStreamProvider], prober: MusicProber = MusicProber(), health: MusicHealth = .shared,
-                companions: MusicCompanionFinder? = nil, budget: TimeInterval = 15) {
+                companions: MusicCompanionFinder? = nil, budget: TimeInterval = 20) {
         self.providers = Dictionary(providers.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         self.prober = prober; self.health = health; self.companions = companions; self.budget = budget
     }
@@ -287,9 +314,9 @@ public struct MusicResolver: Sendable {
     }
 
     public func candidates(for track: MusicTrack) -> [MusicCandidate] {
-        let listed = Self.order.compactMap { platform, provider -> MusicCandidate? in
-            guard let songID = track.ids[platform], let resolver = providers[provider], resolver.platforms.contains(platform) else { return nil }
-            return MusicCandidate(platform: platform, songID: songID, provider: provider)
+        let listed = Self.order.flatMap { platform, provider -> [MusicCandidate] in
+            guard let songID = track.ids[platform], let resolver = providers[provider], resolver.platforms.contains(platform) else { return [] }
+            return resolver.candidates(songID: songID, platform: platform)
         }
         // A music extension's own song plays from what the extension gives; after the built-in channels when the
         // song was also found in a catalog.
@@ -308,71 +335,81 @@ public struct MusicResolver: Sendable {
                        cache: MusicStreamCache = MusicStreamCache()) async throws -> MusicPlaybackSelection {
         let deadline = Date().addingTimeInterval(budget)
         let quality = preference.requested
-        var ready: [MusicCandidate] = [], cooling: [MusicCandidate] = []
-        for candidate in candidates(for: track) where !excluding.contains(candidate.id) {
-            let key = MusicHealth.key(candidate.provider.rawValue, candidate.platform, .resolve)
-            // LX sources track failures separately by imported source and platform. An old
-            // aggregate failure must not keep a newly enabled source behind all built-ins.
-            if candidate.provider != .lx, await health.failing(key) { cooling.append(candidate) } else { ready.append(candidate) }
+        let offered = candidates(for: track).filter { !excluding.contains($0.id) }
+        let canExpand = companions != nil && track.ids.count < MusicPlatform.allCases.count - 1
+        // Leave time for a strictly matched recording in another catalog when the original
+        // platform's endpoints hang. The search and its resolution share this same deadline.
+        let directDeadline = canExpand ? deadline.addingTimeInterval(-min(8, budget * 0.4)) : deadline
+        var ranked: [(candidate: MusicCandidate, cooling: Bool, success: Date?, index: Int)] = []
+        for (index, candidate) in offered.enumerated() {
+            let service = candidate.sourceID.map { "lx:" + $0 } ?? candidate.provider.rawValue
+            let key = MusicHealth.key(service, candidate.platform, .resolve)
+            ranked.append((candidate, await health.failing(key), await health.lastSuccess(key), index))
         }
-        guard !(ready.isEmpty && cooling.isEmpty) else { throw providers.isEmpty ? MusicProviderError.authRequired : MusicProviderError.noResource }
-        // A cooling channel is only asked when nothing else is left: one probe, after the others.
-        var queue = ready + cooling
+        ranked.sort {
+            if $0.cooling != $1.cooling { return !$0.cooling }
+            if $0.success != $1.success { return ($0.success ?? .distantPast) > ($1.success ?? .distantPast) }
+            return $0.index < $1.index
+        }
+        guard !ranked.isEmpty || canExpand else { throw providers.isEmpty ? MusicProviderError.authRequired : MusicProviderError.noResource }
+        let cooling = Set(ranked.filter(\.cooling).map(\.candidate))
+        var queue = ranked.map(\.candidate)
         var attempts: [MusicAttempt] = [], found: [Found] = [], order = 0
-
-        while !queue.isEmpty {
-            try Task.checkCancellation()
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0.5 else { break }
-            if !found.isEmpty, let first = queue.first, cooling.contains(first) { break }
-            // One imported platform cannot hold every slot while built-in channels wait.
-            let first = queue.removeFirst()
-            var wave = [first]
-            if !queue.isEmpty, parallel > 1 {
-                let companion = queue.firstIndex(where: { $0.provider != first.provider }) ?? 0
-                wave.append(queue.remove(at: companion))
-            }
-            let winner: Found? = await withTaskGroup(of: (MusicCandidate, Result<(ResolvedMusicStream, MusicProbeResult), MusicProviderError>, Double).self) { group in
-                for candidate in wave {
-                    group.addTask { await self.attempt(candidate, track: track, quality: quality, timeout: remaining, cache: cache) }
+        let winner: Found? = await withTaskGroup(of: (MusicCandidate, Result<(ResolvedMusicStream, MusicProbeResult), MusicProviderError>, Double).self) { group in
+            var active = Set<MusicCandidate>()
+            func launch() {
+                guard !queue.isEmpty, directDeadline.timeIntervalSinceNow > 0.1, !Task.isCancelled else { return }
+                if !found.isEmpty, let first = queue.first, cooling.contains(first) { return }
+                // Keep a different provider in flight when one is available. Many imported
+                // sources can share a stalled upstream; they must not occupy every slot
+                // while a ready built-in channel waits behind them. Preserve cooldown order.
+                let activeProviders = Set(active.map(\.provider))
+                let firstCooling = cooling.contains(queue[0])
+                let alternate = queue.firstIndex {
+                    !activeProviders.contains($0.provider) && cooling.contains($0) == firstCooling
                 }
-                for await (candidate, result, seconds) in group {
-                    switch result {
-                    case .success(let (stream, probe)):
-                        attempts.append(MusicAttempt(candidate: candidate, outcome: .playable(probe), seconds: seconds))
-                        let item = Found(candidate: candidate, stream: stream, probe: probe, order: order); order += 1
-                        found.append(item)
-                        // Duration can be unknown when a catalog omitted it; a verified audio
-                        // header is still usable, with real playback failure handled by recovery.
-                        let wanted = preference.wantsLossless ? probe.format.isLossless : !probe.format.isLossless
-                        if wanted && probe.completeness != .preview { group.cancelAll(); return item }
-                    case .failure(let error):
-                        attempts.append(MusicAttempt(candidate: candidate, outcome: .failed(error), seconds: seconds))
+                let candidate = queue.remove(at: alternate ?? 0)
+                active.insert(candidate)
+                let remaining = directDeadline.timeIntervalSinceNow
+                group.addTask { await self.attempt(candidate, track: track, quality: quality, timeout: remaining, cache: cache) }
+            }
+            for _ in 0..<parallel { launch() }
+            for await (candidate, result, seconds) in group {
+                active.remove(candidate)
+                switch result {
+                case .success(let (stream, probe)):
+                    attempts.append(MusicAttempt(candidate: candidate, outcome: .playable(probe), seconds: seconds))
+                    let item = Found(candidate: candidate, stream: stream, probe: probe, order: order); order += 1
+                    found.append(item)
+                    let wanted = preference.wantsLossless ? probe.format.isLossless : !probe.format.isLossless
+                    if wanted && probe.completeness != .preview {
+                        group.cancelAll()
+                        // Losing requests were cancelled, not proven unusable. Preserve each
+                        // source identity once for an actual playback failure or manual choice.
+                        queue = ranked.map(\.candidate).filter(active.contains) + queue
+                        return item
                     }
+                case .failure(let error):
+                    attempts.append(MusicAttempt(candidate: candidate, outcome: .failed(error), seconds: seconds))
                 }
-                return nil
+                launch()
             }
-            if let winner {
-                try Task.checkCancellation()
-                let retryable = wave.filter { candidate in
-                    guard candidate != winner.candidate else { return false }
-                    if let attempt = attempts.first(where: { $0.candidate == candidate }), case .failed(let error) = attempt.outcome {
-                        return error == .cancelled
-                    }
-                    return true
-                }
-                return selection(track, winner, degraded: false, attempts: attempts, untried: retryable + queue)
-            }
+            return nil
         }
+        try Task.checkCancellation()
+        if let winner { return selection(track, winner, degraded: false, attempts: attempts, untried: queue) }
         for candidate in queue {
             attempts.append(MusicAttempt(candidate: candidate, outcome: .skipped(found.isEmpty ? .timeout : .cancelled), seconds: 0))
         }
         let usable = Self.usable(found, for: preference)
         // Every channel failed: the same recording in another catalog may have one that works.
-        if usable.isEmpty, let companions, deadline.timeIntervalSinceNow > 2,
-           let wider = await companions.find(track), wider.ids.count > track.ids.count {
-            var rest = self; rest.budget = deadline.timeIntervalSinceNow
-            let tried = Set(attempts.map(\.candidate.id)).union(excluding)
+        if usable.isEmpty, let companions, deadline.timeIntervalSinceNow > 0.4,
+           let wider = await companions.find(track, timeout: min(3, deadline.timeIntervalSinceNow * 0.4)), wider.ids.count > track.ids.count {
+            let rest = MusicResolver(providers: Array(providers.values), prober: prober, health: health, budget: max(0.1, deadline.timeIntervalSinceNow))
+            let tried = Set(attempts.compactMap { attempt -> String? in
+                if case .skipped = attempt.outcome { return nil }
+                return attempt.candidate.id
+            }).union(excluding)
             if var selection = try? await rest.select(wider, preference: preference, excluding: tried, cache: cache) {
                 selection.attempts = attempts.filter { attempt in if case .skipped = attempt.outcome { false } else { true } } + selection.attempts
                 return selection
@@ -405,9 +442,10 @@ public struct MusicResolver: Sendable {
                         cache: MusicStreamCache) async throws -> MusicPlaybackSelection {
         let quality = preference.requested
         await cache.invalidate(candidate.id + "|" + quality.rawValue)
-        let (_, result, seconds) = await attempt(candidate, track: track, quality: quality, timeout: budget, cache: cache)
+        let (_, result, seconds) = await attempt(candidate, track: track, quality: quality, timeout: budget, cache: cache, allowsFailedPlayback: true)
         switch result {
         case .success(let (stream, probe)):
+            if preference == .losslessOnly && !probe.format.isLossless { throw MusicProviderError.notLossless }
             let attempt = MusicAttempt(candidate: candidate, outcome: .playable(probe), seconds: seconds)
             return MusicPlaybackSelection(track: track, candidate: candidate, stream: stream, probe: probe,
                                           degraded: preference.wantsLossless && !probe.format.isLossless, attempts: [attempt], untried: [])
@@ -456,28 +494,39 @@ public struct MusicResolver: Sendable {
     }
 
     private func attempt(_ candidate: MusicCandidate, track: MusicTrack, quality: MusicAudioQuality, timeout: TimeInterval,
-                         cache: MusicStreamCache) async
+                         cache: MusicStreamCache, allowsFailedPlayback: Bool = false) async
         -> (MusicCandidate, Result<(ResolvedMusicStream, MusicProbeResult), MusicProviderError>, Double) {
         let start = Date()
         // Each quality gets its own address: a lossless resolution is no stand-in for a 128 kbps request.
         let cacheKey = candidate.id + "|" + quality.rawValue
-        if let cached = await cache.get(cacheKey) { return (candidate, .success((cached.stream, cached.probe)), 0) }
+        if let cached = await cache.get(cacheKey) {
+            if !allowsFailedPlayback, await cache.failedPlayback(cached.stream) {
+                // This cached request failed, but the provider may now issue a new signature
+                // or authentication header. Refresh within the same bounded attempt before
+                // deciding whether it still aliases the failed media request.
+                await cache.invalidate(cacheKey)
+            } else {
+                return (candidate, .success((cached.stream, cached.probe)), 0)
+            }
+        }
         let key = MusicHealth.key(candidate.provider.rawValue, candidate.platform, .resolve)
         do {
             guard let provider = providers[candidate.provider] else { throw MusicProviderError.authRequired }
             try Task.checkCancellation()
-            let stream = try await MusicHTTP.withTimeout(min(candidate.provider == .lx ? 12 : 8, timeout)) {
-                try await provider.resolve(candidate.songID, platform: candidate.platform, track: track, quality: quality)
+            let (stream, probe) = try await MusicHTTP.withTimeout(min(8, max(0.1, timeout))) {
+                let stream = try await provider.resolve(candidate, track: track, quality: quality)
+                if !allowsFailedPlayback, await cache.failedPlayback(stream) { throw MusicProviderError.noResource }
+                let probe: MusicProbeResult
+                if let verified = stream.verifiedProbe { probe = verified }
+                else { probe = try await prober.probe(stream, expected: track.duration) }
+                try Task.checkCancellation()
+                if probe.completeness == .preview { throw MusicProviderError.preview(probe.duration ?? 0) }
+                if let expected = track.duration, let duration = probe.duration, duration > expected + MusicMatching.durationTolerance(expected) {
+                    throw MusicProviderError.differentRecording(duration)
+                }
+                return (stream, probe)
             }
             if candidate.provider != .lx { await health.record(key, error: nil) }
-            let probe: MusicProbeResult
-            if let verified = stream.verifiedProbe { probe = verified }
-            else { probe = try await prober.probe(stream, expected: track.duration) }
-            try Task.checkCancellation()
-            if probe.completeness == .preview { throw MusicProviderError.preview(probe.duration ?? 0) }
-            if let expected = track.duration, let duration = probe.duration, duration > expected + MusicMatching.durationTolerance(expected) {
-                throw MusicProviderError.differentRecording(duration)
-            }
             await cache.put(cacheKey, .init(stream: stream, probe: probe))
             Diagnostics.shared.record(.info, "music", "\(candidate.provider.rawValue) \(candidate.platform.rawValue) host=\(stream.url.host() ?? "-") \(probe.format.label) \(probe.completeness.rawValue) in \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
             return (candidate, .success((stream, probe)), Date().timeIntervalSince(start))
@@ -496,14 +545,23 @@ public struct MusicCompanionFinder: Sendable {
     let catalogs: [any MusicCatalogSource]
     public init(catalogs: [any MusicCatalogSource]) { self.catalogs = catalogs }
 
-    public func find(_ track: MusicTrack) async -> MusicTrack? {
+    public func find(_ track: MusicTrack, timeout: TimeInterval = 6) async -> MusicTrack? {
+        let matches = await withTaskGroup(of: MusicTrack?.self, returning: [MusicTrack].self) { group in
+            for catalog in catalogs where track.ids[catalog.platform] == nil {
+                group.addTask {
+                    let query = ([track.title] + track.artists.prefix(1)).joined(separator: " ")
+                    guard let results = try? await MusicHTTP.withTimeout(timeout, { try await catalog.search(query, page: 1) }) else { return nil }
+                    return results.first { MusicMatching.sameRecording(track, $0) != nil }
+                }
+            }
+            var matches: [MusicTrack] = []
+            for await match in group { if let match { matches.append(match) } }
+            return matches
+        }
+        guard !Task.isCancelled else { return nil }
         var wider = track
-        for catalog in catalogs where track.ids[catalog.platform] == nil {
-            let query = ([track.title] + track.artists.prefix(1)).joined(separator: " ")
-            guard let results = try? await MusicHTTP.withTimeout(6, { try await catalog.search(query, page: 1) }),
-                  let match = results.first(where: { MusicMatching.sameRecording(wider, $0) != nil }) else { continue }
+        for match in matches where MusicMatching.sameRecording(wider, match) != nil {
             wider = MusicMatching.merge([[wider], [match]]).first ?? wider
-            Diagnostics.shared.record(.info, "music", "companion \(catalog.platform.rawValue) found: \(wider.evidence.joined(separator: ","))")
         }
         return wider.ids.count > track.ids.count ? wider : nil
     }

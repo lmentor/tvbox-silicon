@@ -131,6 +131,20 @@ public struct MusicQueue: Codable, Equatable, Sendable {
         return current
     }
 
+    /// The same successor is used for preparation and Next. Keep the returned queue until
+    /// the intent changes: choosing another random pass twice could choose different songs.
+    public func nextPlaybackQueue(repeatingAll: Bool, shuffled: Bool) -> MusicQueue? {
+        var next = self
+        if next.advance() != nil { return next }
+        guard repeatingAll, next.repeatingTrackCount > 1 else { return nil }
+        if shuffled && next.isShuffled {
+            guard next.restartShuffledPass() != nil else { return nil }
+        } else {
+            guard next.jump(to: 0) != nil else { return nil }
+        }
+        return next
+    }
+
     @discardableResult public mutating func back() -> MusicTrack? {
         guard hasPrevious else { return nil }
         index -= 1
@@ -211,8 +225,9 @@ public struct MusicHistoryEntry: Codable, Equatable, Identifiable, Sendable {
     public private(set) var favoriteCollections: [MusicCollection] = []
     private let file: URL?
     private var saveTask: Task<Void, Never>?
+    private let writer = DispatchQueue(label: "yingxia.music-library.persistence", qos: .utility)
 
-    private struct Saved: Codable {
+    private struct Saved: Codable, Sendable {
         var history: [MusicHistoryEntry]
         var resumePoint: MusicResumePoint?
         var favoriteCollections: [MusicCollection]?
@@ -275,21 +290,29 @@ public struct MusicHistoryEntry: Codable, Equatable, Identifiable, Sendable {
         guard let file, saveTask == nil else { return }
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1))
-            guard let self else { return }
+            guard !Task.isCancelled, let self else { return }
             self.saveTask = nil
-            self.saveNow(to: file)
+            self.saveNow(to: file, wait: false)
         }
     }
 
     /// For leaving the app, when a delayed write might not happen.
     public func flush() {
         saveTask?.cancel(); saveTask = nil
-        if let file { saveNow(to: file) }
+        if let file { saveNow(to: file, wait: true) }
     }
 
-    private func saveNow(to file: URL) {
-        guard let data = try? JSONEncoder().encode(Saved(history: history, resumePoint: resumePoint, favoriteCollections: favoriteCollections)) else { return }
-        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: file, options: .atomic)
+    private func saveNow(to file: URL, wait: Bool) {
+        // Snapshot value types on the owner, then encode the potentially large
+        // playlist away from scrolling and the playback clock. Serial writes keep
+        // an older queued snapshot from replacing a newer lifecycle flush.
+        let saved = Saved(history: history, resumePoint: resumePoint, favoriteCollections: favoriteCollections)
+        let write: @Sendable () -> Void = {
+            guard let data = try? JSONEncoder().encode(saved) else { return }
+            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: file, options: .atomic)
+        }
+        if wait { writer.sync(execute: write) }
+        else { writer.async(execute: write) }
     }
 }

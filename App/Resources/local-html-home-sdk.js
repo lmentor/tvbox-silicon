@@ -3,7 +3,15 @@
 (() => {
   const config = window.__yingxiaHTMLHome;
   delete window.__yingxiaHTMLHome;
-  if (!config || window.top !== window || location.origin !== config.origin || window.__yingxiaHomeSDK) return;
+  if (!config || window.top !== window || window.__yingxiaHomeSDK) return;
+  if (config.localFile) {
+    // File origins can serialize as null or file:// across WebKit versions;
+    // authority belongs to the selected document, never every local file.
+    let actual, selected;
+    try { actual = new URL(location.href); selected = new URL(config.documentURL); } catch { return; }
+    actual.hash = selected.hash = ''; actual.search = selected.search = '';
+    if (actual.protocol !== 'file:' || actual.href !== selected.href) return;
+  } else if (location.origin !== config.origin) return;
   window.__yingxiaHomeSDK = true;
   const channel = window.webkit.messageHandlers.localHTMLHome;
   const invoke = (method, payload = {}) => channel.postMessage({ token: config.token, method, payload });
@@ -46,7 +54,7 @@
     // The supplied Jasna Mac adapter declares desktop Chrome, while this host
     // runs WebKit. Its Turnstile window and cookie-backed API retry must keep
     // the actual browser identity instead of impersonating a different engine.
-    if (window.__ltxMacCat?.active && new URL(payload.url).origin === 'https://ltx.libray.workers.dev') {
+    if (window.__ltxMacCat?.active && ['https://ltx.libray.workers.dev', 'https://ltxlib.dpdns.org'].includes(new URL(payload.url).origin)) {
       const values = Object.fromEntries(Object.entries(payload.headers || {}).filter(([name]) => name.toLowerCase() !== 'user-agent'));
       payload.headers = { ...values, 'User-Agent': navigator.userAgent };
     }

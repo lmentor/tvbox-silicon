@@ -50,7 +50,7 @@ def main():
     subprocess.run(['xcodebuild', '-resolvePackageDependencies', '-project', 'Yingxia-iOS.xcodeproj',
                     '-scheme', 'TVBox-iOS', '-clonedSourcePackagesDirPath', 'build/SourcePackages',
                     '-onlyUsePackageVersionsFromResolvedFile'], cwd=ROOT, check=True)
-    print('Dependencies prepared. Run python3 Scripts/build-ios-ipa.py --build-number 1')
+    print('Dependencies prepared. Run python3 Scripts/build-ios-ipa.py')
 
 
 if __name__ == '__main__':

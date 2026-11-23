@@ -79,7 +79,19 @@ function html(message) {
         case 'querySelectorAll': return keepAll($(message.query).toArray());
         case 'getElementById': return keep($(`[id="${String(message.id).replace(/"/g, '\\"')}"]`).get(0));
         case 'getText': return $(element).text();
-        case 'getAttributes': return { ...(element?.attribs ?? {}) };
+        case 'getAttributes': {
+            const attributes = { ...(element?.attribs ?? {}) };
+            // jcomic's public reader moved the lazy image address out of src.
+            // Match its inline loader only for that source and its marked images.
+            if (source?.key === 'jcomic' && element?.name === 'img' && !attributes.src
+                && String(attributes['data-locked'] || '').startsWith('JCOMIC_TRAPS_')) {
+                try {
+                    const address = Buffer.from(attributes['data-locked'].slice('JCOMIC_TRAPS_'.length).split('').reverse().join(''), 'base64').toString('utf8');
+                    if (/^https?:\/\//i.test(address)) attributes.src = address;
+                } catch (_) { }
+            }
+            return attributes;
+        }
         case 'dom_querySelector': return keep($(element).find(message.query).get(0));
         case 'dom_querySelectorAll': return keepAll($(element).find(message.query).toArray());
         case 'getChildren': return keepAll((element?.children ?? []).filter(isElement));
@@ -212,6 +224,29 @@ const settingDefaults = new Map();
 // its listed mirrors don't, so a mirror is the default. The viewer's own choice still wins.
 const preferredDefaults = { copy_manga: { auto_clear_device_info: true }, baozi: { domains: "kukuc.co" } };
 const declaredDefault = (key, name, item) => preferredDefaults[key]?.[name] ?? item?.default ?? null;
+
+// The public manwaba reader wraps en_images in IV + AES-CBC bytes. The listed
+// source (1.0.3) has no image callback yet. Reproduce its public BaseUtil loader,
+// retaining any source-authored callback when a later source adds one.
+function completeImageCallbacks(source) {
+    if (source.key !== 'manwaba' || !source.comic) return;
+    for (const name of ['onImageLoad', 'onThumbnailLoad']) {
+        const original = source.comic[name];
+        source.comic[name] = async function (...args) {
+            const config = typeof original === 'function' ? (await original.apply(this, args)) ?? {} : {};
+            if (!String(config.url ?? args[0]).includes('/en_images/') || typeof config.onResponse === 'function') return config;
+            return { ...config, onResponse(data) {
+                const bytes = toBytes(data);
+                if (bytes.length < 32 || (bytes.length - 16) % 16 !== 0) return data;
+                if ((bytes[0] === 0xff && bytes[1] === 0xd8) || (bytes[0] === 0x89 && bytes[1] === 0x50)
+                    || (bytes[0] === 0x47 && bytes[1] === 0x49) || (bytes[0] === 0x52 && bytes[1] === 0x49)) return data;
+                return fromBase64(native({ op: 'aes', encrypt: false, mode: 'CBC', padding: true,
+                    keyText: '0B6666A0-BB59-1381-B746-a0E4C9AC', iv: toBase64(bytes.subarray(0, 16)),
+                    data: toBase64(bytes.subarray(16)) }).data);
+            } };
+        };
+    }
+}
 const configs = new Map();
 let nextConfig = 1;
 function lookup(path) {
@@ -265,6 +300,7 @@ globalThis.__venera = {
             if (typeof source.init === 'function') {
                 try { await source.init(); } catch (error) { log(`init failed: ${error?.message || error}`); }
             }
+            completeImageCallbacks(source);
             return { value: describe() };
         } catch (error) { return failure(error); }
     },
@@ -275,6 +311,15 @@ globalThis.__venera = {
             const { owner, target } = lookup(path);
             if (typeof target !== 'function') throw new Error(`The source has no ${path}`);
             return { value: plain(await target.apply(owner, args || [])) };
+        } catch (error) { return failure(error); }
+    },
+    async webLogin(url, title) {
+        try {
+            const login = source?.account?.loginWithWebview;
+            if (!login || typeof login.checkStatus !== 'function') throw new Error('This source has no web login status callback');
+            if (!(await login.checkStatus.call(login, url, title))) return { value: false };
+            if (typeof login.onLoginSuccess === 'function') await login.onLoginSuccess.call(login);
+            return { value: true };
         } catch (error) { return failure(error); }
     },
     // Image loading configs: functions stay here, Swift gets the data and an id to call them by.

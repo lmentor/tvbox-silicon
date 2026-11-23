@@ -211,7 +211,13 @@
       "file": "pan-types.json",
       "source": "ioscat/runtime/pan-types.json",
       "sha256": "920ba3f3c21c32164e931cf366a23723cf4854359c6cb351fb1ec762b20aedb0"
+    },
+    {
+      "file": "lib/site-pan.mjs",
+      "source": "ioscat/runtime/lib/site-pan.mjs",
+      "sha256": "7779c47536e38c149b331cd3fd893ff50c6a4b3d47785a58d0f56febfb4ec506",
+      "date": "2026-11-22"
     }
   ],
-  "hashesDescribe": "Original MacCat reference snapshot at migration time; not checksums of the current exported files."
+  "integrity_note": "Hashes record the original reference snapshot. Current exported file hashes are in SOURCE-MANIFEST.json."
 }

@@ -2,7 +2,18 @@ import SwiftUI
 import Perception
 import TVCore
 
-/// Watching follows the selected subscription and keeps a list or poster layout.
+enum WatchingHistoryItem: Identifiable {
+    case video(PlaybackHistoryEntry)
+    case manga(MangaLibrary.Progress)
+    var id: String {
+        switch self { case .video(let entry): "video:" + entry.id; case .manga(let progress): "manga:" + progress.id }
+    }
+    var updated: Date {
+        switch self { case .video(let entry): entry.updatedAt; case .manga(let progress): progress.updated }
+    }
+}
+
+/// Watching combines video and manga progress without changing their storage or identities.
 struct PlaybackHistoryView: View {
     @Environment(Store.self) private var store
     @Environment(\.isEnabled) private var isEnabled
@@ -12,10 +23,27 @@ struct PlaybackHistoryView: View {
     @State private var query = ""
     @State private var confirmsClear = false
     @State private var clearIDs = Set<String>()
+    @State private var clearMangaIDs = Set<String>()
+    @State private var mangaStore = MangaStore.shared
+    @State private var mangaReading: MangaReading?
+    @State private var mangaTask: Task<Void, Never>?
+    @State private var mangaRequest: UUID?
+    @State private var preparingMangaID: String?
+    @State private var mangaFailure: String?
     @AppStorage("local.library.historyLayout") private var layout = "list"
     private var history: PlaybackHistory { store.playbackHistory }
-    private var entries: [PlaybackHistoryEntry] {
-        store.visibleHistory.filter { query.isEmpty || $0.context.displayTitle.localizedCaseInsensitiveContains(query) || $0.context.sourceName.localizedCaseInsensitiveContains(query) }
+    private var entries: [WatchingHistoryItem] {
+        let videos = store.visibleHistory.map(WatchingHistoryItem.video)
+        let comics = mangaStore.history.map(WatchingHistoryItem.manga)
+        return (videos + comics).filter { item in
+            guard !query.isEmpty else { return true }
+            switch item {
+            case .video(let entry):
+                return entry.context.displayTitle.localizedCaseInsensitiveContains(query) || entry.context.sourceName.localizedCaseInsensitiveContains(query)
+            case .manga(let progress):
+                return progress.comic.title.localizedCaseInsensitiveContains(query) || mangaStore.name(of: progress.comic.sourceKey).localizedCaseInsensitiveContains(query)
+            }
+        }.sorted { $0.updated == $1.updated ? $0.id < $1.id : $0.updated > $1.updated }
     }
 
     var body: some View {
@@ -25,16 +53,33 @@ struct PlaybackHistoryView: View {
                     VStack(alignment: .leading, spacing: Layout.headerSpacing) {
                         header
                         if let error = history.persistenceError { StatusNotice(text: L10n.text("Unable to save playback history: %@", error)) }
+                        if let mangaFailure { StatusNotice(text: mangaFailure) }
                         if entries.isEmpty {
                             EmptyPage(symbol: AppSection.history.icon, title: "你的观看旅程即将开始",
-                                      message: "播放后，这里会自动记录当前订阅的观看进度。",
+                                      message: "播放或阅读后，这里会自动记录观看和漫画阅读进度。",
                                       action: "浏览站点", actionSymbol: AppSection.sites.icon, perform: { if canInteract { store.section = .sites } })
                         } else if layout == "horizontal" {
                             LazyVGrid(columns: Layout.posterColumns, spacing: Layout.gridRowSpacing) {
-                                ForEach(entries) { entry in WithPerceptionTracking { WatchingHistoryCard(entry: entry) } }
+                                ForEach(entries) { item in
+                                    WithPerceptionTracking {
+                                        switch item {
+                                        case .video(let entry): WatchingHistoryCard(entry: entry)
+                                        case .manga(let progress): mangaCard(progress)
+                                        }
+                                    }
+                                }
                             }
                         } else {
-                            LazyVStack(spacing: 12) { ForEach(entries) { entry in WithPerceptionTracking { historyRow(entry) } } }
+                            LazyVStack(spacing: 12) {
+                                ForEach(entries) { item in
+                                    WithPerceptionTracking {
+                                        switch item {
+                                        case .video(let entry): historyRow(entry)
+                                        case .manga(let progress): mangaRow(progress)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }.pageContainer()
                 }
@@ -42,12 +87,18 @@ struct PlaybackHistoryView: View {
             .catalogSearchable(text: $query, prompt: L10n.text("Search history"))
             .screenBackdrop().historyDetailsDestination().tabTitle(AppSection.history.title)
             .disabled(!canInteract)
+            .fullScreenCover(item: $mangaReading) { reading in MangaReaderView(reading: reading) }
+            .onDisappear { cancelMangaPreparation() }
+            .appOnChange(of: canInteract) { _, active in if !active { cancelMangaPreparation() } }
+            .appOnChange(of: store.resumingHistoryID) { _, id in if id != nil { cancelMangaPreparation() } }
             .confirmationDialog("清空当前显示的观看记录？", isPresented: $confirmsClear, titleVisibility: .visible) {
                 Button("清空观看记录", role: .destructive) {
                     guard canInteract else { return }
+                    if let preparingMangaID, clearMangaIDs.contains(preparingMangaID) { cancelMangaPreparation() }
                     history.remove(clearIDs); clearIDs.removeAll()
+                    mangaStore.forget(ids: clearMangaIDs); clearMangaIDs.removeAll()
                 }
-                Button("取消", role: .cancel) { clearIDs.removeAll() }
+                Button("取消", role: .cancel) { clearIDs.removeAll(); clearMangaIDs.removeAll() }
             }
         }
     }
@@ -62,6 +113,7 @@ struct PlaybackHistoryView: View {
 
     private func resume(_ entry: PlaybackHistoryEntry, mode: PlaybackResumeMode = .resume) {
         guard canInteract else { return }
+        cancelMangaPreparation()
         store.resume(entry, mode: mode)
     }
 
@@ -73,7 +125,7 @@ struct PlaybackHistoryView: View {
             }
             Text(store.historySubscriptions.first.map { "当前订阅：\($0.title)" } ?? "未启用订阅期间")
                 .font(.subheadline).foregroundStyle(.secondary)
-            Text(store.historyScope == nil ? "显示未启用订阅期间的观看记录，包含已启用的 Python 来源。" : "显示当前订阅及所有已启用 Python 来源在此订阅下的观看进度。")
+            Text(store.historyScope == nil ? "包含未启用订阅期间、已启用的 Python 来源和漫画阅读记录。" : "包含当前订阅、已启用的 Python 来源和漫画阅读记录。")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }
@@ -87,11 +139,93 @@ struct PlaybackHistoryView: View {
             }.controlButton().accessibilityLabel(layout == "list" ? "切换为横排" : "切换为列表")
             Button {
                 guard canInteract else { return }
-                clearIDs = Set(store.visibleHistory.map(\.id)); confirmsClear = true
+                captureClearSelection()
+                confirmsClear = true
             } label: {
                 Label("清空观看记录", systemImage: "trash").lineLimit(1)
-            }.controlButton().disabled(store.visibleHistory.isEmpty)
+            }.controlButton().disabled(entries.isEmpty)
         }
+    }
+
+    private func captureClearSelection() {
+        clearIDs = Set(entries.compactMap { if case .video(let entry) = $0 { return entry.id }; return nil })
+        clearMangaIDs = Set(entries.compactMap { if case .manga(let progress) = $0 { return progress.id }; return nil })
+    }
+
+    private func mangaCard(_ progress: MangaLibrary.Progress) -> some View {
+        Button { resumeManga(progress) } label: {
+            MangaCard(comic: progress.comic, caption: mangaCaption(progress))
+        }.cardButton()
+            .overlay(alignment: .topTrailing) {
+                HStack(spacing: 6) {
+                    ArtworkBadgeButton(symbol: "arrow.counterclockwise", label: "从头阅读") { resumeManga(progress, beginning: true) }
+                    ArtworkBadgeButton(symbol: "xmark", label: "移除阅读记录", destructive: true) {
+                        guard canInteract else { return }
+                        if preparingMangaID == progress.id { cancelMangaPreparation() }
+                        mangaStore.forget(progress)
+                    }
+                }.padding(8)
+            }
+            .overlay { if preparingMangaID == progress.id { ProgressView().padding(12).background(.regularMaterial, in: Circle()) } }
+            .accessibilityIdentifier("history.manga." + progress.id)
+    }
+
+    private func mangaRow(_ progress: MangaLibrary.Progress) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button { resumeManga(progress) } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    MangaCover(source: progress.comic.sourceKey, url: progress.comic.cover)
+                        .frame(width: 54, height: 78).clipped().clipShape(RoundedRectangle(cornerRadius: 7))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(progress.comic.title).font(.headline).foregroundStyle(.primary).lineLimit(2)
+                        Text("漫画 · " + mangaStore.name(of: progress.comic.sourceKey)).font(.caption).foregroundStyle(.secondary)
+                        Text(MangaProgressText.short(progress)).font(.caption).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    if preparingMangaID == progress.id { ProgressView() }
+                    else { Text(progress.updated, style: .date).font(.caption2).foregroundStyle(.secondary) }
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            HStack(spacing: 12) {
+                Button("从头阅读", systemImage: "arrow.counterclockwise") { resumeManga(progress, beginning: true) }
+                Spacer(minLength: 0)
+                Button("继续阅读", systemImage: "book") { resumeManga(progress) }
+                Button(role: .destructive) {
+                    guard canInteract else { return }
+                    if preparingMangaID == progress.id { cancelMangaPreparation() }
+                    mangaStore.forget(progress)
+                } label: { Image(systemName: "xmark") }.accessibilityLabel("移除 " + progress.comic.title + " 的阅读记录")
+            }.font(.subheadline).buttonStyle(.borderless)
+        }.padding(14).background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 14))
+            .accessibilityIdentifier("history.manga." + progress.id)
+    }
+
+    private func mangaCaption(_ progress: MangaLibrary.Progress) -> String {
+        "漫画 · " + mangaStore.name(of: progress.comic.sourceKey) + " · " + MangaProgressText.short(progress)
+    }
+
+    private func resumeManga(_ progress: MangaLibrary.Progress, beginning: Bool = false) {
+        guard canInteract else { return }
+        store.cancelResume()
+        cancelMangaPreparation()
+        let request = UUID()
+        mangaRequest = request; preparingMangaID = progress.id; mangaFailure = nil
+        mangaTask = Task { @MainActor in
+            defer { if mangaRequest == request { preparingMangaID = nil; mangaRequest = nil; mangaTask = nil } }
+            do {
+                let details = try await MangaRuntime.shared.details(progress.comic.sourceKey, id: progress.comic.id)
+                guard !Task.isCancelled, mangaRequest == request, canInteract,
+                      store.resumingHistoryID == nil, store.playing == nil else { return }
+                let position = progress.position(in: details.chapters, fromBeginning: beginning)
+                mangaReading = MangaReading(comic: details.comic.merged(progress.comic), chapters: details.chapters,
+                                            chapter: position.chapter, page: position.page)
+            } catch {
+                if !Task.isCancelled, mangaRequest == request { mangaFailure = error.mangaMessage }
+            }
+        }
+    }
+
+    private func cancelMangaPreparation() {
+        mangaTask?.cancel(); mangaTask = nil; mangaRequest = nil; preparingMangaID = nil
     }
     private func historyRow(_ entry: PlaybackHistoryEntry) -> some View {
         VStack(alignment: .leading, spacing: 12) {

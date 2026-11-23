@@ -10,9 +10,17 @@ public protocol MusicStreamProvider: Sendable {
     func resolve(_ songID: String, platform: MusicPlatform, quality: MusicAudioQuality) async throws -> ResolvedMusicStream
     /// The same, for providers that also want the song's title and artist (LX Music sources).
     func resolve(_ songID: String, platform: MusicPlatform, track: MusicTrack?, quality: MusicAudioQuality) async throws -> ResolvedMusicStream
+    func resolve(_ candidate: MusicCandidate, track: MusicTrack?, quality: MusicAudioQuality) async throws -> ResolvedMusicStream
+    func candidates(songID: String, platform: MusicPlatform) -> [MusicCandidate]
 }
 
 extension MusicStreamProvider {
+    public func candidates(songID: String, platform: MusicPlatform) -> [MusicCandidate] {
+        [MusicCandidate(platform: platform, songID: songID, provider: id)]
+    }
+    public func resolve(_ candidate: MusicCandidate, track: MusicTrack?, quality: MusicAudioQuality) async throws -> ResolvedMusicStream {
+        try await resolve(candidate.songID, platform: candidate.platform, track: track, quality: quality)
+    }
     public func resolve(_ songID: String, platform: MusicPlatform, track: MusicTrack?, quality: MusicAudioQuality) async throws -> ResolvedMusicStream {
         try await resolve(songID, platform: platform, quality: quality)
     }

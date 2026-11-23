@@ -76,6 +76,9 @@ public enum MusicBrowse {
     public private(set) var incomplete = false
     private let sources: [any MusicBrowseSource]
     private var answers: [Int: [MusicBrowseSection]] = [:]
+    private var retrySources: Set<Int> = []
+    private var sourceRevisions: [Int: UInt64] = [:]
+    @PerceptionIgnored private var loadTask: Task<Void, Never>?
     private var loadedAt: Date?
     static let lifetime: TimeInterval = 6 * 60 * 60
 
@@ -91,35 +94,57 @@ public enum MusicBrowse {
     /// Fetches what is missing or stale; `refresh` fetches everything again. Shelves already shown stay
     /// until their catalog answers anew.
     public func load(refresh: Bool = false, now: Date = Date()) async {
-        guard !loading else { return }
+        guard !Task.isCancelled else { return }
+        while let loadTask {
+            await loadTask.value
+            guard !Task.isCancelled, refresh else { return }
+        }
         let stale = refresh || loadedAt.map { now.timeIntervalSince($0) > Self.lifetime } == true
-        let wanted = sources.indices.filter { stale || answers[$0] == nil }
+        let wanted = sources.indices.filter { stale || answers[$0] == nil || retrySources.contains($0) }
         guard !wanted.isEmpty else { return }
         loading = true
-        defer { loading = false }
-        var failed = false
-        await withTaskGroup(of: (Int, [MusicBrowseSection]?).self) { group in
-            for index in wanted {
-                let source = sources[index]
-                group.addTask { (index, try? await source.browseSections()) }
+        let revisions = sourceRevisions
+        // Home and search share a retained model, but SwiftUI cancels Home's
+        // view task when search opens or a detail is pushed. The model owns this
+        // bounded catalog fetch so a quick return can join it instead of losing
+        // its only load behind the departing view's `loading` flag.
+        let operation = Task {
+            defer { loading = false; loadTask = nil }
+            await withTaskGroup(of: (Int, [MusicBrowseSection]?).self) { group in
+                for index in wanted {
+                    let source = sources[index]
+                    group.addTask { (index, try? await source.browseSections()) }
+                }
+                for await (index, answer) in group {
+                    // Settings may replace/disable an extension while its old
+                    // response is in flight. Only the current source can publish.
+                    guard sourceRevisions[index, default: 0] == revisions[index, default: 0] else { continue }
+                    guard let answer, !answer.isEmpty || sources[index].mayBeEmpty else {
+                        retrySources.insert(index)
+                        continue
+                    }
+                    answers[index] = answer
+                    retrySources.remove(index)
+                    sections = MusicBrowse.merge(sources.indices.compactMap { answers[$0] })
+                }
             }
-            for await (index, answer) in group {
-                guard let answer, !answer.isEmpty || sources[index].mayBeEmpty else { failed = true; continue }
-                answers[index] = answer
-                sections = MusicBrowse.merge(sources.indices.compactMap { answers[$0] })
-            }
+            incomplete = !retrySources.isEmpty
+            // The clock runs from the last time every catalog was asked, not from a retry of one.
+            if wanted.count == sources.count { loadedAt = now }
         }
-        // Leaving the page cancels the fetch; that is not a failure, and the next visit finishes it.
-        guard !Task.isCancelled else { return }
-        incomplete = failed
-        // The clock runs from the last time every catalog was asked, not from a retry of one.
-        if wanted.count == sources.count { loadedAt = now }
+        loadTask = operation
+        await operation.value
     }
 
     /// Fetches `platform`'s shelves again, the others staying: after music extensions were added or turned off.
     public func reload(_ platform: MusicPlatform) async {
-        for index in sources.indices where sources[index].platform == platform { answers[index] = nil }
+        for index in sources.indices where sources[index].platform == platform {
+            sourceRevisions[index, default: 0] &+= 1
+            retrySources.insert(index)
+            answers[index] = nil
+        }
         sections = MusicBrowse.merge(sources.indices.compactMap { answers[$0] })
+        if let loadTask { await loadTask.value }
         await load()
     }
 }

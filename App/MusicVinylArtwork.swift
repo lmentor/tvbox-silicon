@@ -21,33 +21,54 @@ enum MusicNowPlayingDismissal {
 }
 
 #if os(iOS)
+import QuartzCore
 import SwiftUI
 import Perception
 
+/// The compositor advances a persistent layer; no frame clock publishes SwiftUI
+/// state or reconstructs the record / poster while the finger is moving.
+@MainActor
+final class MusicVinylRotation {
+    private weak var layer: CALayer?
+    private var phase = MusicVinylPhase()
+    private var trackID: String?
+    private var running = false
+
+    init(layer: CALayer) { self.layer = layer }
+
+    func update(trackID: String, running: Bool, at time: TimeInterval) {
+        guard self.trackID != trackID || self.running != running, let layer else { return }
+        if self.trackID != trackID { phase.reset(running: running, at: time) }
+        else { phase.setRunning(running, at: time) }
+        self.trackID = trackID
+        self.running = running
+        let radians = phase.degrees(at: time) * .pi / 180
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: "music.vinyl.rotation")
+        layer.transform = CATransform3DMakeRotation(CGFloat(radians), 0, 0, 1)
+        if running {
+            let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+            animation.fromValue = radians
+            animation.toValue = radians + .pi * 2
+            animation.duration = 24
+            animation.repeatCount = .infinity
+            animation.timingFunction = CAMediaTimingFunction(name: .linear)
+            layer.add(animation, forKey: "music.vinyl.rotation")
+        }
+        CATransaction.commit()
+    }
+}
+
 struct MusicVinylArtwork: View {
     let url: URL?
-    let trackID: String
     let size: CGFloat
-    let playing: Bool
-    @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var phase = MusicVinylPhase()
-    @State private var visible = false
-    private var running: Bool { visible && playing && scenePhase == .active && !reduceMotion }
-    private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !running)) { _ in
-            WithPerceptionTracking {
-                record.rotationEffect(.degrees(phase.degrees(at: now)))
-            }
+        WithPerceptionTracking {
+            record.frame(width: size, height: size)
         }
-        .frame(width: size, height: size)
-        .shadow(color: .black.opacity(0.4), radius: 16, y: 10)
-        .onAppear { visible = true; phase.setRunning(playing && scenePhase == .active && !reduceMotion, at: now) }
-        .onDisappear { phase.setRunning(false, at: now); visible = false }
-        .appOnChange(of: running) { _, active in phase.setRunning(active, at: now) }
-        .appOnChange(of: trackID) { _, _ in phase.reset(running: running, at: now) }
-        .accessibilityLabel("黑胶唱片封面").accessibilityValue(playing ? "正在播放" : "已暂停")
+        .ignoresSafeArea().environment(\.colorScheme, .dark)
+        .accessibilityHidden(true)
     }
     private var record: some View {
         ZStack {

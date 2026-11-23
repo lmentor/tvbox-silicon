@@ -8,13 +8,15 @@ struct LocalSearchSettingsView: View {
     @State private var preferences: LocalSearchPreferences
     @State private var selectedGroup: String?
     @State private var query = ""
-    init(config: Subscription) {
+    private var changed: () -> Void
+    init(config: Subscription, changed: @escaping () -> Void = {}) {
         self.config = config
+        self.changed = changed
         let preferences = LocalSearchPreferences.load(config: config)
         _preferences = State(initialValue: preferences)
         _selectedGroup = State(initialValue: preferences.groups.first?.id)
     }
-    private var sites: [Site] { config.sites.filter { $0.searchable && $0.canBrowse(jarURL: config.spiderURL) } }
+    private var sites: [Site] { (config.sites + LocalSearchManga.sites).filter { $0.searchable && $0.canBrowse(jarURL: config.spiderURL) } }
     private var visible: [Site] { sites.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query.trimmingCharacters(in: .whitespacesAndNewlines)) } }
     private var groupIndex: Int? { preferences.groups.firstIndex { $0.id == selectedGroup } }
     private func enabled(_ site: Site) -> Bool {
@@ -57,12 +59,26 @@ struct LocalSearchSettingsView: View {
                     #if os(iOS)
                     LocalGlassChoicePicker(title: "搜索模式", selection: $preferences.mode,
                                            options: LocalSearchPreferences.Mode.allCases.map { .init($0, $0.title) })
+                    LocalGlassChoicePicker(title: "搜索结果", selection: $preferences.resultOrder,
+                                           options: LocalSearchPreferences.ResultOrder.allCases.map { .init($0, $0.title) })
+                    LocalGlassChoicePicker(title: "关键词", selection: $preferences.keywordMode,
+                                           options: LocalSearchPreferences.KeywordMode.allCases.map { .init($0, $0.title) })
                     #else
                     Picker("搜索模式", selection: $preferences.mode) {
                         ForEach(LocalSearchPreferences.Mode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
                     }.pickerStyle(.segmented)
+                    Picker("搜索结果", selection: $preferences.resultOrder) {
+                        ForEach(LocalSearchPreferences.ResultOrder.allCases, id: \.self) { order in Text(order.title).tag(order) }
+                    }.pickerStyle(.segmented)
+                    Picker("关键词", selection: $preferences.keywordMode) {
+                        ForEach(LocalSearchPreferences.KeywordMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                    }.pickerStyle(.segmented)
                     #endif
-                    Text(preferences.mode == .all ? "查询所有支持搜索的站点，不受默认开关影响。" : preferences.mode == .default ? "勾选默认搜索的站点；关闭的站点仍可在全部模式中搜索。" : "按分组选择站点；同一站点加入多个分组只查询一次，首先显示第一个分组。")
+                    Text(preferences.mode == .all ? "按设置顺序查询全部订阅、Python 和已安装漫画站点，不受默认开关影响。" : preferences.mode == .default ? "勾选默认搜索的站点；关闭的站点仍可在全部模式中搜索。" : "按分组顺序查询，各组内保持设置中的站点顺序；同一站点只查询一次，首先显示全部分组。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text(preferences.resultOrder == .default ? "默认顺序按设置排列，稍后返回的结果插入对应位置。" : "结果优先按返回时间追加，已显示的结果保持原位。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text(preferences.keywordMode == .default ? "默认搜索保留站点返回的结果。" : preferences.keywordMode == .contains ? "模糊搜索只显示标题包含关键词的结果。" : "精确搜索只显示标题与关键词相同的结果。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }.listRowBackground(Color.clear)
                 if preferences.mode == .groups {
@@ -100,22 +116,23 @@ struct LocalSearchSettingsView: View {
                         }.disabled(preferences.groups.count >= 32)
                     }.listRowBackground(Color.clear)
                 }
-                if preferences.mode != .all {
-                    Section(preferences.mode == .default ? "默认参与的站点" : "当前分组的站点") {
-                        TextField("筛选站点", text: $query)
+                Section(preferences.mode == .all ? "搜索顺序" : preferences.mode == .default ? "默认参与的站点" : "当前分组的站点") {
+                    TextField("筛选站点", text: $query)
+                    if preferences.mode != .all {
                         HStack {
                             Button("全选") { visible.forEach { set($0, true) } }
                             Spacer()
                             Button("全不选") { visible.forEach { set($0, false) } }
                         }
-                        ForEach(visible) { site in
-                            Toggle(site.name, isOn: Binding(get: { enabled(site) }, set: { set(site, $0) }))
-                        }
-                    }.listRowBackground(Color.clear)
-                        .disabled(preferences.mode == .groups && groupIndex == nil)
-                }
+                    }
+                    ForEach(visible) { site in
+                        if preferences.mode == .all { Text(site.name) }
+                        else { Toggle(site.name, isOn: Binding(get: { enabled(site) }, set: { set(site, $0) })) }
+                    }
+                }.listRowBackground(Color.clear)
+                    .disabled(preferences.mode == .groups && groupIndex == nil)
             }
-            .appOnChange(of: preferences) { _, value in value.save(config: config) }
+            .appOnChange(of: preferences) { _, value in value.save(config: config); changed() }
         }
     }
 }

@@ -5,6 +5,29 @@ public struct LocalSearchPreferences: Codable, Equatable, Sendable {
         case `default`, all, groups
         public var title: String { switch self { case .default: "默认"; case .all: "全部"; case .groups: "分组" } }
     }
+    public enum ResultOrder: String, Codable, CaseIterable, Sendable {
+        case `default`, arrival
+        public var title: String { self == .default ? "默认顺序" : "结果优先" }
+    }
+    public enum KeywordMode: String, Codable, CaseIterable, Sendable {
+        case `default`, contains, exact
+        public var title: String {
+            switch self { case .default: "默认搜索"; case .contains: "模糊搜索"; case .exact: "精确搜索" }
+        }
+        /// Compare the displayed title consistently without removing meaningful punctuation
+        /// or expanding synonyms. Canonically equivalent text and letter case match.
+        public func accepts(_ title: String, keyword: String) -> Bool {
+            guard self != .default else { return true }
+            let title = Self.normalized(title), keyword = Self.normalized(keyword)
+            guard !keyword.isEmpty else { return true }
+            return self == .exact ? title == keyword : title.contains(keyword)
+        }
+        private static func normalized(_ text: String) -> String {
+            text.precomposedStringWithCompatibilityMapping
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        }
+    }
     public struct Group: Codable, Equatable, Identifiable, Sendable {
         public var id: String
         public var name: String
@@ -14,9 +37,20 @@ public struct LocalSearchPreferences: Codable, Equatable, Sendable {
         }
     }
     public var mode: Mode = .default
+    public var resultOrder: ResultOrder = .default
+    public var keywordMode: KeywordMode = .default
     public var disabledSiteIDs: Set<String> = []
     public var groups: [Group] = []
     public init() {}
+    private enum CodingKeys: String, CodingKey { case mode, resultOrder, keywordMode, disabledSiteIDs, groups }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        mode = (try? values.decode(Mode.self, forKey: .mode)) ?? .default
+        resultOrder = (try? values.decode(ResultOrder.self, forKey: .resultOrder)) ?? .default
+        keywordMode = (try? values.decode(KeywordMode.self, forKey: .keywordMode)) ?? .default
+        disabledSiteIDs = try values.decodeIfPresent(Set<String>.self, forKey: .disabledSiteIDs) ?? []
+        groups = try values.decodeIfPresent([Group].self, forKey: .groups) ?? []
+    }
     /// Stable membership is independent of collision suffixes and imported code versions.
     public static func memberID(for site: Site, fallbackOrigin: URL? = nil) -> String {
         guard let origin = site.provenance?.origin ?? fallbackOrigin else { return site.id }
@@ -49,15 +83,16 @@ public struct LocalSearchPreferences: Codable, Equatable, Sendable {
     public func resolvedGroups(sites: [Site]) -> [Group] {
         // Resolve each stable provenance identity once. A group containing 400 sources
         // previously recomputed all 400 SHA-256 identities for every one of its members.
-        var members: [String: [String]] = [:]
+        var members: [String: String] = [:]
         for site in sites {
-            let stable = Self.memberID(for: site)
-            members[stable, default: []].append(site.id)
-            if stable != site.id { members[site.id, default: []].append(site.id) }
+            members[site.id] = Self.memberID(for: site)
         }
         return groups.map { group in
             var value = group
-            value.siteIDs = group.siteIDs.flatMap { members[$0] ?? [] }
+            let included = Set(group.siteIDs)
+            value.siteIDs = sites.compactMap { site in
+                included.contains(site.id) || included.contains(members[site.id] ?? site.id) ? site.id : nil
+            }
             return value
         }
     }
@@ -67,9 +102,9 @@ public struct LocalSearchPreferences: Codable, Equatable, Sendable {
         case .all: return eligible
         case .default: return eligible.filter { !disabledSiteIDs.contains(Self.memberID(for: $0)) && !disabledSiteIDs.contains($0.id) }
         case .groups:
-            let byID = Dictionary(eligible.flatMap { [(Self.memberID(for: $0), $0), ($0.id, $0)] }, uniquingKeysWith: { first, _ in first })
+            let byID = Dictionary(eligible.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             var seen = Set<String>()
-            return groups.flatMap(\.siteIDs).compactMap { id in
+            return resolvedGroups(sites: eligible).flatMap(\.siteIDs).compactMap { id in
                 guard let site = byID[id], seen.insert(site.id).inserted else { return nil }
                 return site
             }

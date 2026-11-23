@@ -18,7 +18,6 @@ globalThis.fetch = mobileFetch;
 const sourceRequests = new AsyncLocalStorage();
 let messagesPort = workerData.messagesPort;
 let danmakuOwner;
-installRequestCancellation(sourceRequests, { bridgePort: () => messagesPort });
 setProxy(workerData.proxy);
 globalThis.catDartServerPort = () => messagesPort;
 let server, lastPort, opened = false;
@@ -29,13 +28,14 @@ const searchActivity = (operation, delta) => {
     const count = (searchOperations.get(operation) || 0) + delta;
     if (count > 0) searchOperations.set(operation, count); else searchOperations.delete(operation);
 };
-const activity = (delta, search = false, operation) => {
+const activity = (delta, search = false, operation, operationDelta = delta) => {
     activeHTTP = Math.max(0, activeHTTP + delta);
     if (search) activeSearchHTTP = Math.max(0, activeSearchHTTP + delta);
-    if (search) searchActivity(operation, delta);
+    if (operation) searchActivity(operation, operationDelta);
     parentPort.postMessage({ activity: { active: activeHTTP + activeHandlers,
         searches: activeSearchHTTP + activeSearchHandlers, searchOperations: [...searchOperations.keys()], at: Date.now() } });
 };
+installRequestCancellation(sourceRequests, { bridgePort: () => messagesPort, activity });
 const relistenLocal = trackLocalHTTPListeners(() => server, activity);
 globalThis.catServerFactory = handler => {
     server = http.createServer((req, res) => {
@@ -50,16 +50,17 @@ globalThis.catServerFactory = handler => {
         patchSourceLimiters(globalThis.__CAT_JS_UTIL, sourceRequests);
         const search = req.headers['x-yingxia-search'] === '1';
         const operation = req.headers['x-yingxia-search-operation'];
-        if (search) { activeSearchHandlers += 1; searchActivity(operation, 1); }
+        if (search) activeSearchHandlers += 1;
+        searchActivity(operation, 1);
         activeHandlers += 1; activity(0);
         let result;
         try { result = runSourceRequest(sourceRequests, req, res, handler, server); }
-        catch (error) { activeHandlers -= 1; if (search) { activeSearchHandlers -= 1; searchActivity(operation, -1); } activity(0); throw error; }
+        catch (error) { activeHandlers -= 1; if (search) activeSearchHandlers -= 1; searchActivity(operation, -1); activity(0); throw error; }
         Promise.resolve(result).catch(error => {
             log('CATPAW_HANDLER', thrownText(error));
             if (!res.headersSent) res.writeHead(500);
             res.end();
-        }).finally(() => { activeHandlers -= 1; if (search) { activeSearchHandlers -= 1; searchActivity(operation, -1); } activity(0); });
+        }).finally(() => { activeHandlers -= 1; if (search) activeSearchHandlers -= 1; searchActivity(operation, -1); activity(0); });
         return result;
     });
     opened = false;

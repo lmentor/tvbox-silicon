@@ -9,7 +9,7 @@ extension Site {
         default: enabled = true
         }
         return enabled && !Self.disabledSearch(raw["supportSearch"])
-            && raw["indexs"] != .bool(true) && raw["indexs"]?.int != 1
+            && !isIndexSource
     }
     private static func disabledSearch(_ value: JSONValue?) -> Bool {
         value == .bool(false) || value == .number(0) || value == .string("0") || value == .string("false")
@@ -50,7 +50,16 @@ public struct SearchSourceResult: Identifiable, Sendable {
     public let site: Site
     public let page: CatalogPage?
     public let error: String?
+    public let mangaPage: MangaPage?
+    /// The first retained match may come from a later page after title filtering.
+    public let pageNumber: Int
+    public let unfilteredPageFingerprint: String?
     public var id: String { site.id }
+    public init(site: Site, page: CatalogPage?, error: String?, mangaPage: MangaPage? = nil,
+                pageNumber: Int = 1, unfilteredPageFingerprint: String? = nil) {
+        self.site = site; self.page = page; self.error = error; self.mangaPage = mangaPage
+        self.pageNumber = pageNumber; self.unfilteredPageFingerprint = unfilteredPageFingerprint
+    }
 }
 
 /// A materialized video card. IDs are scoped to a source, so equal IDs from different
@@ -69,7 +78,9 @@ public enum GlobalSearch {
     /// Native HTTP, embedded Python, QuickJS and Node have independent limits inside one
     /// global memory/network budget. Pending sources are data, not hundreds of running tasks.
     public static func search(sites: [Site], origin: URL, jarURL: URL?, query: String,
-                              http: HTTPClient = HTTPClient(), concurrency: Int = 8,
+                              http: HTTPClient = HTTPClient(), retryFailures: Bool = false, concurrency: Int = 30,
+                              deadlineSeconds: Double? = nil,
+                              customSearch: (@Sendable (Site) async -> SearchSourceResult?)? = nil,
                               onResult: @escaping @Sendable (SearchSourceResult) async -> Void) async {
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !keyword.isEmpty, !Task.isCancelled else { return }
@@ -78,23 +89,32 @@ public enum GlobalSearch {
         let runtimeCounts = Dictionary(grouping: eligible, by: lane).mapValues(\.count)
         Diagnostics.shared.record(.info, "search", "begin sources=\(eligible.count) skipped=\(sites.count - eligible.count) runtimes=\(runtimeCounts)")
         defer { Diagnostics.shared.record(.info, "search", "end elapsed=\(began.duration(to: .now)) cancelled=\(Task.isCancelled)") }
-        let width = min(8, max(1, concurrency))
-        let limits: [SearchScheduler.Lane: Int] = [.native: min(6, width), .python: min(4, width),
-            .quickJS: min(4, width), .node: width, .jar: min(5, width)]
-        await SearchScheduler.search(sites: eligible, maximumConcurrent: min(12, width * 2), limits: limits,
+        let width = min(SearchScheduler.maximumConcurrent, max(1, concurrency))
+        let limits = SearchScheduler.runtimeLimits.mapValues { min($0, width) }
+        await SearchScheduler.search(sites: eligible, maximumConcurrent: width, limits: limits,
                                      lane: lane, operation: { site in
-            await fetchPage(site: site, origin: origin, jarURL: jarURL, keyword: keyword, page: 1, http: http)
+            if let custom = await customSearch?(site) { return custom }
+            return await fetchPage(site: site, origin: origin, jarURL: jarURL, keyword: keyword, page: 1,
+                                   http: http, retryFailures: retryFailures, deadlineSeconds: deadlineSeconds)
         }, onResult: onResult)
+    }
+
+    /// Detail and manga work use the same cross-query budget as automatic searches.
+    /// The operation must await its real runtime completion even after cancellation.
+    public static func withAdmission<Value: Sendable>(site: Site? = nil,
+                         operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        try await SearchScheduler.withPermit(lane: site.map(lane) ?? .native, operation: operation)
     }
 
     /// Pagination shares the same admission budget as first-page and replacement searches.
     static func page(site: Site, origin: URL, jarURL: URL?, query: String, page: Int, http: HTTPClient) async -> SearchSourceResult {
         await SearchScheduler.request(site: site, lane: lane(site)) {
-            await fetchPage(site: site, origin: origin, jarURL: jarURL, keyword: query, page: page, http: http)
+            await fetchPage(site: site, origin: origin, jarURL: jarURL, keyword: query, page: page, http: http, retryFailures: true)
         }
     }
 
     private static func lane(_ site: Site) -> SearchScheduler.Lane {
+        if site.raw["localMangaSource"] != nil { return .quickJS }
         if site.native { return .native }
         switch site.preferredRuntime {
         case .python: return .python
@@ -105,23 +125,27 @@ public enum GlobalSearch {
     }
 
     private enum Answer: Sendable {
-        case page(CatalogPage), failure(String), expired, cancelled
+        case page(CatalogPage), failure(any Error), expired, cancelled
     }
-    private static func fetchPage(site: Site, origin: URL, jarURL: URL?, keyword: String, page: Int, http: HTTPClient) async -> SearchSourceResult {
+    private static func fetchPage(site: Site, origin: URL, jarURL: URL?, keyword: String, page: Int, http: HTTPClient,
+                                  retryFailures: Bool, deadlineSeconds: Double? = nil) async -> SearchSourceResult {
         let began = ContinuousClock.now
         // A first plugin answer includes its local module preparation. HTTP sources need less.
-        let seconds = lane(site) == .native ? 15 : 25
+        // Automatic searches probe a recent failure briefly; an explicit retry gets the full budget.
+        let recentlyFailed = await SourceHealth.shared.failedRecently(site, origin: origin)
+        let standardSeconds: Double = !retryFailures && recentlyFailed ? 8 : (lane(site) == .native ? 15 : 25)
+        let seconds = deadlineSeconds.flatMap { $0.isFinite ? min(standardSeconds, max(0.05, $0)) : nil } ?? standardSeconds
         let answer = await withTaskGroup(of: Answer.self) { group in
             group.addTask {
                 do {
                     try Task.checkCancellation()
                     let page = try await CatalogClient(site: site, origin: origin, http: http, jarURL: jarURL)
-                        .list(category: nil, query: keyword, page: page)
+                        .list(category: nil, query: keyword, page: page, recordHealth: false)
                     try Task.checkCancellation()
                     return .page(page)
                 } catch {
                     if Task.isCancelled { return .cancelled }
-                    return .failure(error.localizedDescription)
+                    return .failure(error)
                 }
             }
             group.addTask {
@@ -135,14 +159,23 @@ public enum GlobalSearch {
             return first
         }
         let elapsed = began.duration(to: .now)
+        // A user stop/replacement can arrive while native cancellation unwinds. It is never
+        // a source failure, even if the deadline won just before that cancellation.
+        guard !Task.isCancelled else {
+            return SearchSourceResult(site: site, page: nil, error: CancellationError().localizedDescription)
+        }
         switch answer {
         case .page(let page):
+            await SourceHealth.shared.record(site, origin: origin, seconds: elapsed.seconds, error: nil)
             Diagnostics.shared.record(.debug, "search", "source=\(site.key) ok videos=\(page.videos.count) elapsed=\(elapsed)")
             return SearchSourceResult(site: site, page: page, error: nil)
         case .expired:
+            await SourceHealth.shared.record(site, origin: origin, seconds: elapsed.seconds, error: URLError(.timedOut))
             Diagnostics.shared.record(.warning, "search", "source=\(site.key) deadline=\(seconds)s elapsed=\(elapsed)")
             return SearchSourceResult(site: site, page: nil, error: "站点搜索超过 \(seconds) 秒，可单独重试。")
-        case .failure(let message):
+        case .failure(let error):
+            await SourceHealth.shared.record(site, origin: origin, seconds: elapsed.seconds, error: error)
+            let message = error.localizedDescription
             Diagnostics.shared.record(.warning, "search", "source=\(site.key) failed elapsed=\(elapsed) error=\(message)")
             return SearchSourceResult(site: site, page: nil, error: message)
         case .cancelled:

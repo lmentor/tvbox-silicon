@@ -38,6 +38,7 @@ import UniformTypeIdentifiers
     var offset = 0.0
     var enabled = UserDefaults.standard.object(forKey: "danmakuEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "danmakuEnabled") {
         didSet {
+            guard enabled != oldValue else { return }
             UserDefaults.standard.set(enabled, forKey: "danmakuEnabled")
             if !enabled { cancelAutomatic() }
             else if comments.isEmpty { startAutomatic(automaticContext) }
@@ -46,6 +47,7 @@ import UniformTypeIdentifiers
     }
     var automatic = UserDefaults.standard.object(forKey: "danmakuAutoMatch") == nil ? true : UserDefaults.standard.bool(forKey: "danmakuAutoMatch") {
         didSet {
+            guard automatic != oldValue else { return }
             UserDefaults.standard.set(automatic, forKey: "danmakuAutoMatch")
             if automatic { startAutomatic(automaticContext) } else { cancelAutomatic() }
             if !reloadingSettings { nativeAutomatic?() }

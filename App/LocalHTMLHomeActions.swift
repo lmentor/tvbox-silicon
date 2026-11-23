@@ -58,7 +58,7 @@ import TVCore
             }
             let headers = try mergedHeaders(payload)
             let request = MediaPushRequest(input: media.url.absoluteString, title: string(payload, "title"), headers: headers)
-            let record = try LocalMediaLibrary.shared.register(request, mode: bool(payload, "sniff") ? .sniff : .direct)
+            let record = try LocalMediaLibrary.shared.register(request, mode: bool(payload, "sniff") ? .sniff : .direct, htmlSourceID: home?.id)
             var client = CatalogClient(site: record.site, origin: LocalMediaLibrary.origin)
             if let config = store.subscription { client = client.applying(config) }
             let video = record.video.keepingPoster(poster(payload))
@@ -88,26 +88,27 @@ import TVCore
                 return ["id": item.id, "state": status?.state.rawValue ?? "uncertain", "summary": status?.summary ?? "暂时无法确认"]
             } : []]
         case "pan.play":
-            var raw = string(payload, "url")
+            var raw = string(payload, "url").trimmingCharacters(in: .whitespacesAndNewlines)
             if raw.lowercased().hasPrefix("push://") { raw = String(raw.dropFirst(7)) }
-            var share = try LocalHTMLHomePolicy.address(raw)
+            var input = try LocalHTMLHomePolicy.pushInput(raw)
             if string(payload, "type") == "http" {
-                var direct = payload; direct["url"] = share.absoluteString; direct["sniff"] = true
+                var direct = payload; direct["url"] = try LocalHTMLHomePolicy.address(input).absoluteString; direct["sniff"] = true
                 direct["title"] = string(payload, "title", "name", "vod_name")
                 return try await invoke("player.playUrl", payload: direct, store: store, openRoute: openRoute)
             }
             let kind = diskType(string(payload, "type")), password = String(string(payload, "password", "pwd").prefix(100))
             let keys = ["quark":"pwd", "baidu":"pwd", "123":"pwd", "uc":"pwd", "xunlei":"pwd", "115":"password", "pikpak":"pass_code", "guangya":"code"]
-            if !password.isEmpty, let key = keys[kind], var components = URLComponents(url: share, resolvingAgainstBaseURL: false) {
+            if !password.isEmpty, let key = keys[kind], var components = URLComponents(string: input),
+               ["http", "https"].contains(components.scheme?.lowercased() ?? "") {
                 let remaining = (components.queryItems ?? []).filter { $0.name != key }
                 components.queryItems = [URLQueryItem(name: key, value: password)] + remaining
-                if let value = components.url { share = value }
+                if let value = components.url { input = value.absoluteString }
             }
             guard let config = store.subscription else { throw LocalHTMLHomeError("请先导入包含网盘推送站点的订阅") }
             let sources = MediaPush.sources(config.sites).filter { $0.canBrowse(jarURL: config.spiderURL) }
             guard let site = sources.first(where: { $0.origin(or: config.origin).absoluteString == historyScope }) ?? sources.first else { throw LocalHTMLHomeError("当前订阅没有可用的推送站点") }
             let base = CatalogClient(site: site, origin: config.origin, jarURL: config.spiderURL).applying(config)
-            let request = MediaPushRequest(input: share.absoluteString, title: string(payload, "title", "name", "vod_name"))
+            let request = MediaPushRequest(input: input, title: string(payload, "title", "name", "vod_name"))
             let model = MediaPushModel()
             await model.resolve(request, client: base); try current()
             guard let found = model.video else { throw LocalHTMLHomeError(model.error ?? "网盘未返回可播放资源") }
@@ -155,12 +156,24 @@ import TVCore
         let vodID = string(payload, "vod_id"), flag = string(payload, "vod_play_from").isEmpty ? "HTML 首页" : string(payload, "vod_play_from")
         let live = bool(payload, "isLive") || flag == "直播" || vodID.range(of: "^bililive_\\d+$", options: .regularExpression) != nil
         let fallback = originalWorkURL(vodID, home: home)
-        let key = (home?.id ?? "html") + "\n" + (vodID.isEmpty ? title + "\n" + original(rows[index], fallback: fallback) : vodID)
-        let id = "html-media-" + SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        let references = rows.enumerated().map { offset, row in
+            let page = original(row, fallback: fallback)
+            return HTMLHomePlayback.EpisodeReference(id: "", name: string(row, "name").isEmpty ? "第\(offset + 1)集" : string(row, "name"),
+                pageURL: page, resolverURL: HTMLHomePlayback.resolverIdentity(string(row, "resolverURL", "url"), pageURL: page,
+                                                                           mediaURL: string(row, "mediaUrl")))
+        }
+        let sourceID = home?.id ?? "html"
+        let id: String
+        if let stable = HTMLHomePlayback.historyID(sourceID: sourceID, workID: vodID, title: title, episodes: references, fallbackPage: fallback) {
+            id = stable
+        } else {
+            let key = try JSONEncoder().encode([sourceID, title] + rows.map { string($0, "mediaUrl", "url") }.sorted())
+            id = "html-media-" + SHA256.hash(data: key).map { String(format: "%02x", $0) }.joined()
+        }
         var episodes: [Episode] = [], plans: [String: PlaybackPlan] = [:]
         for (offset, row) in rows.enumerated() {
-            let name = string(row, "name").isEmpty ? "第\(offset + 1)集" : string(row, "name")
-            let episode = Episode(id: id + "-\(offset)", name: name, address: original(row, fallback: fallback), flag: flag, videoID: id)
+            let name = references[offset].name
+            let episode = Episode(id: id + "-\(offset)", name: name, address: references[offset].pageURL, flag: flag, videoID: id)
             episodes.append(episode)
             if bool(row, "resolve"), string(row, "mediaUrl").isEmpty { continue }
             do {
@@ -177,11 +190,10 @@ import TVCore
         let video = Video(id: id, name: title, poster: poster(payload), episodes: episodes)
         let reference = home.map { home in
             HTMLHomePlayback.History(sourceID: home.id, workID: vodID, isLive: live,
-                episodes: zip(rows, episodes).map { row, episode in
+                episodes: zip(references, episodes).map { reference, episode in
                     HTMLHomePlayback.EpisodeReference(id: episode.id, name: episode.name, pageURL: episode.address,
-                        resolverURL: HTMLHomePlayback.resolverIdentity(string(row, "resolverURL", "url"), pageURL: episode.address,
-                            mediaURL: string(row, "mediaUrl")))
-                })
+                                                     resolverURL: reference.resolverURL)
+                }, historyID: id, fallbackPage: fallback)
         }
         try current()
         let record = try LocalMediaLibrary.shared.registerHTML(MediaPushRequest(input: selected.address, title: title), video: video, htmlHome: reference)

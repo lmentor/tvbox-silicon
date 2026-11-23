@@ -20,6 +20,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .python: return "python"
         case .history: return "观看"
         case .favorites: return "收藏"
+        case .live: return "直播"
         case .music: return "音乐"
         case .push: return "推送"
         case .settings, .more: return "设置"
@@ -114,7 +115,7 @@ struct RootView: View {
     #endif
     /// A message from the website waits while a video plays or another alert or sheet is up.
     private var messageWaits: Bool {
-        var busy = store.playing != nil || store.error != nil || updates.sheet != nil || updates.message != nil || PluginSignIn.shared.prompt != nil
+        var busy = store.playing != nil || store.historyPlaybackPreparation != nil || store.error != nil || updates.sheet != nil || updates.message != nil || PluginSignIn.shared.prompt != nil
         #if os(tvOS)
         busy = busy || store.music.presentsPlayer
         #endif
@@ -174,7 +175,9 @@ struct RootView: View {
                 if section != .search { store.searchModel.suspend() }
             }
             // A Baidu or Aliyun line waiting for its plugin's sign-in code to be scanned.
-            .sheet(item: Binding(get: { PluginSignIn.shared.prompt }, set: { if $0 == nil { PluginSignIn.shared.dismiss() } })) { perceptionArgument0 in
+            .sheet(item: Binding(get: { store.historyPlaybackPreparation == nil ? PluginSignIn.shared.prompt : nil }, set: {
+                if $0 == nil, store.historyPlaybackPreparation == nil { PluginSignIn.shared.dismiss() }
+            })) { perceptionArgument0 in
                 WithPerceptionTracking {
                     PluginSignInView(prompt: perceptionArgument0)
                 }
@@ -395,7 +398,7 @@ struct RootView: View {
         case .search: GlobalSearchView()
         case .live:
             #if os(iOS)
-            DiscoverView()
+            IPTVBrowserView()
             #else
             LiveView()
             #endif
@@ -458,7 +461,8 @@ private struct TVMoreView: View {
 #if !os(macOS)
 /// What the player cover shows; the same presentation whichever channel it holds.
 private struct PlayerSlot: Identifiable {
-    let channel: Channel
+    var channel: Channel?
+    var preparation: HistoryPlaybackPreparation?
     var id: String { "player" }
 }
 #endif
@@ -471,6 +475,8 @@ private struct PlayerPresentation: ViewModifier {
     #endif
     #if os(macOS)
     @State private var playerWindow = PlayerWindowController()
+    #else
+    @State private var historyPresentationLifetime = PlayerPresentationLifetime()
     #endif
     func body(content: Content) -> some View {
         WithPerceptionTracking {
@@ -483,6 +489,7 @@ private struct PlayerPresentation: ViewModifier {
                 }
             }
             #else
+            let historyCoverLifetime = historyPresentationLifetime
             #if os(iOS)
             let presentationID = orientationID
             #endif
@@ -494,28 +501,49 @@ private struct PlayerPresentation: ViewModifier {
                 #if os(iOS)
                 if PictureInPicture.shared.hidesPlayer { return nil }
                 #endif
-                return playing.map(PlayerSlot.init)
+                if store.retiringHistoryPresentationID != nil { return nil }
+                if let preparation = store.historyPlaybackPreparation, preparation.isPresented {
+                    return PlayerSlot(preparation: preparation)
+                }
+                return playing.map { PlayerSlot(channel: $0) }
             }, set: { value in
                 #if os(iOS)
                 if PictureInPicture.shared.preservesSessionOnDismiss { return }
                 #endif
-                if value == nil { playing = nil }
+                if value == nil {
+                    store.dismissPlayerPresentation(historyCoverLifetime)
+                }
             }), onDismiss: {
                 #if os(iOS)
                 PlayerOrientation.release(presentationID: presentationID)
                 if orientationID === presentationID { orientationID = PlayerOrientation.Presentation() }
                 PictureInPicture.shared.coverDismissed()
                 #endif
+                store.historyPlaybackPresentationDismissed(historyCoverLifetime)
+                if historyPresentationLifetime === historyCoverLifetime { historyPresentationLifetime = PlayerPresentationLifetime() }
             }) { perceptionArgument0 in
-                                                      WithPerceptionTracking {
+                WithPerceptionTracking {
                     // Handed in: the iPad app on a Mac presents a full-screen cover without the presenter's environment
                     // objects, and every video stopped the app there ("No Observable object of type Store found").
-                    #if os(iOS)
-                    PlaybackView(channel: playing ?? perceptionArgument0.channel, orientationID: presentationID).environment(store)
-                    #else
-                    PlaybackView(channel: playing ?? perceptionArgument0.channel).environment(store)
-                    #endif
-                                                      }
+                    Group {
+                        if let preparation = store.historyPreparation(in: historyCoverLifetime) {
+                            HistoryPlaybackPreparationView(preparation: preparation, presentationID: historyCoverLifetime.id).environment(store)
+                        } else if historyCoverLifetime.canPresent, store.playerPresentationLifetime === historyCoverLifetime,
+                                  let channel = playing ?? perceptionArgument0.channel {
+                            #if os(iOS)
+                            PlaybackView(channel: channel, orientationID: presentationID).environment(store)
+                            #else
+                            PlaybackView(channel: channel).environment(store)
+                            #endif
+                        } else {
+                            Color.black.ignoresSafeArea()
+                        }
+                    }
+                    .onAppear {
+                        store.playerPresentationAppeared(historyCoverLifetime, initialPreparationID: perceptionArgument0.preparation?.id,
+                                                       initialChannel: perceptionArgument0.channel)
+                    }
+                }
             }
             #endif
         }

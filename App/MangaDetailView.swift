@@ -58,6 +58,7 @@ struct MangaDetailView: View {
             #endif
             .modifier(MangaNoticeBanner())
             .screenTitle(current.title)
+            .modifier(LocalDetailNavigation())
             .task { if details == nil { await load() } }
             #if os(macOS)
             .appOnChange(of: reading?.id) { _, _ in
@@ -80,8 +81,9 @@ struct MangaDetailView: View {
 
     /// Read from the start, or Continue where the viewer stopped.
     private func readOn() {
-        if let progress = store.progress(comic), let index = chapters.firstIndex(where: { $0.id == progress.chapterID }) ?? (chapters.isEmpty ? 0 : nil) {
-            read(at: index, page: progress.page)
+        if let progress = store.progress(comic) {
+            let position = progress.position(in: chapters)
+            read(at: position.chapter, page: position.page)
         } else {
             read(at: 0, page: 0)
         }

@@ -1004,6 +1004,7 @@ enum PosterPalette {
 
 struct PosterImage: View {
     @AppStorage("local.tmdb.custom.v1") private var tmdbSettings = Data()
+    @Environment(\.usesSearchPosterThumbnails) private var usesSearchPosterThumbnails
     #if os(iOS)
     @Environment(\.isLocalPageActive) private var localPageActive
     #endif
@@ -1014,6 +1015,8 @@ struct PosterImage: View {
     /// Receives the loaded image's width over height, for a frame that shows the whole cover.
     var aspect: Binding<CGFloat?>? = nil
     @State private var bitmap: PosterBitmap?
+    @State private var mounted = false
+    @State private var viewportVisible = false
     @State private var cacheRevision = MediaCache.shared.revision
     #if os(tvOS)
     @Environment(\.coverOverlays) private var overlays
@@ -1028,13 +1031,18 @@ struct PosterImage: View {
         return url.map { PosterResource(url: TMDBServiceSettings.artworkURL($0), headers: headers) }
     }
     private var displayedBitmap: PosterBitmap? {
+        guard !usesSearchPosterThumbnails || loadActive else { return nil }
         guard let resource else { return nil }
-        if let bitmap, bitmap.resource == resource, bitmap.revision == MediaCache.shared.revision { return bitmap }
-        return PosterLoader.cached(resource)
+        if let bitmap, bitmap.resource == resource, bitmap.maxPixels == maxPixels,
+           bitmap.revision == MediaCache.shared.revision { return bitmap }
+        return PosterLoader.cached(resource, maxPixels: maxPixels)
     }
+    private var maxPixels: Int { usesSearchPosterThumbnails ? 360 : 720 }
+    private var loadActive: Bool { pageActive && (!usesSearchPosterThumbnails || (mounted && viewportVisible)) }
     private struct PosterRequest: Equatable {
         let resource: PosterResource?
         let revision: UInt64
+        let maxPixels: Int
         let active: Bool
     }
     private var pageActive: Bool {
@@ -1048,8 +1056,20 @@ struct PosterImage: View {
         WithPerceptionTracking {
             artwork
             .contentShape(.rect)
-            .task(id: PosterRequest(resource: resource, revision: cacheRevision, active: pageActive)) {
-                guard pageActive else { return }
+            .background {
+                #if os(iOS)
+                if usesSearchPosterThumbnails {
+                    SearchPosterViewportObserver(enabled: pageActive && mounted) { visible in
+                        if viewportVisible != visible { viewportVisible = visible }
+                    }.allowsHitTesting(false)
+                }
+                #endif
+            }
+            .task(id: PosterRequest(resource: resource, revision: cacheRevision, maxPixels: maxPixels, active: loadActive)) {
+                guard loadActive else {
+                    if usesSearchPosterThumbnails { bitmap = nil; aspect?.wrappedValue = nil }
+                    return
+                }
                 guard let resource else { bitmap = nil; aspect?.wrappedValue = nil; return }
                 if let image = displayedBitmap {
                     bitmap = image
@@ -1057,11 +1077,13 @@ struct PosterImage: View {
                     return
                 }
                 bitmap = nil; aspect?.wrappedValue = nil
-                if let image = try? await PosterLoader.shared.load(resource), !Task.isCancelled {
+                if let image = try? await PosterLoader.shared.load(resource, maxPixels: maxPixels), !Task.isCancelled {
                     bitmap = image
                     aspect?.wrappedValue = CGFloat(image.image.width) / CGFloat(max(image.image.height, 1))
                 }
             }
+            .onAppear { if usesSearchPosterThumbnails { mounted = true } }
+            .onDisappear { if usesSearchPosterThumbnails { mounted = false; bitmap = nil } }
             .onReceive(NotificationCenter.default.publisher(for: MediaCache.invalidated).receive(on: DispatchQueue.main)) { _ in
                 let revision = MediaCache.shared.revision
                 if cacheRevision != revision { cacheRevision = revision }

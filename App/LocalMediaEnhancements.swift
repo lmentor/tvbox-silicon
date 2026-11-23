@@ -15,6 +15,7 @@ import TVCore
     private(set) var timelineVersion = 0
     var mediaVersion: Int { 0 }
     var serviceReady: Bool { ready }
+    @PerceptionIgnored var history = PlaybackHistory.shared
     var hasSelectedTrack: Bool {
         if catalog.selection.origin == .manual && !nativeManual { return false }
         return catalog.selection.origin == .cleared || indexed || isLive || (!comments.isEmpty && catalog.selection.origin != .manual) || nativeManual
@@ -31,6 +32,34 @@ import TVCore
     @PerceptionIgnored private var channel: Channel?
     @PerceptionIgnored private var descriptor: MediaDanmakuDescriptor?
     @PerceptionIgnored private var loading: Task<Void, Never>?
+    /// Changes to the selected track belong to the playing media even when PiP dismisses its controls.
+    private(set) var selectingTrack = false
+    var trackSelectionError: String?
+    @PerceptionIgnored private var trackSelectionTask: Task<Void, Never>?
+    @PerceptionIgnored private var trackSelectionID = UUID()
+
+    func selectTrack(_ action: @escaping @MainActor () async throws -> Void) {
+        cancelTrackSelection()
+        let id = trackSelectionID
+        selectingTrack = true
+        trackSelectionTask = Task {
+            defer {
+                if trackSelectionID == id { selectingTrack = false; trackSelectionTask = nil }
+            }
+            do { try await action() }
+            catch {
+                if trackSelectionID == id, !Task.isCancelled, !(error is CancellationError) {
+                    trackSelectionError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func cancelTrackSelection() {
+        trackSelectionID = UUID()
+        trackSelectionTask?.cancel(); trackSelectionTask = nil
+        selectingTrack = false; trackSelectionError = nil
+    }
     @PerceptionIgnored private var ready = false
     @PerceptionIgnored private var liveEnabled = true
     @PerceptionIgnored private var indexed = false
@@ -38,6 +67,9 @@ import TVCore
     @PerceptionIgnored private var usesBuiltinSource = false
     @PerceptionIgnored private var selectedCatalogSource: NativeDanmakuCatalogSource?
     @PerceptionIgnored private var pendingCatalogSelection: (source: NativeDanmakuCatalogSource, previous: DanmakuTrackSelection)?
+    @PerceptionIgnored private var historySelection: PlaybackDanmakuSelection?
+    @PerceptionIgnored private var preparedCacheID: String?
+    @PerceptionIgnored private var sourceCommentCount = 0
     @PerceptionIgnored private var builtinEnabled = LocalDanmakuPreferences.builtinEnabled()
     @PerceptionIgnored private var busy = false
     @PerceptionIgnored private var lastWindow = -1000.0
@@ -60,6 +92,16 @@ import TVCore
     }
     func sourceLoaded(count: Int) {
         guard !catalog.selection.hasExplicitChoice else { return }
+        sourceCommentCount = count
+        if count > 0, historySelection == nil || historySelection?.bilibiliCID != nil,
+           let channel, let context = channel.historyContext,
+           let cid = DanmakuSource.bilibiliCID(for: channel.url) {
+            var saved = PlaybackDanmakuSelection(title: historySelection?.title ?? context.videoName,
+                episodeName: historySelection?.episodeName ?? context.episodeName, year: historySelection?.year ?? context.year,
+                manual: false, builtin: true)
+            saved.bilibiliCID = cid
+            saveHistorySelection(saved)
+        }
         setStatus(count > 0 ? "已加载订阅弹幕 · \(count) 条" : "订阅没有返回弹幕",
                   kind: count > 0 ? .success : .information)
     }
@@ -70,6 +112,11 @@ import TVCore
         stop(); self.channel = channel; self.sessionID = sessionID; self.player = player
         CatPawDanmaku.beginPlayback(channel.historyContext, sessionID: sessionID, requestJSON: channel.playback?.requestJSON)
         catalog.beginMedia(channel.historyContext.map { $0.id + "|" + $0.episodeName } ?? channel.id, context: channel.historyContext)
+        historySelection = channel.historyContext.flatMap { history.danmakuSelection(for: $0) } ?? legacyHistorySelection()
+        if let cid = historySelection?.bilibiliCID, UInt64(cid).map({ $0 > 0 }) == true,
+           LocalDanmakuPreferences.builtinEnabled() {
+            DanmakuSource.register(channel.url, feed: "https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=" + cid, duration: nil)
+        }
         descriptor = MediaDanmakuRegistry.descriptor(for: channel.url)
         // Preserve the canonical source answer across remux/proxy URL copies,
         // process-local registry eviction and a restored playback descriptor.
@@ -93,10 +140,22 @@ import TVCore
                 guard active == self.generation else { return }
                 self.ready = true
                 guard self.catalog.enabled else { return }
+                if await self.restoreHistorySelection() { return }
+                guard active == self.generation, !Task.isCancelled, !self.catalog.selection.hasExplicitChoice else { return }
+                if self.historySelection != nil { await self.matchCatalogAutomatically(); return }
                 if let saved = self.rememberedFeed(), let source = self.selectedCatalogSource {
-                    try await self.prepareRemembered(saved, source: source)
-                } else if self.descriptor != nil, LocalDanmakuPreferences.builtinEnabled() { try await self.useSource() }
-                else { await self.matchCatalogAutomatically() }
+                    do { try await self.prepareRemembered(saved, source: source); return }
+                    catch {
+                        guard active == self.generation, !Task.isCancelled else { return }
+                        // A failed old-format manual bookmark must not suppress fallback.
+                        if self.catalog.selection.origin == .cleared { self.catalog.selection = DanmakuTrackSelection() }
+                    }
+                }
+                if self.descriptor != nil, LocalDanmakuPreferences.builtinEnabled() {
+                    do { try await self.useSource(); return }
+                    catch { guard active == self.generation, !Task.isCancelled else { return } }
+                }
+                await self.matchCatalogAutomatically()
             } catch { if active == self.generation, !Task.isCancelled { self.setStatus("弹幕服务暂不可用，可在弹幕面板重试", kind: .warning) } }
         }
     }
@@ -140,8 +199,9 @@ import TVCore
     }
     private func matchCatalogAutomatically() async {
         guard catalog.enabled, !catalog.selection.hasExplicitChoice else { return }
-        guard catalog.automatic else { setStatus("自动匹配弹幕已关闭"); return }
-        guard let context = catalog.context else { setStatus("当前媒体没有可匹配的弹幕信息"); return }
+        guard catalog.automatic || historySelection != nil else { setStatus("自动匹配弹幕已关闭"); return }
+        guard let original = catalog.context else { setStatus("当前媒体没有可匹配的弹幕信息"); return }
+        let context = historySelection?.matchingContext(original) ?? original
         let active = generation
         setStatus("正在自动匹配订阅弹幕")
         var failed = false
@@ -180,9 +240,12 @@ import TVCore
                         let parameters = try await service.prepareParameters(episode, result: result)
                         guard active == generation, !Task.isCancelled, catalog.enabled, !catalog.selection.hasExplicitChoice else { return }
                         catalog.sourceSelected()
-                        let count = try await prepare(parameters, manual: false, source: source)
+                        let count = try await prepare(parameters, manual: false, source: source, rememberHistory: false)
                         guard active == generation, !Task.isCancelled, catalog.enabled, !catalog.selection.hasExplicitChoice else { return }
-                        if count > 0 { setStatus("已自动匹配弹幕 · \(count) 条", kind: .success); return }
+                        if count > 0 {
+                            remember(result: result, episode: episode, manual: false)
+                            setStatus("已自动匹配弹幕 · \(count) 条", kind: .success); return
+                        }
                     } catch {
                         if active != generation || Task.isCancelled || catalog.selection.hasExplicitChoice { return }
                         failed = true
@@ -209,7 +272,8 @@ import TVCore
             let parameters = try await NativeDanmakuCatalog(context: catalog.context).prepareParameters(episode, result: result)
             guard scope == generation, catalog.selection.ticket == ticket, ready, catalog.enabled,
                   !Task.isCancelled, NativeDanmakuCatalog.isEnabled(result.source) else { throw CancellationError() }
-            try await prepare(parameters, manual: true, source: result.source)
+            let count = try await prepare(parameters, manual: true, source: result.source, rememberHistory: false)
+            if count > 0 { remember(result: result, episode: episode) }
         } catch {
             if scope == generation, catalog.selection.ticket == ticket {
                 catalog.selection = previous
@@ -245,6 +309,90 @@ import TVCore
         selectedCatalogSource = NativeDanmakuCatalogSource(id: api.id, name: api.name, address: api.url)
         return server.appendingPathComponent("api/v2/comment/" + episode).absoluteString + "?format=xml&withRelated=true"
     }
+    private func legacyHistorySelection() -> PlaybackDanmakuSelection? {
+        guard let channel, let context = channel.historyContext else { return nil }
+        let key = "danmaku.manual." + context.id + "|" + context.episodeID
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let record = try? JSONDecoder().decode([String: String].self, from: data),
+              let episodeID = record["episode"], !episodeID.isEmpty,
+              let title = record["title"], !title.isEmpty else { return nil }
+        var saved = PlaybackDanmakuSelection(title: title.replacingOccurrences(of: #"\(\d{4}\)【[^】]+】from\s+\S+$"#,
+                with: "", options: .regularExpression), episodeName: context.episodeName, year: context.year,
+            manual: true, builtin: record["builtin"] == "1")
+        saved.sourceID = record["sourceID"]
+        saved.sourceAddress = saved.builtin ? nil : record["api"]
+        saved.publicCatalog = saved.builtin && (record["api"]?.isEmpty ?? true)
+        saved.catalogEpisodeID = episodeID
+        return saved
+    }
+    private func saveHistorySelection(_ selection: PlaybackDanmakuSelection?) {
+        historySelection = selection
+        if let context = channel?.historyContext { history.updateDanmaku(for: context, selection: selection) }
+    }
+    private func restoredSource(_ selection: PlaybackDanmakuSelection) -> NativeDanmakuCatalogSource? {
+        guard let id = selection.sourceID else { return nil }
+        if selection.builtin {
+            guard LocalDanmakuPreferences.builtinEnabled() else { return nil }
+            // Persist subscription identity, never its old loopback port or revision.
+            return NativeDanmakuCatalogSource(id: id, name: "内置", address: nil,
+                publicCatalog: selection.publicCatalog ?? false, subscriptionID: id)
+        }
+        guard let api = NativeDanmakuAPIStore.enabled().first(where: { $0.id == id && $0.url == selection.sourceAddress }) else { return nil }
+        return NativeDanmakuCatalogSource(id: api.id, name: api.name, address: api.url)
+    }
+    private func restoreHistorySelection() async -> Bool {
+        guard var saved = historySelection, ready, catalog.enabled, !catalog.selection.hasExplicitChoice,
+              !saved.builtin || LocalDanmakuPreferences.builtinEnabled() else { return false }
+        let source = restoredSource(saved)
+        guard saved.sourceID == nil || source != nil else { return false }
+        let active = generation
+        catalog.sourceSelected()
+        let ticket = catalog.selection.ticket
+        func current() -> Bool {
+            active == generation && !Task.isCancelled && ready && catalog.enabled &&
+            catalog.selection.ticket == ticket && !catalog.selection.hasExplicitChoice &&
+            (source.map { NativeDanmakuCatalog.isEnabled($0) } ?? (!saved.builtin || LocalDanmakuPreferences.builtinEnabled()))
+        }
+        func attempt(_ parameters: [String: JSONValue]) async -> Bool {
+            guard current() else { return false }
+            usesBuiltinSource = saved.builtin
+            do {
+                let count = try await prepare(parameters, manual: false, source: source, rememberHistory: false)
+                guard current(), count > 0 else { return false }
+                saved.cacheID = preparedCacheID ?? saved.cacheID
+                if saved.manual { catalog.selection.select(.manual); nativeManual = true }
+                saveHistorySelection(saved)
+                setStatus("已复用本集弹幕 · \(count) 条", kind: .success)
+                return true
+            } catch { return false }
+        }
+        if let cacheID = saved.cacheID, await attempt(["cacheId": .string(cacheID)]) { return true }
+        guard current() else { return false }
+        if saved.bilibiliCID != nil {
+            await catalog.nativeSourceReload?()
+            guard current() else { return false }
+            if sourceCommentCount > 0 {
+                saveHistorySelection(saved)
+                setStatus("已复用本集弹幕 · \(sourceCommentCount) 条", kind: .success)
+                return true
+            }
+        }
+        // A purged cache still has a stable episode reference. Refresh the active
+        // catalog endpoint and request that episode directly, without title search.
+        if let source, let episodeID = saved.catalogEpisodeID {
+            let episode = NativeDanmakuCatalogEpisode(id: episodeID, title: saved.catalogEpisodeTitle ?? saved.episodeName,
+                                                       url: saved.catalogEpisodeURL)
+            let result = NativeDanmakuCatalogResult(id: episodeID, title: saved.title, source: source,
+                episodes: [episode], animeID: saved.animeID, raw: .null)
+            do {
+                let context = catalog.context.map { saved.matchingContext($0) }
+                let parameters = try await NativeDanmakuCatalog(context: context).prepareParameters(episode, result: result)
+                guard current() else { return false }
+                if await attempt(parameters) { return true }
+            } catch { }
+        }
+        return false
+    }
     private func sessionDefinition() -> [String: JSONValue] {
         guard let channel else { return [:] }
         var request: [String: JSONValue] = ["title": .string(channel.historyContext?.videoName ?? channel.name), "episodeName": .string(channel.historyContext?.episodeName ?? channel.name), "url": .string(channel.url.absoluteString), "direct": .string(channel.url.absoluteString)]
@@ -256,11 +404,13 @@ import TVCore
         return ["id": .string(sessionID), "mediaVersion": .number(0), "timelineVersion": .number(Double(timelineVersion)), "request": .object(request), "qualities": .array([quality]), "isLive": .bool(descriptor?.live != nil)]
     }
     func stop() {
+        cancelTrackSelection()
         let previous = sessionID
         CatPawDanmaku.endPlayback(sessionID: previous)
         generation = UUID(); loading?.cancel(); loading = nil; ready = false; indexed = false
         comments = []; revision = UUID(); sourceRevision = UUID(); isLive = false; nativeManual = false; descriptor = nil; busy = false
         usesBuiltinSource = false; selectedCatalogSource = nil; pendingCatalogSelection = nil; builtinEnabled = LocalDanmakuPreferences.builtinEnabled()
+        historySelection = nil; preparedCacheID = nil; sourceCommentCount = 0
         lastWindow = -1000; lastPosition = -1; timelineVersion = 0
         lastTimelineRevision = -1; lastSampleWall = 0; liveSequence = 0; rawLiveComments = []; status = ""; notice = nil
         sessionID = ""; player = nil; channel = nil
@@ -270,10 +420,12 @@ import TVCore
         if !previous.isEmpty { Task { _ = try? await MobileMediaServices.call("session.stop", ["sessionId": .string(previous)]) } }
     }
     func clear() {
+        cancelTrackSelection()
         generation = UUID(); busy = false
         loading?.cancel(); loading = nil
         selectedCatalogSource = nil
         pendingCatalogSelection = nil
+        saveHistorySelection(nil)
         if let channel {
             let key = "danmaku.manual." + (channel.historyContext?.id ?? channel.id) + "|" + (channel.historyContext?.episodeID ?? channel.id)
             UserDefaults.standard.removeObject(forKey: key)
@@ -311,14 +463,21 @@ import TVCore
     func prepareFeed(_ address: String, headers: [String: String] = [:]) async throws {
         try await prepare(["url": .string(address), "headers": .object(headers.mapValues(JSONValue.string))], manual: true)
     }
-    func restoreSource() async throws { catalog.selection = DanmakuTrackSelection(); catalog.beginMedia(channel?.id ?? ""); try await useSource() }
-    func remember(result: NativeDanmakuCatalogResult, episode: NativeDanmakuCatalogEpisode) {
-        guard let channel else { return }
-        let key = "danmaku.manual." + (channel.historyContext?.id ?? channel.id) + "|" + (channel.historyContext?.episodeID ?? channel.id)
-        if let data = try? JSONEncoder().encode(["api": result.source.address ?? "", "episode": episode.id,
-            "title": result.title, "sourceID": result.source.id, "builtin": result.source.isBuiltin ? "1" : "0"]) {
-            UserDefaults.standard.set(data, forKey: key)
-        }
+    func restoreSource() async throws {
+        saveHistorySelection(nil)
+        catalog.selection = DanmakuTrackSelection(); catalog.beginMedia(channel?.id ?? "")
+        try await useSource()
+    }
+    func remember(result: NativeDanmakuCatalogResult, episode: NativeDanmakuCatalogEpisode, manual: Bool = true) {
+        guard channel != nil, indexed else { return }
+        var saved = PlaybackDanmakuSelection(title: result.matchingTitle, episodeName: episode.title,
+            year: catalog.context?.year, cacheID: preparedCacheID, manual: manual, builtin: result.source.isBuiltin)
+        saved.sourceID = result.source.id
+        saved.sourceAddress = result.source.isBuiltin ? nil : result.source.address
+        saved.publicCatalog = result.source.publicCatalog
+        saved.catalogEpisodeID = episode.id; saved.catalogEpisodeTitle = episode.title
+        saved.catalogEpisodeURL = episode.url; saved.animeID = result.animeID
+        saveHistorySelection(saved)
     }
 
     func importFile(_ url: URL) async throws {
@@ -331,7 +490,8 @@ import TVCore
         guard data.count <= 32 * 1024 * 1024 else { throw TVError.unsupported("弹幕文件超过 32 MB") }
         try await prepare(["data": .string(data.base64EncodedString())], manual: true)
     }
-    @discardableResult private func prepare(_ input: [String: JSONValue], manual: Bool, source: NativeDanmakuCatalogSource? = nil) async throws -> Int {
+    @discardableResult private func prepare(_ input: [String: JSONValue], manual: Bool, source: NativeDanmakuCatalogSource? = nil,
+                                            rememberHistory: Bool = true) async throws -> Int {
         guard ready else { throw TVError.unsupported("播放器尚未准备完成") }
         let previousSelection = catalog.selection
         if manual { catalog.selection.select(.manual) }
@@ -368,10 +528,19 @@ import TVCore
             nativeManual = manual; indexed = true; isLive = false; lastWindow = -1000; comments = []; rawLiveComments = []; revision = UUID(); sourceRevision = UUID()
             committed = true
             let count = prepared.object?["count"]?.int ?? 0
+            preparedCacheID = prepared.object?["cacheId"]?.string
             setStatus(count > 0 ? (manual ? "已选择弹幕" : "已加载订阅弹幕") + " · \(count) 条" : "所选来源没有返回弹幕",
                       kind: count > 0 ? .success : .information)
             await tick()
             guard current() else { throw CancellationError() }
+            if rememberHistory, count > 0, let context = catalog.context {
+                var saved = PlaybackDanmakuSelection(title: historySelection?.title ?? context.videoName,
+                    episodeName: historySelection?.episodeName ?? context.episodeName, year: historySelection?.year ?? context.year,
+                    cacheID: preparedCacheID, manual: manual, builtin: builtin)
+                saved.sourceID = source?.id
+                saved.sourceAddress = source?.isBuiltin == false ? source?.address : nil
+                saveHistorySelection(saved)
+            }
             return count
         } catch {
             if !committed, active == generation, catalog.selection.ticket == ticket {

@@ -43,26 +43,16 @@ public actor EmbeddedNodeHost {
         let body = try JSONEncoder().encode(input)
         let control = try await start()
         let serviceTimeout: TimeInterval = method == "playback.prepare" ? 8 : method == "playback.release" ? 3 : 150
-        return try await withTaskCancellationHandler {
-            let answer: Data
-            do { answer = try await send(body, to: control, timeout: serviceTimeout) }
-            catch let error as URLError where error.code == .cannotConnectToHost || error.code == .networkConnectionLost {
-                answer = try await send(body, to: try await relisten(after: control), timeout: serviceTimeout)
-            }
+        let answer: Data
+        do { answer = try await sendSource(body, to: control, operationID: operationID, timeout: serviceTimeout) }
+        catch let error as URLError where error.code == .cannotConnectToHost || error.code == .networkConnectionLost {
             try Task.checkCancellation()
-            let envelope = try JSONDecoder().decode([String: JSONValue].self, from: answer)
-            if let message = envelope["error"]?.string { throw TVError.unsupported(message) }
-            return envelope["serviceResult"] ?? .null
-        } onCancel: {
-            Task { await self.cancelMediaOperation(operationID) }
+            answer = try await sendSource(body, to: try await relisten(after: control), operationID: UUID().uuidString, timeout: serviceTimeout)
         }
-    }
-
-    private func cancelMediaOperation(_ id: String) async {
-        guard let control = try? await start(), let body = try? JSONEncoder().encode([
-            "service": JSONValue.string("operation.cancel"), "params": .object(["id": .string(id)])
-        ]) else { return }
-        _ = try? await send(body, to: control)
+        try Task.checkCancellation()
+        let envelope = try JSONDecoder().decode([String: JSONValue].self, from: answer)
+        if let message = envelope["error"]?.string { throw TVError.unsupported(message) }
+        return envelope["serviceResult"] ?? .null
     }
 
     public func request(site: Site, bundleURL: URL, params: [String: String], http: HTTPClient, origin: URL) async throws -> [String: JSONValue] {
@@ -80,7 +70,7 @@ public actor EmbeddedNodeHost {
         if !FileManager.default.fileExists(atPath: bundle.path) { try data.write(to: bundle, options: .atomic) }
         var params = params
         if let path = site.raw["catPawOpen"]?.string { params["catPawOpen"] = path }
-        let operationID = params["wd"] != nil ? UUID().uuidString : nil
+        let operationID = UUID().uuidString
         var input: [String: JSONValue] = [
             "bundle": .string(bundle.path), "api": .string(bundleURL.absoluteString),
             "profile": .string(root.appendingPathComponent("Profiles/" + key).path),
@@ -88,7 +78,7 @@ public actor EmbeddedNodeHost {
             "cloudAccounts": .string(CloudDriveAccounts.fileURL.path),
             "proxy": Self.systemProxy(), "params": .object(params.mapValues(JSONValue.string)),
         ]
-        if let operationID { input["operationId"] = .string(operationID) }
+        input["operationId"] = .string(operationID)
         let body = try JSONEncoder().encode(input)
         let kind = EmbeddedJarHost.kind(params)
         let started = ContinuousClock.now
@@ -98,16 +88,15 @@ public actor EmbeddedNodeHost {
         do {
             let answer: Data
             do {
-                if let operationID { answer = try await sendSource(body, to: control, operationID: operationID) }
-                else { answer = try await send(body, to: control) }
+                answer = try await sendSource(body, to: control, operationID: operationID)
             }
             catch let error as URLError where error.code == .cannotConnectToHost || error.code == .networkConnectionLost {
                 // iOS takes back a suspended app's listening sockets; Node then listens again on new ports.
                 let fresh = try await relisten(after: control)
-                if operationID != nil { answer = try await sendSource(body, to: fresh, operationID: UUID().uuidString) }
-                else { answer = try await send(body, to: fresh) }
+                try Task.checkCancellation()
+                answer = try await sendSource(body, to: fresh, operationID: UUID().uuidString)
             }
-            envelope = try JSONDecoder().decode([String: JSONValue].self, from: answer)
+            envelope = try await CatalogResponseParser.decode(answer)
         } catch {
             if error is CancellationError || (error as? URLError)?.code == .cancelled { throw CancellationError() }
             Diagnostics.shared.record(.error, "jar.request", "source=\(site.key) node \(kind) failed duration=\(started.duration(to: .now)) error=\(error.localizedDescription)")
@@ -121,7 +110,7 @@ public actor EmbeddedNodeHost {
             throw TVError.unsupported(L10n.text("The plugin returned no content. Try another source."))
         }
         Diagnostics.shared.record(.info, "jar.request", "source=\(site.key) node \(kind) complete duration=\(started.duration(to: .now)) bytes=\(text.utf8.count)")
-        return try JSONDecoder().decode([String: JSONValue].self, from: Data(text.utf8))
+        return try await CatalogResponseParser.decode(Data(text.utf8), maximumBytes: params["wd"] == nil ? BoundedHTTPData.catalogBytes : BoundedHTTPData.searchBytes)
     }
 
     /// A bundle's media proxy address at the port the bundle listens on now. iOS takes back a suspended app's listening
@@ -159,7 +148,8 @@ public actor EmbeddedNodeHost {
         return response?["applied"] == .bool(true)
     }
 
-    private func send(_ body: Data, to control: Control, timeout: TimeInterval = 150, controlOnly: Bool = false) async throws -> Data {
+    private func send(_ body: Data, to control: Control, timeout: TimeInterval = 150, controlOnly: Bool = false,
+                      maximumBytes: Int = 64 * 1024 * 1024) async throws -> Data {
         guard let port = control.port, let token = control.token else {
             throw TVError.unsupported(control.error ?? L10n.text("The CatPawOpen runtime stopped. Quit and reopen the app to use these sources."))
         }
@@ -169,20 +159,23 @@ public actor EmbeddedNodeHost {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = body
         let transport = controlOnly ? sourceControlSession : session
-        return try await transport.data(for: request).0
+        return try await BoundedHTTPData.load(request, session: transport,
+            maximumBytes: controlOnly ? 64 * 1024 : maximumBytes,
+            countsTowardBudget: !controlOnly).0
     }
 
     /// A cancelled URLSession request closes its socket before Node's source handler
     /// necessarily exits. Keep the caller's real admission slot until Node acknowledges
     /// that handler/HTTP cleanup finished. Detached cleanup does not inherit cancellation.
-    private func sendSource(_ body: Data, to control: Control, operationID: String) async throws -> Data {
+    private func sendSource(_ body: Data, to control: Control, operationID: String, timeout: TimeInterval = 150) async throws -> Data {
         try Task.checkCancellation()
         var input = try JSONDecoder().decode([String: JSONValue].self, from: body)
+        let maximumBytes = input["params"]?.object?["wd"] != nil ? BoundedHTTPData.catalogBytes : 64 * 1024 * 1024
         input["operationId"] = .string(operationID)
         let tagged = try JSONEncoder().encode(input)
         return try await withTaskCancellationHandler {
             do {
-                let answer = try await send(tagged, to: control)
+                let answer = try await send(tagged, to: control, timeout: timeout, maximumBytes: maximumBytes)
                 try await Task.detached { try await self.waitForSourceCompletion(operationID, control: control, cancel: false) }.value
                 try Task.checkCancellation()
                 return answer

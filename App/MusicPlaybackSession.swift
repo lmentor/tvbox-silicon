@@ -68,16 +68,25 @@ typealias MusicTrack = TVCore.MusicTrack
 
     let player = AVQueuePlayer()
     private var wantsPlayback = true
+    private let backgroundTask = MusicPlaybackBackgroundTask()
+    private let sleepFade = PlaybackSleepFade()
+    private var sleepFadeRevision: UUID?
+    private var sleepTimerObservers: [NSObjectProtocol] = []
     private var pendingFailureSkip: UUID?
     private var preparationTask: Task<Void, Never>?
     private var preparationID = UUID()
     private var prepared: PreparedNext?
+    private var intendedNextQueue: MusicQueue?
+    private var advancingPreparation = false
+    private var preparationAttempts = 0
+    private var nextPreparationAt = Date.distantPast
     private var currentItemObservation: NSKeyValueObservation?
     private struct PreparedNext {
         let origin: UUID
         let queue: MusicQueue
         let selection: MusicPlaybackSelection
         let item: AVPlayerItem
+        let cache: MusicStreamCache
     }
     private var generation = UUID()
     private var seekRevision = UUID()
@@ -86,8 +95,6 @@ typealias MusicTrack = TVCore.MusicTrack
     private var lyricsTask: Task<Void, Never>?
     private var cache = MusicStreamCache()
     private var recovery = MusicRecovery()
-    private var retriedLXSourceIDs: Set<String> = []
-    private var failedLXSourceIDs: Set<String> = []
     private var itemObservation: NSKeyValueObservation?
     private var rateObservation: NSKeyValueObservation?
     private var observers: [NSObjectProtocol] = []
@@ -108,13 +115,17 @@ typealias MusicTrack = TVCore.MusicTrack
     @PerceptionIgnored var resolveSource: ((MusicSourceEpisode) async throws -> Channel)?
     /// Opens a TVBox episode in the video player at a second: its stream has a picture (`true`), or this player
     /// can't play it and the video player, with more ways to play, might. The last is whether Now Playing was open.
-    @PerceptionIgnored var handOffSource: ((Channel, Double, Bool, Bool) -> Void)?
+    @PerceptionIgnored var handOffSource: ((Channel, Double, Bool, Bool, UUID) -> Void)?
     /// Saves where a TVBox episode is under its book, as the video player saves a series.
     @PerceptionIgnored var recordSource: ((MusicSourceEpisode, Double, Double) -> Void)?
     /// The stream of the TVBox episode playing.
     private(set) var sourceStream: Channel?
     /// The first episode's stream, which the page that started the queue already resolved.
     private var givenStream: (track: String, channel: Channel)?
+    /// A source may discover a video while its resolution was paused by the
+    /// listener or sleep timer. Keep its resolved channel until explicit resume.
+    private var deferredSourceHandoff: (run: UUID, stream: Channel, reason: String, picture: Bool)?
+    private var pendingVideoHandoff: UUID?
     private var pictureObservation: NSKeyValueObservation?
 
     init(library: MusicLibrary = .shared, defaults: UserDefaults = .standard) {
@@ -127,6 +138,7 @@ typealias MusicTrack = TVCore.MusicTrack
         #endif
         player.volume = Float(volume)
         player.actionAtItemEnd = .pause
+        observeSleepTimer()
         currentItemObservation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in
             Task { @MainActor [weak self] in self?.adoptPreparedIfAdvanced() }
         }
@@ -141,6 +153,7 @@ typealias MusicTrack = TVCore.MusicTrack
     var hasStream: Bool { selection != nil || sourceStream != nil }
     var canSeek: Bool { player.currentItem != nil && (phase == .playing || phase == .paused || phase == .loading) }
     var isPlaying: Bool { phase == .playing || phase == .loading && player.rate > 0 }
+    var keepsNowPlayingActive: Bool { sleepFadeRevision != nil || wantsPlayback && (phase == .playing || phase == .loading || phase == .resolving) }
     var failure: String? { if case .failed(let message) = phase { message } else { nil } }
     /// Seconds the lyrics run ahead of the audio for this song, set by the viewer: positive shows
     /// lines earlier. Covers lyrics timed a little off and slow outputs such as Bluetooth.
@@ -149,24 +162,34 @@ typealias MusicTrack = TVCore.MusicTrack
     private static let offsetsKey = "musicLyricsOffsets"
 
     func adjustLyrics(by seconds: Double) {
+        guard seconds.isFinite, track != nil else { return }
         setLyricsOffset(((lyricsOffset + seconds) * 10).rounded() / 10)
     }
 
     func resetLyricsOffset() { setLyricsOffset(0) }
 
     /// Plays from a lyric line, where it is heard with the offset.
-    func seek(toLyric line: MusicLyricLine) { seek(to: max(0, line.time - lyricsOffset)) }
+    func seek(toLyric line: MusicLyricLine) {
+        guard line.time.isFinite else { return }
+        seek(to: max(0, line.time - lyricsOffset))
+    }
 
     private func setLyricsOffset(_ value: Double) {
-        lyricsOffset = max(-10, min(10, value))
-        guard let id = track?.id else { return }
-        var offsets = UserDefaults.standard.dictionary(forKey: Self.offsetsKey) as? [String: Double] ?? [:]
+        guard value.isFinite, let id = track?.id else { return }
+        let next = max(-10, min(10, value))
+        guard next != lyricsOffset else { return }
+        lyricsOffset = next
+        // An explicit timing correction resumes following the highlighted line,
+        // even when the listener had previously scrolled the lyrics by hand.
+        timelineRevision = UUID()
+        var offsets = modeDefaults.dictionary(forKey: Self.offsetsKey) ?? [:]
         offsets[id] = lyricsOffset == 0 ? nil : lyricsOffset
-        UserDefaults.standard.set(offsets, forKey: Self.offsetsKey)
+        modeDefaults.set(offsets, forKey: Self.offsetsKey)
     }
 
     private func savedLyricsOffset(for id: String) -> Double {
-        (UserDefaults.standard.dictionary(forKey: Self.offsetsKey) as? [String: Double])?[id] ?? 0
+        guard let value = modeDefaults.dictionary(forKey: Self.offsetsKey)?[id] as? Double, value.isFinite else { return 0 }
+        return max(-10, min(10, (value * 10).rounded() / 10))
     }
 
     /// The channels the viewer can switch to: those that played or were not tried.
@@ -224,6 +247,7 @@ typealias MusicTrack = TVCore.MusicTrack
 
     /// The next song, or the first again when the whole queue repeats.
     func next() {
+        cancelSleepFade()
         adoptPreparedIfAdvanced()
         if let prepared, prepared.origin == generation, preparationIsFresh(prepared), player.items().contains(where: { $0 === prepared.item }) {
             wantsPlayback = true
@@ -232,16 +256,24 @@ typealias MusicTrack = TVCore.MusicTrack
             player.play()
             return
         }
-        guard var queue else { return }
-        if queue.advance() == nil {
-            guard repeatMode == .all, queue.repeatingTrackCount > 1 else { return }
-            if shuffled && queue.isShuffled {
-                guard queue.restartShuffledPass() != nil else { return }
-            } else {
-                guard queue.jump(to: 0) != nil else { return }
-            }
+        if preparationTask != nil, intendedNextQueue != nil, !advancingPreparation {
+            // Keep the playing item and the one resolver request alive. Its
+            // result will advance this queue without repeating provider work.
+            wantsPlayback = true
+            advancingPreparation = true
+            backgroundTask.begin()
+            if player.timeControlStatus != .playing { phase = .resolving }
+            return
         }
-        self.queue = queue
+        if advancingPreparation, let pending = intendedNextQueue {
+            guard let following = pending.nextPlaybackQueue(repeatingAll: repeatMode == .all, shuffled: shuffled) else { return }
+            self.queue = following
+            synchronizePlaybackMode()
+            loadCurrent(at: nil)
+            return
+        }
+        guard let nextQueue = intendedNextQueue ?? queue?.nextPlaybackQueue(repeatingAll: repeatMode == .all, shuffled: shuffled) else { return }
+        self.queue = nextQueue
         synchronizePlaybackMode()
         loadCurrent(at: nil)
     }
@@ -337,7 +369,13 @@ typealias MusicTrack = TVCore.MusicTrack
 
     /// Back to the start of the song once a few seconds played, otherwise to the song before.
     func previous() {
+        backgroundTask.end()
+        let fading = sleepFadeRevision != nil
+        cancelSleepFade()
+        if fading { wantsPlayback = true }
         adoptPreparedIfAdvanced()
+        advancingPreparation = false
+        updateAutomaticAdvance()
         if currentSeconds > MusicQueue.restartThreshold || queue?.hasPrevious != true { seek(to: 0); return }
         guard var queue, queue.back() != nil else { return }
         self.queue = queue
@@ -354,29 +392,58 @@ typealias MusicTrack = TVCore.MusicTrack
         loadCurrent(at: nil)
     }
 
-    /// Plays a channel the viewer picked, at the same second when it is the same recording.
+    /// Keep the current item and its observers running until the requested channel is ready.
+    /// A failed manual request restores that item, or resolves the remaining channels when
+    /// there was no playable old item to return to.
     func choose(_ candidate: MusicCandidate) {
+        cancelSleepFade()
         adoptPreparedIfAdvanced()
         guard let track else { return }
-        let previous = selection?.probe, at = currentSeconds
-        let run = UUID(); generation = run
+        let previousSelection = selection, previousItem = player.currentItem
+        let run = generation
+        pendingFailureSkip = nil
         task?.cancel(); startWatch?.cancel()
-        tearDownItem()
-        position = at
-        phase = .resolving
+        cancelPreparation()
+        failureDetail = nil
+        if previousItem == nil || previousItem?.status == .failed { phase = wantsPlayback ? .resolving : .paused }
         let resolver = MusicResolver(preferences: preferences), preference = preferences.quality, cache = cache
         task = Task {
             do {
-                var chosen = try await resolver.refresh(candidate, track: track, preference: preference, cache: cache)
-                guard self.generation == run else { return }
+                var chosen = try await resolver.refresh(candidate, track: previousSelection?.track ?? track, preference: preference, cache: cache)
+                guard self.generation == run, !Task.isCancelled else { return }
                 chosen.untried = self.alternatives.filter { $0 != candidate }
                 self.record(chosen.attempts)
-                self.start(chosen, at: previous.flatMap { MusicRecovery.canResume(from: $0, to: chosen.probe) ? at : nil }, run: run)
+                let at = previousSelection.flatMap { MusicRecovery.canResume(from: $0.probe, to: chosen.probe) ? self.currentSeconds : nil }
+                let next = UUID(); self.generation = next; self.recovery = MusicRecovery()
+                self.start(chosen, at: at, run: next)
             } catch {
-                guard self.generation == run else { return }
+                guard self.generation == run, !Task.isCancelled else { return }
                 let failure = MusicProviderError(error)
                 self.record([MusicAttempt(candidate: candidate, outcome: .failed(failure), seconds: 0)])
-                self.fail(failure)
+                if let previousSelection, let previousItem, self.player.currentItem === previousItem, previousItem.status != .failed {
+                    let resumeAt = self.currentSeconds
+                    self.notice = failure.localizedDescription
+                    self.start(previousSelection, at: resumeAt, run: run, preparedItem: previousItem)
+                    return
+                }
+                var excluded = Set(self.attempts.compactMap { attempt -> String? in
+                    if case .failed(let error) = attempt.outcome, error != .cancelled { return attempt.candidate.id }
+                    return nil
+                })
+                excluded.insert(candidate.id)
+                if let previousSelection { excluded.insert(previousSelection.candidate.id) }
+                do {
+                    let chosen = try await resolver.select(previousSelection?.track ?? track, preference: preference, excluding: excluded, cache: cache)
+                    guard self.generation == run, !Task.isCancelled else { return }
+                    self.record(chosen.attempts)
+                    let at = previousSelection.flatMap { MusicRecovery.canResume(from: $0.probe, to: chosen.probe) ? self.currentSeconds : nil }
+                    let next = UUID(); self.generation = next; self.recovery = MusicRecovery()
+                    self.start(chosen, at: at, run: next)
+                } catch {
+                    guard self.generation == run, !Task.isCancelled else { return }
+                    self.tearDownItem()
+                    self.songFailed(MusicProviderError(error), run: run)
+                }
             }
         }
     }
@@ -392,7 +459,13 @@ typealias MusicTrack = TVCore.MusicTrack
         switch phase {
         case .playing, .loading: pause()
         case .paused:
+            cancelSleepFade()
             wantsPlayback = true
+            if let deferred = deferredSourceHandoff, deferred.run == generation {
+                deferredSourceHandoff = nil
+                handOff(deferred.stream, reason: deferred.reason, picture: deferred.picture)
+                return
+            }
             if player.currentItem != nil { activateAudioSession(); player.play(); phase = .loading }
             else if pendingFailureSkip == generation {
                 pendingFailureSkip = nil
@@ -404,10 +477,13 @@ typealias MusicTrack = TVCore.MusicTrack
     }
 
     func pause() {
+        pendingVideoHandoff = nil
+        cancelSleepFade()
         adoptPreparedIfAdvanced()
-        guard phase == .playing || phase == .loading || phase == .resolving else { return }
+        backgroundTask.end()
+        guard phase == .playing || phase == .loading || phase == .resolving || phase == .paused else { return }
         wantsPlayback = false
-        cancelPreparation()
+        cancelPreparation(preservingPrepared: true)
         player.pause(); phase = .paused
         saveResumePoint(force: true)
     }
@@ -441,7 +517,10 @@ typealias MusicTrack = TVCore.MusicTrack
 
     /// Stops and hides the player. Where listening was stays saved, to continue from the Music page.
     func stop() {
+        pendingVideoHandoff = nil
+        cancelSleepFade()
         adoptPreparedIfAdvanced()
+        backgroundTask.end()
         wantsPlayback = false
         pendingFailureSkip = nil
         saveResumePoint(force: true)
@@ -450,7 +529,8 @@ typealias MusicTrack = TVCore.MusicTrack
         tearDownItem()
         queue = nil; selection = nil; attempts = []; phase = .idle; failureDetail = nil; notice = nil; presentsPlayer = false
         sourceStream = nil; givenStream = nil
-        position = 0; duration = nil; seekingTo = nil; lyrics = nil; lyricsFor = nil
+        deferredSourceHandoff = nil
+        position = 0; duration = nil; seekingTo = nil; lyrics = nil; lyricsFor = nil; lyricsOffset = 0
         library.flush()
     }
 
@@ -465,9 +545,13 @@ typealias MusicTrack = TVCore.MusicTrack
     /// Finds a channel for the queue's current song and plays it.
     private func loadCurrent(at resumeAt: Double?) {
         guard let track else { return }
+        cancelSleepFade()
         let run = UUID(); generation = run
         wantsPlayback = true
+        backgroundTask.begin()
         pendingFailureSkip = nil
+        deferredSourceHandoff = nil
+        pendingVideoHandoff = nil
         task?.cancel(); startWatch?.cancel(); lyricsTask?.cancel()
         tearDownItem()
         selection = nil; attempts = []; failureDetail = nil; sourceStream = nil
@@ -475,7 +559,6 @@ typealias MusicTrack = TVCore.MusicTrack
         lyrics = nil; lyricsLoading = false; lyricsFor = nil; recordedPlay = false
         lyricsOffset = savedLyricsOffset(for: track.id)
         cache = MusicStreamCache(); recovery = MusicRecovery()
-        retriedLXSourceIDs = []; failedLXSourceIDs = []
         requestedAt = Date()
         phase = .resolving
         if let source = track.source { loadSource(source, track: track, at: resumeAt, run: run); return }
@@ -491,14 +574,14 @@ typealias MusicTrack = TVCore.MusicTrack
         task = Task {
             do {
                 let selection = try await resolver.select(track, preference: preference, cache: cache)
-                guard self.generation == run else { return }
+                guard self.generation == run, !Task.isCancelled else { return }
                 self.attempts = selection.attempts
                 // A saved position only applies to a stream as long as the song, well before its end.
                 let length = selection.probe.duration ?? track.duration
                 let at = resumeAt.flatMap { seconds in length.map { seconds < $0 - 5 } == true ? seconds : nil }
                 self.start(selection, at: at, run: run)
             } catch {
-                guard self.generation == run else { return }
+                guard self.generation == run, !Task.isCancelled else { return }
                 self.songFailed(MusicProviderError(error), run: run)
             }
         }
@@ -516,6 +599,8 @@ typealias MusicTrack = TVCore.MusicTrack
 
     /// Plays a stream, watching for its failure and its end, and for no sound within the start window.
     @discardableResult private func setItem(url: URL, headers: [String: String], metadata track: MusicTrack, at seconds: Double?, run: UUID, preparedItem: AVPlayerItem? = nil) -> AVPlayerItem {
+        if wantsPlayback { backgroundTask.begin() }
+        else { backgroundTask.end() }
         activateAudioSession()
         let asset = AVURLAsset(url: url, options: headers.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers])
         let item = preparedItem ?? AVPlayerItem(asset: asset)
@@ -588,10 +673,10 @@ typealias MusicTrack = TVCore.MusicTrack
                 if let given { stream = given }
                 else if let resolve { stream = try await resolve(source) }
                 else { throw CancellationError() }
-                guard self.generation == run else { return }
+                guard self.generation == run, !Task.isCancelled else { return }
                 self.startSource(stream, track: track, at: resumeAt, run: run)
             } catch {
-                guard self.generation == run else { return }
+                guard self.generation == run, !Task.isCancelled else { return }
                 self.songFailed(MusicProviderError(error), run: run, message: error.localizedDescription)
             }
         }
@@ -599,6 +684,7 @@ typealias MusicTrack = TVCore.MusicTrack
 
     private func startSource(_ stream: Channel, track: MusicTrack, at seconds: Double?, run: UUID) {
         tearDownItem()
+        deferredSourceHandoff = nil
         sourceStream = stream
         // Addresses only the video player can open (its own schemes for drives and remuxed streams) go there.
         guard ["http", "https", "file"].contains(stream.url.scheme?.lowercased() ?? "") else {
@@ -622,16 +708,37 @@ typealias MusicTrack = TVCore.MusicTrack
     /// The source's episode playing, in the video player instead.
     func openInVideoPlayer() {
         guard let stream = sourceStream else { return }
+        cancelSleepFade()
+        wantsPlayback = true
         handOff(stream, reason: "viewer", picture: false)
     }
 
     /// Stops here and opens the episode in the video player where it was. Nothing of it stays in Continue Playing.
     private func handOff(_ stream: Channel, reason: String, picture: Bool) {
+        guard wantsPlayback else {
+            deferredSourceHandoff = (generation, stream, reason, picture)
+            cancelSleepFade()
+            player.pause()
+            phase = .paused
+            backgroundTask.end()
+            saveResumePoint(force: true)
+            return
+        }
         let at = currentSeconds > 1 ? currentSeconds : position, covered = presentsPlayer
         Diagnostics.shared.record(.info, "music", "source to the video player: \(reason)")
         sourceStream = nil
         stop()
-        handOffSource?(stream, at, picture, covered)
+        let request = UUID()
+        pendingVideoHandoff = request
+        handOffSource?(stream, at, picture, covered, request)
+    }
+
+    /// Opening video can wait for the music sheet to dismiss. A timer firing,
+    /// Stop or a new song during that gap invalidates this one-shot request.
+    func consumeVideoHandoff(_ request: UUID) -> Bool {
+        guard pendingVideoHandoff == request else { return false }
+        pendingVideoHandoff = nil
+        return true
     }
 
     private func loadLyrics(for selection: MusicPlaybackSelection) {
@@ -665,7 +772,14 @@ typealias MusicTrack = TVCore.MusicTrack
 
     private func songEnded(run: UUID) {
         guard generation == run else { return }
+        if SleepTimer.shared.itemEnded() { return }
         guard wantsPlayback else { return }
+        if advancingPreparation {
+            // The listener already requested this successor. EOF is the same
+            // transition, not another Next that should skip one more song.
+            backgroundTask.begin()
+            return
+        }
         if repeatMode == .one || repeatMode == .all && queue?.hasNext != true && queue?.repeatingTrackCount == 1 {
             seek(to: 0); activateAudioSession(); player.play(); phase = .loading
             return
@@ -695,67 +809,78 @@ typealias MusicTrack = TVCore.MusicTrack
         fail(error, message: message)
     }
 
-    /// A stream that stopped working: refresh it, then try another channel, then give up.
+    /// Refresh an expired address once; the remaining recovery resolves all other eligible
+    /// channels within the resolver's deadline, including strict cross-catalog matches.
     private func playbackFailed(_ reason: String, run: UUID) {
-        // The video player has more ways to play a source's stream (its own demuxer, proxies).
         if generation == run, let stream = sourceStream { handOff(stream, reason: reason, picture: false); return }
-        guard generation == run, let selection, let track else { return }
+        guard generation == run, let selection, track != nil else { return }
+        cancelSleepFade()
+        if wantsPlayback { backgroundTask.begin() }
         Diagnostics.shared.record(.warning, "music", "playback failed \(selection.candidate.provider.rawValue): \(reason)")
         let at = currentSeconds, previous = selection.probe
-        if let sourceID = selection.stream.sourceID {
-            // One fresh address is allowed for expiry. A second real playback failure must
-            // fall through to another import instead of resolving the same healthy header.
-            if !retriedLXSourceIDs.insert(sourceID).inserted { failedLXSourceIDs.insert(sourceID) }
-        }
         startWatch?.cancel()
-        let mayTryAnotherImport = selection.candidate.provider == .lx && !failedLXSourceIDs.isEmpty && recovery.resolvesLeft > 0
+        let hadBudget = recovery.resolvesLeft > 0
         var step = recovery.next(failed: selection.candidate, untried: alternatives)
-        // Honor a selected provider fallback. Another import may use the remaining slot only
-        // when the normal policy found no provider candidate; it must not displace that choice.
-        if case .giveUp = step, mayTryAnotherImport { step = .refresh(selection.candidate) }
-        let resolver = MusicResolver(preferences: preferences, excludingLXSourceIDs: failedLXSourceIDs), preference = preferences.quality, cache = cache
+        // A newly discovered platform or another import can still work when the original
+        // selection had no remaining candidates. This consumes the same final recovery slot.
+        if case .giveUp = step, hadBudget { step = .switchTo(selection.candidate) }
+        let resolver = MusicResolver(preferences: preferences), preference = preferences.quality, cache = cache
         switch step {
         case .giveUp:
             failureDetail = reason
             tearDownItem()
             songFailed(MusicProviderError.invalidResponse(reason), run: run, message: L10n.text("Playback stopped, and no other channel could continue it."))
         case .refresh(let candidate), .switchTo(let candidate):
+            let switching: Bool
+            if case .switchTo = step { switching = true } else { switching = false }
+            let excluded = Set(attempts.compactMap { attempt -> String? in
+                if case .failed(let error) = attempt.outcome, error != .cancelled { return attempt.candidate.id }
+                return nil
+            }).union([selection.candidate.id])
             let next = UUID(); generation = next
             task?.cancel()
             tearDownItem()
             position = at
-            phase = .resolving
+            phase = wantsPlayback ? .resolving : .paused
             task = Task {
                 do {
-                    var chosen = try await resolver.refresh(candidate, track: track, preference: preference, cache: cache)
-                    guard self.generation == next else { return }
-                    chosen.untried = self.alternatives.filter { $0 != candidate }
+                    try Task.checkCancellation()
+                    await cache.recordPlaybackFailure(selection.stream)
+                    var chosen: MusicPlaybackSelection
+                    if switching {
+                        chosen = try await resolver.select(selection.track, preference: preference, excluding: excluded, cache: cache)
+                    } else {
+                        chosen = try await resolver.refresh(candidate, track: selection.track, preference: preference, cache: cache)
+                        chosen.untried = self.alternatives.filter { $0 != candidate }
+                    }
+                    guard self.generation == next, !Task.isCancelled else { return }
                     self.record(chosen.attempts)
-                    if candidate == selection.candidate || MusicRecovery.canResume(from: previous, to: chosen.probe) {
+                    if chosen.candidate == selection.candidate || MusicRecovery.canResume(from: previous, to: chosen.probe) {
                         self.start(chosen, at: at, run: next)
                     } else {
-                        // Another version must not take over at the same second: the viewer decides.
                         self.selection = chosen
                         self.fail(MusicProviderError.differentRecording(chosen.probe.duration ?? 0),
                                   message: L10n.text("The other channel has a different version. Choose a channel to continue."))
                     }
                 } catch {
-                    guard self.generation == next else { return }
-                    self.record([MusicAttempt(candidate: candidate, outcome: .failed(MusicProviderError(error)), seconds: 0)])
-                    self.playbackFailedAgain(candidate, reason: MusicProviderError(error).detail, run: next)
+                    guard self.generation == next, !Task.isCancelled else { return }
+                    let failure = MusicProviderError(error)
+                    if !switching {
+                        self.record([MusicAttempt(candidate: candidate, outcome: .failed(failure), seconds: 0)])
+                        // A failed resolution never becomes the selected/played stream. Keep
+                        // its source identity and duration attached to the stream that failed.
+                        self.playbackFailed(failure.detail, run: next)
+                    } else {
+                        self.failureDetail = failure.detail
+                        self.songFailed(failure, run: next)
+                    }
                 }
             }
         }
     }
 
-    private func playbackFailedAgain(_ candidate: MusicCandidate, reason: String, run: UUID) {
-        guard var selection else { return }
-        selection.candidate = candidate
-        self.selection = selection
-        playbackFailed(reason, run: run)
-    }
-
     private func fail(_ error: MusicProviderError, message: String? = nil) {
+        backgroundTask.end()
         cancelPreparation()
         startWatch?.cancel()
         failureDetail = failureDetail ?? error.detail
@@ -782,7 +907,11 @@ typealias MusicTrack = TVCore.MusicTrack
         let itemDuration = item.duration.seconds
         if itemDuration.isFinite, itemDuration > 0 { duration = itemDuration }
         saveResumePoint(force: false)
-        if let prepared, !preparationIsFresh(prepared) { cancelPreparation() }
+        if let prepared, !preparationIsFresh(prepared) {
+            // A previously valid signed URL expiring is not a failed preparation attempt.
+            if prepared.item.status != .failed { preparationAttempts = 0 }
+            cancelPreparation(resetAttempts: false)
+        }
         prepareNextIfNeeded()
     }
 
@@ -799,6 +928,8 @@ typealias MusicTrack = TVCore.MusicTrack
         guard track != nil else { return }
         switch status {
         case .playing:
+            backgroundTask.end()
+            if sleepFadeRevision != nil { return }
             guard wantsPlayback else { player.pause(); return }
             if phase == .loading || phase == .paused { phase = .playing; startWatch?.cancel() }
             if let set = streamSetAt {
@@ -810,10 +941,19 @@ typealias MusicTrack = TVCore.MusicTrack
                 // A source's episodes are kept under their book in the playback history instead.
                 if track.source == nil { library.recordPlay(track) }
             }
+            updateAutomaticAdvance()
             prepareNextIfNeeded()
         case .waitingToPlayAtSpecifiedRate:
             if phase == .playing { phase = .loading }
         case .paused:
+            if advancingPreparation && wantsPlayback {
+                // EOF and its paused KVO can arrive in either order. The pending
+                // Next still owns transport and its finite background lease.
+                phase = .resolving
+                backgroundTask.begin()
+                return
+            }
+            backgroundTask.end()
             if phase == .playing { phase = .paused }
         @unknown default: break
         }
@@ -840,12 +980,22 @@ typealias MusicTrack = TVCore.MusicTrack
 
     // MARK: - One upcoming media item
 
-    private func cancelPreparation() {
+    private func cancelPreparation(resetAttempts: Bool = true, preservingPrepared: Bool = false) {
+        advancingPreparation = false
         preparationID = UUID()
         preparationTask?.cancel(); preparationTask = nil
         player.actionAtItemEnd = .pause
-        if let prepared, player.currentItem !== prepared.item { player.remove(prepared.item) }
-        prepared = nil
+        if !preservingPrepared {
+            if let prepared, player.currentItem !== prepared.item { player.remove(prepared.item) }
+            prepared = nil
+        }
+        if resetAttempts {
+            intendedNextQueue = preservingPrepared ? prepared?.queue : nil
+            preparationAttempts = 0
+            nextPreparationAt = .distantPast
+        } else {
+            nextPreparationAt = Date().addingTimeInterval(5)
+        }
     }
 
     private func refreshPreparation() {
@@ -855,50 +1005,66 @@ typealias MusicTrack = TVCore.MusicTrack
     }
 
     private func preparationIsFresh(_ next: PreparedNext) -> Bool {
-        next.selection.stream.expiresAt.map { $0.timeIntervalSinceNow > 30 } ?? true
+        next.item.status != .failed && (next.selection.stream.expiresAt.map { $0.timeIntervalSinceNow > 30 } ?? true)
     }
 
-    /// Resolving/decoding the upcoming item is kept away from startup, and close enough to EOF
-    /// that temporary media URLs remain useful. AVQueuePlayer alone owns both media items.
+    /// Once sound has settled, prepare one manual/automatic successor with the same resolver
+    /// used by Play (including imported LX and music extensions). AVQueuePlayer owns and reuses
+    /// its buffered bytes. Repeat-one keeps automatic advancement off, while Next can use it.
     private func prepareNextIfNeeded() {
         guard wantsPlayback, phase == .playing, preparationTask == nil, prepared == nil,
-              sourceStream == nil, selection != nil, repeatMode != .one,
-              let duration, duration - position <= 30, duration - position > 0,
-              var nextQueue = queue, nextQueue.tracks.count > 1 else { return }
-        if nextQueue.advance() == nil {
-            guard repeatMode == .all else { return }
-            if shuffled && nextQueue.isShuffled { guard nextQueue.restartShuffledPass() != nil else { return } }
-            else { guard nextQueue.jump(to: 0) != nil else { return } }
-        }
+              sourceStream == nil, selection != nil, preparationAttempts < 3,
+              Date() >= nextPreparationAt, position >= 3,
+              duration.map({ $0 - position > 0 }) ?? true,
+              let current = player.currentItem,
+              let nextQueue = intendedNextQueue ?? queue?.nextPlaybackQueue(repeatingAll: repeatMode == .all, shuffled: shuffled) else { return }
+        // MusicTrack.source is a TVBox book/chapter, not an imported LX music source.
         guard let nextTrack = nextQueue.current, nextTrack.source == nil else { return }
         if nextQueue.isShuffled && !nextQueue.isShuffledWithinCurrentDomain { return }
         let intendedQueue = nextQueue, run = generation, request = UUID()
+        intendedNextQueue = intendedQueue
         preparationID = request
+        preparationAttempts += 1
         let resolver = MusicResolver(preferences: preferences), quality = preferences.quality
-        preparationTask = Task { [weak self] in
+        let nextCache = MusicStreamCache()
+        preparationTask = Task { [weak self, weak current] in
+            defer {
+                if let self, self.preparationID == request {
+                    self.preparationTask = nil
+                    self.nextPreparationAt = Date().addingTimeInterval(5 * Double(self.preparationAttempts))
+                    if self.advancingPreparation {
+                        // A failed preparation falls back once through normal
+                        // recovery; a completed one consumes its exact item.
+                        if self.prepared != nil { self.next() }
+                        else {
+                            self.queue = intendedQueue
+                            self.synchronizePlaybackMode()
+                            self.loadCurrent(at: nil)
+                        }
+                    }
+                }
+            }
             do {
                 let selection: MusicPlaybackSelection
                 if let saved = MusicDownloadLibrary.shared.localSelection(for: nextTrack) { selection = saved }
-                else { selection = try await resolver.select(nextTrack, preference: quality) }
-                guard let self, !Task.isCancelled, self.generation == run, self.preparationID == request,
-                      self.wantsPlayback, let current = self.player.currentItem else { return }
+                else { selection = try await resolver.select(nextTrack, preference: quality, cache: nextCache) }
+                guard let self, let current, !Task.isCancelled, self.generation == run, self.preparationID == request,
+                      self.wantsPlayback, self.player.currentItem === current,
+                      self.phase == .playing || self.phase == .loading || self.advancingPreparation else { return }
                 let stream = selection.stream
-                guard stream.expiresAt.map({ $0.timeIntervalSinceNow > max(30, (self.duration ?? 0) - self.position + 15) }) ?? true else {
-                    return
-                }
+                guard stream.expiresAt.map({ $0.timeIntervalSinceNow > 30 }) ?? true else { return }
                 let asset = AVURLAsset(url: stream.url, options: stream.headers.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": stream.headers])
                 let item = AVPlayerItem(asset: asset)
                 item.preferredForwardBufferDuration = 15
                 guard self.player.canInsert(item, after: current) else { return }
-                self.prepared = PreparedNext(origin: run, queue: intendedQueue, selection: selection, item: item)
+                self.prepared = PreparedNext(origin: run, queue: intendedQueue, selection: selection, item: item, cache: nextCache)
                 self.player.insert(item, after: current)
-                self.player.actionAtItemEnd = .advance
+                self.updateAutomaticAdvance()
                 Diagnostics.shared.record(.info, "music", "prepared one next media item")
             } catch {
                 // EOF will use the ordinary resolver/recovery path. A failed preparation
                 // must neither skip the current song nor start a second playback task.
             }
-            // Keep a completed task as a one-attempt marker until this queue intent changes.
         }
     }
 
@@ -907,8 +1073,10 @@ typealias MusicTrack = TVCore.MusicTrack
     private func adoptPreparedIfAdvanced() {
         guard let next = prepared, player.currentItem === next.item, next.origin == generation else { return }
         prepared = nil
+        advancingPreparation = false
         preparationTask?.cancel(); preparationTask = nil
         preparationID = UUID()
+        intendedNextQueue = nil; preparationAttempts = 0; nextPreparationAt = .distantPast
         player.actionAtItemEnd = .pause
         task?.cancel(); startWatch?.cancel(); lyricsTask?.cancel()
         let run = UUID(); generation = run
@@ -918,10 +1086,71 @@ typealias MusicTrack = TVCore.MusicTrack
         position = 0; duration = next.selection.probe.duration ?? next.selection.track.duration
         recordedPlay = false; lyricsFor = nil; lyrics = nil
         lyricsOffset = savedLyricsOffset(for: next.selection.track.id)
-        cache = MusicStreamCache(); recovery = MusicRecovery(); requestedAt = Date()
-        retriedLXSourceIDs = []; failedLXSourceIDs = []
+        cache = next.cache; recovery = MusicRecovery(); requestedAt = Date()
         start(next.selection, at: nil, run: run, preparedItem: next.item)
         if next.item.status == .failed { playbackFailed("prepared media failed", run: run) }
+    }
+
+    // MARK: - App-wide sleep timer
+
+    private func observeSleepTimer() {
+        for (name, fired) in [(SleepTimer.changed, false), (SleepTimer.fired, true)] {
+            sleepTimerObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    if fired { self?.sleepTimerFired() }
+                    else { self?.sleepTimerChanged() }
+                }
+            })
+        }
+    }
+
+    private func updateAutomaticAdvance() {
+        player.actionAtItemEnd = prepared != nil && repeatMode != .one && !SleepTimer.shared.endsWithItem
+            && sleepFadeRevision == nil && !advancingPreparation && wantsPlayback ? .advance : .pause
+    }
+
+    private func sleepTimerChanged() {
+        // Fired is followed by Changed for the same consumed revision. A later
+        // timer edit cancels only that fade, restoring the current item's volume.
+        if let fading = sleepFadeRevision, fading != SleepTimer.shared.revision {
+            cancelSleepFade()
+            // Explicit pause already cancels its fade. A live fade still owns
+            // the original play request even while the native item is buffering.
+            wantsPlayback = true
+        }
+        updateAutomaticAdvance()
+    }
+
+    private func sleepTimerFired() {
+        pendingVideoHandoff = nil
+        guard track != nil else { return }
+        cancelSleepFade()
+        wantsPlayback = false
+        pendingFailureSkip = nil
+        cancelPreparation(preservingPrepared: true)
+        backgroundTask.end()
+        // Resolve/recovery completions consult wantsPlayback before starting.
+        // Clear that intent now even if there is no player item to fade yet.
+        guard let item = player.currentItem, player.timeControlStatus == .playing else { pause(); return }
+        let run = generation, timer = SleepTimer.shared.revision
+        sleepFadeRevision = timer
+        sleepFade.start(volume: player.volume, isCurrent: { [weak self, weak item] in
+            guard let self, let item else { return false }
+            return self.generation == run && self.player.currentItem === item
+        }, shouldContinue: { [weak self] in
+            guard let self else { return false }
+            return self.sleepFadeRevision == timer && SleepTimer.shared.revision == timer
+                && !self.wantsPlayback
+        }, setVolume: { [weak self] value in
+            self?.player.volume = value
+        }, pause: { [weak self] in
+            self?.pause()
+        })
+    }
+
+    private func cancelSleepFade() {
+        sleepFade.cancel()
+        sleepFadeRevision = nil
     }
 
     #if os(tvOS)

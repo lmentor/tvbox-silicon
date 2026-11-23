@@ -4,9 +4,18 @@ import TVCore
 
 struct LocalSitePageTitle: ViewModifier {
     let title: String
+    var hidesNavigationBar = false
+    @ViewBuilder
     func body(content: Content) -> some View {
         #if os(iOS)
-        content.navigationTitle("").navigationBarTitleDisplayMode(.inline)
+        if hidesNavigationBar {
+            // Folder pages already have a fixed source/search header. Hiding
+            // the bar removes its entire reserved row, including the chevron.
+            content.navigationTitle("").navigationBarTitleDisplayMode(.inline)
+                .toolbar(.hidden, for: .navigationBar)
+        } else {
+            content.navigationTitle("").navigationBarTitleDisplayMode(.inline)
+        }
         #else
         content.screenTitle(title)
         #endif
@@ -15,49 +24,70 @@ struct LocalSitePageTitle: ViewModifier {
 
 #if os(iOS)
 struct LocalSiteActionsSheet: View {
-    @Environment(Store.self) private var store
-    @Environment(\.dismiss) private var dismiss
     let site: Site
     let origin: URL
+    let jarURL: URL?
     let refresh: () -> Void
+    let hide: () -> Void
+    @Binding var checksEnabled: Bool
+    var returnToParent: (() -> Void)? = nil
+    @State private var website: URL?
+    @State private var showsWebsite = false
 
     var body: some View {
         WithPerceptionTracking {
-            RouteStack {
-                ScrollView {
-                    WithPerceptionTracking {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(SourceLabel(site.name).text).font(.headline).padding(.horizontal, 16).padding(.bottom, 8)
-                            Button(action: refresh) { Label("刷新站点", systemImage: "arrow.clockwise") }
-                                .accessibilityIdentifier("site.actions.refresh")
-                            PinSourceButton(site: site, origin: origin)
-                            HideSourceButton(site: site, origin: origin)
-                            RouteLink { LocalSourceSettingsView(kind: store.localSourceGroup(for: site)) } label: { Label("站点设置", systemImage: "slider.horizontal.3") }
-                                .accessibilityIdentifier("site.actions.settings")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let returnToParent {
+                        Button(action: returnToParent) { Label("上一级目录", systemImage: "arrow.turn.up.left") }
+                            .accessibilityIdentifier("site.actions.parent")
+                    }
+                    Button(action: refresh) { Label("刷新站点", systemImage: "arrow.clockwise") }
+                        .accessibilityIdentifier("site.actions.refresh")
+                    Button(action: hide) { Label("隐藏站点", systemImage: "eye.slash") }
+                        .accessibilityIdentifier("source.hide." + site.key)
+                    if website != nil {
+                        Button { showsWebsite = true } label: { Label("站点设置", systemImage: "slider.horizontal.3") }
+                            .accessibilityIdentifier("site.actions.settings")
+                    }
+                    if site.supportsLocalLinkChecks {
+                        Button { checksEnabled.toggle() } label: {
+                            HStack {
+                                Label("本地检测链接有效性", systemImage: "checkmark.shield")
+                                Spacer()
+                                Image(systemName: checksEnabled ? "checkmark.circle.fill" : "circle")
+                            }
                         }
-                        .buttonStyle(LocalSiteActionRowStyle())
-                        .padding(16)
+                        .accessibilityValue(checksEnabled ? "已开启" : "已关闭")
+                        .accessibilityIdentifier("site.actions.panCheck")
                     }
                 }
-                .navigationTitle("站点操作").navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("关闭") { dismiss() }.accessibilityIdentifier("site.actions.close")
-                    }
+                .buttonStyle(LocalSiteActionRowStyle())
+                .padding(16).localDialogContentHeight()
+            }
+            .task(id: site) {
+                guard site.hasSiteSettings else { website = nil; return }
+                let value = await CatPawOpen.siteSettings(site: site, origin: origin, jarURL: jarURL)
+                guard !Task.isCancelled else { return }
+                website = value
+            }
+            .localGlassDialog(isPresented: $showsWebsite, title: "站点设置", layout: .expanded) {
+                ConfigCenterView {
+                    await CatPawOpen.siteSettings(site: site, origin: origin, jarURL: jarURL)
                 }
             }
-            .presentationDetents([.medium, .large])
         }
     }
 }
 
-private struct LocalSiteActionRowStyle: ButtonStyle {
+struct LocalSiteActionRowStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label.font(.body)
             .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
             .padding(.horizontal, 16).padding(.vertical, 3)
-            .contentShape(Rectangle())
-            .background(Color.primary.opacity(configuration.isPressed ? 0.12 : 0.04), in: RoundedRectangle(cornerRadius: 12))
+            .localGlassSurface(cornerRadius: 14)
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -254,7 +284,7 @@ struct LocalCatalogArtworkCarousel: View {
             GeometryReader { geometry in
                 WithPerceptionTracking {
                     DiscoverBackdrop(paint: paint, width: geometry.size.width, heroHeight: geometry.size.height,
-                                     scrollY: 0, trailer: nil, playsTrailer: false)
+                                     scrollY: 0, trailer: nil, playsTrailer: false, showsArtworkPlaceholder: true)
                         .allowsHitTesting(false)
                 }
             }

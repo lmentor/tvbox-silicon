@@ -8,24 +8,39 @@ import Security
 /// Called on the source's script thread; may block it.
 final class MangaHost: ScriptHostExtension, @unchecked Sendable {
     let sourceKey: String
+    private let webLogin: MangaWebLoginTransaction?
+    var cookies: MangaCookieJar { webLogin?.cookies ?? MangaCookieJar.forSource(sourceKey) }
     private let pending = PendingRequests()
+    private var requestScope: ScriptRequestScope?
     let bitmaps = MangaBitmaps()
 
-    init(sourceKey: String) { self.sourceKey = sourceKey }
+    init(sourceKey: String, webLogin: MangaWebLoginTransaction? = nil) { self.sourceKey = sourceKey; self.webLogin = webLogin }
     deinit { pending.cancelAll() }
+    func cancelPending() { pending.cancelAllAndWait() }
+    func beginRequest(_ request: ScriptRequestScope) { requestScope = request }
+    func endRequest(_ request: ScriptRequestScope) { requestScope = nil }
 
     func answer(_ operation: String, _ argument: String) throws -> String?? {
         guard operation.hasPrefix("manga.") else { return nil }
         let request = (try? JSONSerialization.jsonObject(with: Data(argument.utf8), options: [.fragmentsAllowed])) as? [String: Any] ?? [:]
         switch operation.dropFirst("manga.".count) {
         case "httpStart":
+            let scope = requestScope
+            let scopedID = try scope?.begin()
             let id = pending.add()
-            let cancel = MangaHTTP.start(request) { [pending] answer in pending.finish(id, answer) }
+            let cancel = MangaHTTP.start(request, maximumBytes: scope?.search == true ? BoundedHTTPData.searchBytes : BoundedHTTPData.catalogBytes,
+                                         retryChallenge: scope?.search != true, cookies: cookies) { [pending] answer in
+                pending.finish(id, answer)
+                if let scopedID { scope?.finish(scopedID) }
+            }
             pending.setCancel(id, cancel)
+            if let scopedID { scope?.attach(scopedID, cancel: cancel) }
             return .some(String(id))
         case "httpPoll": return .some(pending.take(Int(argument) ?? -1))
-        case "data": return .some(try MangaSourceData.shared.handle(request, fallbackKey: sourceKey))
-        case "cookie": return .some(try MangaCookieJar.shared.handle(request))
+        case "data":
+            if let webLogin { return .some(try webLogin.handle(request)) }
+            return .some(try MangaSourceData.shared.handle(request, fallbackKey: sourceKey))
+        case "cookie": return .some(try cookies.handle(request))
         case "uuid": return .some(Self.json(UUID().uuidString.lowercased()))
         case "locale": return .some(Self.json(Self.locale))
         case "platform":
@@ -247,6 +262,25 @@ public final class MangaSourceData: @unchecked Sendable {
     }
     public func isSignedIn(_ key: String) -> Bool { value(key, "account") != nil }
     public func remove(_ key: String) { lock.withLock { cache[key] = nil; try? FileManager.default.removeItem(at: file(key)) } }
+
+    func snapshot(_ key: String) -> [String: Any] { lock.withLock { load(key) } }
+    /// Commit only fields changed by the login hooks so simultaneous settings
+    /// edits survive. Cookies and the logged-in marker share one atomic profile.
+    func commitWebLogin(_ key: String, changes: [String: Any], cookies: [[String: Any]], userAgent: String) throws {
+        try lock.withLock {
+            try Task.checkCancellation()
+            var data = load(key)
+            for (name, value) in changes where name != "settings" && name != "_webCookies" && name != "_webUserAgent" && name != "account" {
+                if value is NSNull { data[name] = nil } else { data[name] = value }
+            }
+            data["_webCookies"] = cookies
+            data["_webUserAgent"] = userAgent
+            data["account"] = "web"
+            try FileManager.default.createDirectory(at: Self.folder, withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: data).write(to: file(key), options: .atomic)
+            cache[key] = data
+        }
+    }
 
     func handle(_ request: [String: Any], fallbackKey: String) throws -> String? {
         let key = request["key"] as? String ?? fallbackKey

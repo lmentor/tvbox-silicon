@@ -116,10 +116,16 @@ public enum FavoriteItem: Codable, Hashable, Sendable, Identifiable {
         }
     }
 
+    fileprivate var restoringLivePlayback: FavoriteItem {
+        guard case .live(var channel) = self, channel.playback == nil else { return self }
+        channel.playback = PlaybackDescriptor(format: channel.url.pathExtension, isLive: true)
+        return .live(channel)
+    }
+
     public var key: String {
         switch self {
         case .live(let channel):
-            if LiveCatalog.isRoomAddress(channel.url) { return "live|" + channel.url.absoluteString }
+            if IPTVStationReference.id(for: channel) != nil || LiveCatalog.isRoomAddress(channel.url) { return "live|" + channel.url.absoluteString }
             return "live|" + channel.id
         case .video(let video):
             return "video|" + EpisodeSkipSettings.scope(origin: video.origin, source: video.sourceKey, video: video.videoID)
@@ -138,7 +144,7 @@ public enum FavoriteItem: Codable, Hashable, Sendable, Identifiable {
     public func matches(_ other: FavoriteItem) -> Bool {
         switch (self, other) {
         case (.live(let saved), .live(let channel)):
-            return saved.id == channel.id || (LiveCatalog.isRoomAddress(channel.url) && saved.url == channel.url)
+            return saved.id == channel.id || ((IPTVStationReference.id(for: channel) != nil || LiveCatalog.isRoomAddress(channel.url)) && saved.url == channel.url)
         default:
             return key == other.key
         }
@@ -164,9 +170,9 @@ struct FavoriteDocument: Codable {
         var migrated = false
         if let data = defaults.data(forKey: Self.storageKey) {
             if let document = try? JSONDecoder().decode(FavoriteDocument.self, from: data), document.version == 2 {
-                items = document.items
+                items = document.items.map(\.restoringLivePlayback)
             } else if let channels = try? JSONDecoder().decode([Channel].self, from: data) {
-                items = channels.map { .live($0) }
+                items = channels.map { FavoriteItem.live($0).restoringLivePlayback }
                 migrated = true
             }
         }
@@ -249,11 +255,38 @@ struct FavoriteDocument: Codable {
         items = synced.sorted { lhs, rhs in
             if lhs.stamp != rhs.stamp { return lhs.stamp > rhs.stamp }
             return (rank[lhs.id] ?? Int.max, lhs.id) < (rank[rhs.id] ?? Int.max, rhs.id)
-        }.map(\.value)
+        }.map { $0.value.restoringLivePlayback }
         persist()
     }
 
     public func items(_ kind: FavoriteKind) -> [FavoriteItem] { items.filter { $0.kind == kind } }
+
+    /// Only upgrade an old direct-address favorite when exactly one imported station owns that line.
+    public func migrateIPTVStations(_ stations: [IPTVStation]) {
+        let old = liveChannels.filter { IPTVStationReference.id(for: $0) == nil && !$0.url.isFileURL }
+        guard !old.isEmpty, !stations.isEmpty else { return }
+        let wanted = Set(old.map(\.url))
+        var candidates: [URL: [IPTVStation]] = [:]
+        for station in stations {
+            for url in Set(station.lines.map(\.url)) where wanted.contains(url) {
+                candidates[url, default: []].append(station)
+            }
+        }
+        var changed = false
+        var seen = Set<String>()
+        let updated = items.compactMap { item -> FavoriteItem? in
+            var result = item
+            if case .live(let channel) = item, let matched = candidates[channel.url],
+               matched.count == 1, let station = matched.first, channel.name == station.name {
+                result = .live(IPTVStationReference.channel(for: station))
+                changed = true
+            }
+            if case .live(let channel) = result, let id = IPTVStationReference.id(for: channel),
+               !seen.insert(id).inserted { changed = true; return nil }
+            return result
+        }
+        if changed { items = updated; persist(); onChange?() }
+    }
 
     public var liveChannels: [Channel] {
         items.compactMap { if case .live(let channel) = $0 { channel } else { nil } }

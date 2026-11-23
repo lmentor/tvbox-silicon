@@ -3,9 +3,11 @@ import path from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { HomeLibrary } from './parity/lib/home-library.mjs';
 import { PanLinkChecker } from './parity/lib/pan-link-checker.mjs';
+import { sitePanShare } from './parity/lib/site-pan.mjs';
+import { siteIntegrationEnabled } from './parity/lib/catalog.mjs';
 import { LiveDanmakuService } from './parity/lib/live-danmaku.mjs';
 import { normalizeLiveDanmaku } from './parity/lib/live-danmaku-config.mjs';
-import { parseDanmaku, decodeDanmaku } from './parity/lib/danmaku.mjs';
+import { parseDanmaku, decodeDanmaku, readCachedDanmaku, cacheDanmakuDocument } from './parity/lib/danmaku.mjs';
 import { writeDanmakuIndex } from './parity/lib/danmaku-index.mjs';
 import { fetchBuffer } from './parity/lib/http.mjs';
 import { AISubtitleService } from './parity/lib/ai-subtitles.mjs';
@@ -18,6 +20,7 @@ import { normalizeMobilePlayback } from './mobile-playback.mjs';
 import { segmentedMP4Index, segmentedRepresentation } from './segmented-mp4.mjs';
 import { fetchTMDB } from './tmdb-transport.mjs';
 import { IntroSkip } from './remote-skip.mjs';
+import { enrichCacheCoverage } from './cache-file-timeline.mjs';
 
 const defaults = {
   tmdb: { panApiBase: 'https://so.252035.xyz', panToken: '', ...panSearchDefaults },
@@ -98,6 +101,17 @@ export class MobileServices {
           || /\.(?:mp4|m4v|mov|mkv|avi|flv|webm|ts|m2ts|mp3|m4a|aac|flac|wav|ogg|opus|wma|aiff|ape)$/i.test(new URL(url).pathname);
         const hls = format === 'm3u8' || /\.m3u8(?:[?#]|$)/i.test(url);
         if (audio && (hls || format === 'mpd' || /\.mpd(?:[?#]|$)/i.test(url))) throw new Error('当前播放清单另带分离音轨，暂不支持此组合，请选择完整音视频线路');
+        if (params.scopeIPTVHeaders === true || params.sniffIPTVInput === true) {
+          if (audio) throw new Error('此直播线路携带独立音轨，请选择其他线路');
+          const privateHeaders = [...new Headers(params.headers || {}).keys()].some(name =>
+            !['user-agent', 'accept', 'accept-language'].includes(name));
+          const scoped = params.scopeIPTVHeaders === true || privateHeaders || !!new URL(url).username || !!new URL(url).password;
+          const protectedInput = this.hls.prepare({ id, isLive: params.isLive === true,
+            qualities: [{ url, headers: params.headers || {}, format }] },
+          { enabled: params.adClean === true, forceProxy: true, scopeIPTVHeaders: scoped, sniffInput: !scoped }).qualities[0];
+          if (!this.hls.lookup(protectedInput.url)) throw new Error('直播转发服务尚未就绪');
+          return { url: protectedInput.url, headers: scoped ? {} : params.headers || {}, ownerID: id };
+        }
         if (hls && (params.adClean === true || params.enabled === true && params.isLive !== true)) {
           const owner = params.enabled === true && params.isLive !== true ? this.cache.createSession(id,
             { enabled: true, sizeGB: Math.max(1, Math.min(4, Number(params.sizeGB) || 1)) }) : null;
@@ -181,10 +195,25 @@ export class MobileServices {
       }
       case 'playback.release': {
         for (const [key, value] of this.playbackManifests) if (value.id === params.id) this.playbackManifests.delete(key);
-        this.hls.release(params.id); this.dashCache.release(params.id); await this.cache.release(params.id); return { released: true };
+        await this.hls.release(params.id); this.dashCache.release(params.id); await this.cache.release(params.id); return { released: true };
       }
-      case 'playback.cache.stats': return params.id ? this.cache.statistics(params.id) : this.cache.videoStatistics();
+      case 'playback.cache.stats': {
+        if (!params.id) return this.cache.videoStatistics();
+        const owner = this.cache.owners.get(params.id), revision = owner?.cacheRevision;
+        const statistics = this.cache.statistics(params.id);
+        if (!statistics) return null;
+        const coverage = await enrichCacheCoverage(this.cache, params.id, statistics.coverage);
+        // Index enrichment yields while reading acquired bytes. Clear, disable
+        // or release can retire this snapshot before its HLS times are derived.
+        // Refresh all counters/status together and keep old coverage withdrawn.
+        if (this.cache.owners.get(params.id) !== owner || owner.closed || owner.cacheRevision !== revision) {
+          const current = this.cache.statistics(params.id);
+          return current ? { ...current, coverage: [], timeRanges: [] } : null;
+        }
+        return { ...statistics, coverage, timeRanges: this.hls.cachedTimeRanges(params.id, statistics.coverage) };
+      }
       case 'playback.cache.clear': {
+        await this.hls.stopPrefetches({ clear: true });
         await this.cache.clearVideos();
         this.dashCache.clear();
         for (const context of this.hls.contexts.values()) {
@@ -224,7 +253,11 @@ export class MobileServices {
         return { bytes:received };
       }
       case 'settings.set': {
-        if (params.videoCache) await this.cache.update(params.videoCache);
+        if (params.videoCache) {
+          await this.hls.stopPrefetches();
+          await this.cache.update(params.videoCache);
+          this.hls.resumePrefetches();
+        }
         if (params.tmdb) {
           const config = { ...defaults.tmdb, ...params.tmdb };
           const url = new URL(config.panApiBase);
@@ -235,7 +268,12 @@ export class MobileServices {
           this.configuration[key] = { ...defaults[key], ...params[key] };
         this.revision++; return { revision: this.revision };
       }
-      case 'operation.cancel': this.operations.get(params.id)?.abort(); return { cancelled: true };
+      case 'operation.cancel': {
+        const operation = this.operations.get(params.id);
+        operation?.controller.abort();
+        if (operation) await operation.completed;
+        return { cancelled: true };
+      }
       case 'session.set': {
         if (typeof params.id !== 'string' || !params.id || params.id.length > 128) throw new Error('播放会话无效');
         let retired;
@@ -257,12 +295,28 @@ export class MobileServices {
           this.ai.cancel(); this.subtitles.cancel(); this.live.close(); this.danmakuRevision++;
           retired = this.document; this.document = null; this.session = null; this.events = [];
         }
-        this.hls.release(params.sessionId);
+        await this.hls.release(params.sessionId);
         if (retired) await fs.rm(retired.file, { force: true });
         return { stopped: true };
       }
       case 'pan.search': return await this.home.search(params, signal);
       case 'pan.check': return await this.checker.check(params, signal, { enabled: params.manual === true ? true : undefined });
+      case 'catalog.pan.check': {
+        if (!siteIntegrationEnabled(params.site?.panCheck)) return { enabled: false, items: [] };
+        if (!Array.isArray(params.items) || params.items.length > 20) throw new Error('每批检测最多 20 条站点资源');
+        const shares = params.items.flatMap(item => {
+          if (!item || typeof item.id !== 'string' || item.id.length > 8192) return [];
+          const share = sitePanShare(item, params.site);
+          return share ? [{ row: item.id, share }] : [];
+        });
+        if (!shares.length) return { enabled: true, items: [] };
+        const result = await this.checker.check({ items: shares.map(item => item.share), refresh: params.refresh === true }, signal, { enabled: true });
+        signal?.throwIfAborted();
+        return { enabled: result.enabled, items: shares.flatMap(({ row, share }) => {
+          const status = result.items.find(item => item.id === share.id);
+          return status ? [{ ...status, id: row }] : [];
+        }) };
+      }
       case 'live.start': {
         const session = this.assertSession(params), config = normalizeLiveDanmaku(params.descriptor, params.baseURL);
         if (!config) throw new Error('实时弹幕配置无效');
@@ -277,8 +331,12 @@ export class MobileServices {
       case 'danmaku.prepare': {
         const session = this.assertSession(params);
         const revision = ++this.danmakuRevision;
+        const cacheDirectory = path.join(this.directory, 'danmaku-cache');
         let text;
-        if (typeof params.text === 'string') {
+        if (params.cacheId !== undefined) {
+          text = await readCachedDanmaku(cacheDirectory, params.cacheId);
+          if (text === null) throw new Error('原弹幕缓存已失效');
+        } else if (typeof params.text === 'string') {
           if (Buffer.byteLength(params.text) > 32 * 1024 ** 2) throw new Error('弹幕文件过大');
           text = params.text;
         } else if (typeof params.data === 'string') {
@@ -306,7 +364,12 @@ export class MobileServices {
           && Math.max(Number(item.effect?.lifetime) || 0, ...(item.effect?.items || []).map(node => Number(node.lifetime) || 0)) > 32);
         const previous = this.document; this.document = { file, manifest, headerLength, sessionId: session.id, longEvents };
         if (previous) await fs.rm(previous.file, { force: true });
-        return { count: manifest.count, chunks: manifest.chunks.length };
+        // Preserve the complete original document, including advanced effects,
+        // separately from the session index that is deleted on playback close.
+        const cacheId = params.cacheId ?? await cacheDanmakuDocument(cacheDirectory, text).catch(() => undefined);
+        signal?.throwIfAborted();
+        if (this.session !== session || revision !== this.danmakuRevision) throw new Error('播放媒体或弹幕选择已改变');
+        return { count: manifest.count, chunks: manifest.chunks.length, ...(cacheId ? { cacheId } : {}) };
       }
       case 'danmaku.window': {
         this.assertSession(params);
@@ -362,15 +425,31 @@ export class MobileServices {
       }
       case 'cache.stats': return this.cache.statistics(params.id);
       case 'cache.release': await this.cache.release(params.id); return { released: true };
-      case 'hls.release': this.hls.release(params.id); return { released: true };
+      case 'hls.release': await this.hls.release(params.id); return { released: true };
       default: throw new Error('未知媒体服务');
     }
   }
-  async dispatch(method, params, operationId) {
+  async dispatch(method, params, operationId, signal) {
+    if (method === 'operation.cancel' && operationId === params.id) operationId = undefined;
     const controller = new AbortController();
-    if (operationId) { this.operations.get(operationId)?.abort(); this.operations.set(operationId, controller); }
-    try { return await this.call(method, params, controller.signal); }
-    finally { if (this.operations.get(operationId) === controller) this.operations.delete(operationId); }
+    let finish;
+    const operation = { controller, completed: new Promise(resolve => { finish = resolve; }) };
+    if (operationId) {
+      const previous = this.operations.get(operationId);
+      // Duplicate external IDs cannot create a second cleanup chain while the
+      // first invocation still owns native resources.
+      if (previous) throw new Error('The media operation is already running');
+      this.operations.set(operationId, operation);
+    }
+    const abort = () => controller.abort(signal.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    try { controller.signal.throwIfAborted(); return await this.call(method, params, controller.signal); }
+    finally {
+      signal?.removeEventListener('abort', abort);
+      if (this.operations.get(operationId) === operation) this.operations.delete(operationId);
+      finish();
+    }
   }
   async handle(request, response) {
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -387,5 +466,5 @@ export class MobileServices {
     if (!url.pathname.startsWith('/hls/')) return false;
     return await this.hls.handle(request, response, url);
   }
-  async close() { this.live.close(); this.ai.cancel(); this.subtitles.cancel(); this.hls.close(); this.dashCache.close(); this.playbackManifests.clear(); for (const job of this.operations.values()) job.abort(); await this.cache.close(); }
+  async close() { this.live.close(); this.ai.cancel(); this.subtitles.cancel(); await this.hls.close(); this.dashCache.close(); this.playbackManifests.clear(); for (const job of this.operations.values()) job.controller.abort(); await this.cache.close(); }
 }

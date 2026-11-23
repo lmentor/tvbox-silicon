@@ -2,7 +2,7 @@ import SwiftUI
 import TVCore
 
 #if os(iOS)
-struct LocalCatalogDetailEpisode: Identifiable {
+struct LocalCatalogDetailEpisode: Identifiable, Sendable {
     let episode: Episode
     let info: TMDBMatch.EpisodeInfo?
     let title: String

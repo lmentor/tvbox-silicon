@@ -73,6 +73,12 @@ _send = requests.Session.send
 _sleep = time.sleep
 _urlopen = urllib.request.OpenerDirector.open
 _response_begin = http.client.HTTPResponse.begin
+_response_read = http.client.HTTPResponse.read
+_response_read1 = http.client.HTTPResponse.read1
+_response_readline = http.client.HTTPResponse.readline
+_response_close = http.client.HTTPResponse.close
+_requests_iter_content = requests.Response.iter_content
+_requests_close = requests.Response.close
 _executor_submit = ThreadPoolExecutor.submit
 
 
@@ -80,7 +86,9 @@ class RequestStopped(BaseException):
     """A host stop must pass through a source's usual `except Exception: retry` handlers."""
     def __init__(self, code):
         self.code = code
-        super().__init__('The source took too long to respond.' if code == 'request_timeout' else 'The source request was cancelled.')
+        message = 'The source took too long to respond.' if code == 'request_timeout' else 'The source request was cancelled.'
+        if code == 'response_too_large': message = 'The source response exceeds the 8 MB search limit. Narrow the keyword and retry.'
+        super().__init__(message)
 
 
 _requests_lock = threading.Lock()
@@ -101,6 +109,14 @@ def executor_submit(executor, function, /, *args, **kwargs):
     scope = current_request()
     if scope is None:
         return _executor_submit(executor, function, *args, **kwargs)
+    with scope.child_condition:
+        scope.check()
+        scope.children += 1
+
+    def completed(_=None):
+        with scope.child_condition:
+            scope.children -= 1
+            scope.child_condition.notify_all()
 
     def run():
         previous, previous_trace = current_request(), sys.gettrace()
@@ -115,7 +131,13 @@ def executor_submit(executor, function, /, *args, **kwargs):
             sys.settrace(previous_trace)
             _thread.request_scope = previous
 
-    return _executor_submit(executor, run)
+    try:
+        future = _executor_submit(executor, run)
+    except BaseException:
+        completed()
+        raise
+    future.add_done_callback(completed)
+    return future
 
 
 ThreadPoolExecutor.submit = executor_submit
@@ -134,6 +156,10 @@ class RequestScope:
     def __init__(self, request):
         self.id = str(request.get('request') or '')
         default = 25 if 'wd' in (request.get('params') or {}) else 140
+        self.maximum_bytes = 8 * 1024 * 1024 if 'wd' in (request.get('params') or {}) else None
+        self.http_slots = threading.BoundedSemaphore(4)
+        self.child_condition = threading.Condition()
+        self.children = 0
         try:
             timeout = min(140, max(.05, float(request.get('timeoutSeconds', default))))
         except (TypeError, ValueError):
@@ -168,6 +194,13 @@ class RequestScope:
     def finish(self):
         sys.settrace(self.previous_trace)
         _thread.request_scope = self.previous
+        if self.maximum_bytes is not None:
+            # A source may return without joining an executor it created. Keep
+            # the execution fence until its child calls have actually unwound.
+            self.stop(self.code or 'request_cancelled')
+            with self.child_condition:
+                while self.children:
+                    self.child_condition.wait(.05)
         self.timer.cancel()
         with _requests_lock:
             if _requests.get(self.id) is self:
@@ -186,6 +219,7 @@ class RequestScope:
         """Only acquiring/rewriting a proxy response is deadline-bound; movies may run for hours."""
         self.timer.cancel()
         self.deadline = float('inf')
+        self.maximum_bytes = None
 
     def trace(self, frame, event, arg):
         if frame.f_code.co_filename.startswith(self.source_folders):
@@ -238,6 +272,12 @@ class RequestScope:
         except (TypeError, ValueError):
             return urllib3.util.Timeout(total=remaining, connect=remaining, read=remaining)
 
+    def check_bytes(self, amount):
+        self.check()
+        if self.maximum_bytes is not None and amount > self.maximum_bytes:
+            self.stop('response_too_large')
+            self.check()
+
 
 def cancel_request(request_id):
     if not re.fullmatch(r'[A-Za-z0-9-]{1,80}', request_id):
@@ -271,28 +311,110 @@ def response_begin(response):
     scope = current_request()
     if scope:
         scope.track(response)
-    return _response_begin(response)
+    result = _response_begin(response)
+    if scope and scope.maximum_bytes is not None:
+        response._yingxia_scope = scope
+        response._yingxia_read = 0
+        response._yingxia_reading = False
+        scope.check_bytes(response.length or 0)
+    return result
+
+
+def bounded_response_read(response, original, amount=None):
+    scope = getattr(response, '_yingxia_scope', None)
+    if scope is None or getattr(response, '_yingxia_reading', False):
+        return original(response, amount)
+    scope.check()
+    remaining = scope.maximum_bytes - response._yingxia_read
+    bounded = remaining + 1 if amount is None or amount < 0 else min(amount, remaining + 1)
+    response._yingxia_reading = True
+    try:
+        data = original(response, bounded)
+    finally:
+        response._yingxia_reading = False
+    response._yingxia_read += len(data)
+    scope.check_bytes(response._yingxia_read)
+    if response.isclosed(): release_response_slot(response)
+    return data
+
+
+def response_read(response, amount=None): return bounded_response_read(response, _response_read, amount)
+def response_read1(response, amount=-1): return bounded_response_read(response, _response_read1, amount)
+def response_readline(response, amount=-1): return bounded_response_read(response, _response_readline, amount)
+
+
+def requests_iter_content(response, chunk_size=1, decode_unicode=False):
+    scope = getattr(response, '_yingxia_scope', None)
+    if scope is None or scope.maximum_bytes is None:
+        yield from _requests_iter_content(response, chunk_size, decode_unicode)
+        return
+    received = 0
+    try:
+        # requests / urllib3 decompress before yielding; count decoded bytes too.
+        for chunk in _requests_iter_content(response, min(chunk_size or 65536, 65536), decode_unicode):
+            received += len(chunk.encode('utf-8')) if isinstance(chunk, str) else len(chunk)
+            scope.check_bytes(received)
+            yield chunk
+    finally:
+        if received and not getattr(response, '_content_consumed', False): response.close()
+        release_response_slot(response)
+
+
+def release_response_slot(response):
+    release = getattr(response, '_yingxia_release', None)
+    if release:
+        response._yingxia_release = None
+        release()
+
+
+def requests_close(response):
+    try: return _requests_close(response)
+    finally: release_response_slot(response)
+
+
+def response_close(response):
+    try: return _response_close(response)
+    finally: release_response_slot(response)
 
 
 def urlopen(opener, url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
     scope = current_request()
+    # Redirects recursively enter the same opener on this thread. One socket
+    # lease spans that chain; otherwise the fourth redirect would deadlock.
+    nested = getattr(_thread, 'opening_depth', 0)
     if scope:
         timeout = scope.timeout(timeout)
+    release = acquire_http_slot(scope) if scope and scope.maximum_bytes is not None and not nested else None
+    _thread.opening_depth = nested + 1
     try:
         response = _urlopen(opener, url, data, timeout)
-    except Exception:
+    except BaseException:
+        if release: release()
         if scope:
             scope.check()
         raise
+    finally:
+        _thread.opening_depth = nested
+    if release: response._yingxia_release = release
     if scope:
-        scope.track(response)
-        scope.check()
+        try:
+            scope.track(response)
+            scope.check()
+        except BaseException:
+            response.close()
+            raise
     return response
 
 
 time.sleep = sleep
 http.client.HTTPResponse.begin = response_begin
+http.client.HTTPResponse.read = response_read
+http.client.HTTPResponse.read1 = response_read1
+http.client.HTTPResponse.readline = response_readline
+http.client.HTTPResponse.close = response_close
 urllib.request.OpenerDirector.open = urlopen
+requests.Response.iter_content = requests_iter_content
+requests.Response.close = requests_close
 
 
 @contextmanager
@@ -318,14 +440,52 @@ def recorded_failure():
     return last_failure if _shared else getattr(_thread, 'failure', None)
 
 
+def acquire_http_slot(scope):
+    while not scope.http_slots.acquire(timeout=.05): scope.check()
+    released = False
+    release_lock = threading.Lock()
+    def release():
+        nonlocal released
+        with release_lock:
+            if not released:
+                released = True
+                scope.http_slots.release()
+    return release
+
+
 def send(session, prepared, **options):
+    scope = current_request()
+    depth = getattr(_thread, 'sending_depth', 0)
+    if scope is None or scope.maximum_bytes is None or depth:
+        return send_scoped(session, prepared, **options)
+    release = acquire_http_slot(scope)
+    _thread.sending_depth = depth + 1
+    try:
+        response = send_scoped(session, prepared, **options)
+        if options.get('stream'):
+            response._yingxia_release = release
+        else:
+            release()
+        return response
+    except BaseException:
+        release()
+        raise
+    finally:
+        _thread.sending_depth = depth
+
+
+def send_scoped(session, prepared, **options):
     """Record the last upstream failure, and bound waits."""
     host = urlsplit(prepared.url).netloc
     if options.get('timeout') is None:
         options['timeout'] = 20
     scope = current_request()
+    streaming = options.get('stream', False)
     if scope:
         options['timeout'] = scope.timeout(options.get('timeout'))
+        if scope.maximum_bytes is not None:
+            # Session.send otherwise consumes .content before the host can attach bounds.
+            options['stream'] = True
     try:
         response = _send(session, prepared, **options)
     except requests.RequestException as error:
@@ -336,7 +496,15 @@ def send(session, prepared, **options):
         raise
     if scope:
         scope.track(response)
+        response._yingxia_scope = scope
         scope.check()
+        if scope.maximum_bytes is not None:
+            try:
+                scope.check_bytes(int(response.headers.get('content-length') or 0))
+                if not streaming: _ = response.content
+            except BaseException:
+                response.close()
+                raise
     log('PY_HTTP', host + urlsplit(prepared.url).path, response.status_code)
     if response.status_code >= 400:
         record_failure(RemoteFailure(host, response.status_code, f'The source {host} returned HTTP {response.status_code}'))
@@ -874,13 +1042,28 @@ class Session:
             query = address[match.end():]
         return self.runtime.proxy_url.split('?', 1)[0] + '?' + (query or 'do=py')
 
-    def proxy_values(self, value):
+    def proxy_values(self, value, encoded_depth=0):
         if isinstance(value, str):
             return self.proxy_address(value)
         if isinstance(value, dict):
-            return {key: self.proxy_values(item) for key, item in value.items()}
+            result = {}
+            for key, item in value.items():
+                # The native/Node playback normalizers also accept JSON text
+                # inside these envelopes. Bind its source proxy while we still
+                # know the owning session, retaining the envelope's wire shape.
+                if key in ('data', 'result', 'play') and isinstance(item, str) and encoded_depth < 4:
+                    try:
+                        nested = json.loads(item)
+                    except (ValueError, TypeError):
+                        nested = None
+                    if isinstance(nested, (dict, list)):
+                        rewritten = self.proxy_values(nested, encoded_depth + 1)
+                        result[key] = json.dumps(rewritten, ensure_ascii=False) if rewritten != nested else item
+                        continue
+                result[key] = self.proxy_values(item, encoded_depth)
+            return result
         if isinstance(value, (list, tuple)):
-            return [self.proxy_values(item) for item in value]
+            return [self.proxy_values(item, encoded_depth) for item in value]
         return value
 
     def proxy_playlist(self, body):
@@ -965,8 +1148,12 @@ class Session:
             fields = {str(key).lower(): value for key, value in body.headers.items()}
             fields.update({str(key).lower(): value for key, value in headers.items()})
             headers = fields
-            if status == 200 and body.status_code == 206:
-                status = 206
+            # Most spiders return [200, mime, response] and let the host carry
+            # the actual HTTP metadata. Preserve a partial response or origin
+            # failure; otherwise an expired URL/failed seek becomes cacheable
+            # successful movie bytes. An explicitly chosen source status wins.
+            if status == 200 and body.status_code != 200:
+                status = body.status_code
             # A spider may already have eagerly read its response. Reuse those
             # bytes without asking .content to fetch a second complete body.
             if body._content_consumed and isinstance(body._content, bytes):
@@ -1047,13 +1234,16 @@ class Session:
                 raise recorded_failure()
             result = {}
         if isinstance(result, str):
+            if 'wd' in params and (scope := current_request()): scope.check_bytes(len(result.encode('utf-8')))
             result = parsed(result)
         if 'play' not in params:
             result = self.catalog.normalize(result, detail='ids' in params)
         normalized = self.proxy_values(result)
         if 'play' in params and self.runtime.proxy_url.split('?', 1)[0] in json.dumps(normalized, ensure_ascii=False):
             self.playback_until = time.monotonic() + 45
-        return {'result': json.dumps(normalized, ensure_ascii=False)}
+        text = json.dumps(normalized, ensure_ascii=False)
+        if 'wd' in params and (scope := current_request()): scope.check_bytes(len(text.encode('utf-8')))
+        return {'result': text}
 
     def close(self):
         if self.closed:

@@ -11,7 +11,6 @@ struct HomeView: View {
     @FocusState private var primaryFocused: Bool
     #endif
     @AppStorage(HomeSection.continueWatching.key) private var showsContinueWatching = true
-    @AppStorage(HomeSection.pinnedSources.key) private var showsPinnedSources = true
     @AppStorage(HomeSection.recommendations.key) private var showsRecommendations = true
     @AppStorage(HomeSection.favorites.key) private var showsFavorites = true
     @AppStorage(HomeSection.liveTV.key) private var showsLiveTV = true
@@ -58,7 +57,6 @@ struct HomeView: View {
             switch section {
             case .upNext: showsUpNext
             case .continueWatching: showsContinueWatching && store.playbackHistory.isEnabled
-            case .pinnedSources: showsPinnedSources
             case .recommendations: showsRecommendations
             case .favorites: showsFavorites && store.favorites.isEnabled
             case .liveTV: showsLiveTV
@@ -113,7 +111,6 @@ struct HomeView: View {
     /// A section that will be on the page once it is built. Empty data is skipped so a placeholder does not appear and then vanish.
     private func showsPlaceholder(_ config: Subscription) -> Bool {
         (showsContinueWatching && store.playbackHistory.isEnabled && !store.visibleHistory.isEmpty)
-            || (showsPinnedSources && !store.pinnedSources.isEmpty)
             || showsRecommendations
             || (showsFavorites && store.favorites.isEnabled && !store.favorites.items.isEmpty)
             || (showsLiveTV && !config.lives.isEmpty)
@@ -123,13 +120,10 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: Layout.sectionSpacing) {
             if showsContinueWatching, store.playbackHistory.isEnabled, !store.visibleHistory.isEmpty { continueWatching }
             if let config = store.subscription {
-                if showsPinnedSources, store.orderedSites(config).contains(where: { store.pinnedSources.contains($0, origin: config.origin) }) {
-                    pinnedSources(config)
-                }
                 if showsRecommendations { RecommendationsView(config: config) }
                 if showsFavorites, store.favorites.isEnabled, !store.favorites.items.isEmpty { favorites }
                 if showsLiveTV, !config.lives.isEmpty { playlists(config).id("live") }
-                if !(showsContinueWatching || showsPinnedSources || showsRecommendations || showsFavorites || showsLiveTV) { allHidden }
+                if !(showsContinueWatching || showsRecommendations || showsFavorites || showsLiveTV) { allHidden }
             } else {
                 welcome
             }
@@ -141,9 +135,7 @@ struct HomeView: View {
             if showsContinueWatching, store.playbackHistory.isEnabled, !store.visibleHistory.isEmpty {
                 loadingSection(HomeSection.continueWatching.title, action: { store.section = .history }) { cardRow }
             }
-            if showsPinnedSources, !store.pinnedSources.isEmpty {
-                loadingSection(HomeSection.pinnedSources.title, action: { store.section = .sites }) { cardRow }
-            }
+
             if showsRecommendations {
                 VStack(alignment: .leading, spacing: 16) {
                     ChipSkeletonRow()
@@ -294,22 +286,7 @@ struct HomeView: View {
         .frame(maxWidth: .infinity).padding(.top, 60)
     }
 
-    private func pinnedSources(_ config: Subscription) -> some View {
-        VStack(alignment: .leading, spacing: Layout.headerSpacing) {
-            SectionHeader(title: L10n.text("Pinned Sources")) { store.section = .sites }
-            LazyVGrid(columns: Layout.cardColumns, spacing: Layout.cardSpacing) {
-                WithPerceptionTracking {
-                    ForEach(store.orderedSites(config).filter { store.pinnedSources.contains($0, origin: config.origin) }) { site in
-                        WithPerceptionTracking {
-                            RouteLink { WithPerceptionTracking { SiteView(site: site, origin: config.origin, jarURL: config.spiderURL) } } label: { WithPerceptionTracking { SiteCard(site: site, marksPinned: false) } }
-                                .tileButton().contextMenu { WithPerceptionTracking { PinSourceButton(site: site, origin: config.origin) } }
-                                .accessibilityIdentifier("home.pinned." + site.key)
-                        }
-                    }
-                }
-            }
-        }.accessibilityIdentifier("home.pinnedSources")
-    }
+
 
     private var continueWatching: some View {
         VStack(alignment: .leading, spacing: Layout.headerSpacing) {
@@ -605,7 +582,7 @@ private enum PosterSurface {
 
 /// A section of Watch Now that Settings can hide. Each one shows until it is switched off.
 enum HomeSection: String, CaseIterable, Identifiable {
-    case upNext, continueWatching, pinnedSources, recommendations, favorites, liveTV
+    case upNext, continueWatching, recommendations, favorites, liveTV
     var id: String { rawValue }
     /// The sections Watch Now has.
     static var available: [HomeSection] { allCases }
@@ -615,7 +592,6 @@ enum HomeSection: String, CaseIterable, Identifiable {
         switch self {
         case .upNext: L10n.text("Up Next")
         case .continueWatching: L10n.text("Continue Watching")
-        case .pinnedSources: L10n.text("Pinned Sources")
         case .recommendations: L10n.text("Recommendations")
         case .favorites: L10n.text("Favorites")
         case .liveTV: L10n.text("Live TV")
@@ -625,7 +601,6 @@ enum HomeSection: String, CaseIterable, Identifiable {
         switch self {
         case .upNext: "play.circle.fill"
         case .continueWatching: AppSection.history.icon
-        case .pinnedSources: "pin.fill"
         case .recommendations: "sparkles"
         case .favorites: AppSection.favorites.icon
         case .liveTV: AppSection.live.icon
@@ -635,7 +610,6 @@ enum HomeSection: String, CaseIterable, Identifiable {
         switch self {
         case .upNext: Brand.cyan
         case .continueWatching: Brand.amber
-        case .pinnedSources: .purple
         case .recommendations: .orange
         case .favorites: Brand.rose
         case .liveTV: .red

@@ -11,6 +11,7 @@ struct LocalSourceSettingsView: View {
     @State private var name = ""
     @State private var address = ""
     @State private var showsPicker = false
+    @State private var replacementEntry: SubscriptionEntry?
     @State private var preparingSelection = false
     @State private var importProgress = ""
     @State private var batchReport: LocalDocumentBatchReport?
@@ -23,14 +24,16 @@ struct LocalSourceSettingsView: View {
         WithPerceptionTracking {
             sourceForm
             .navigationTitle(group.title)
-            .localDocumentImporter(isPresented: $showsPicker, kind: group == .python ? .pythonFiles : .subscriptionFile) { result in
+            .localDocumentImporter(isPresented: $showsPicker, kind: replacementEntry != nil ? .sourceReplacement : (group == .python ? .pythonFiles : .subscriptionFile)) { result in
                 switch result {
                 case .success(let selection):
                     importSelectedDocuments(selection)
                 case .failure(let error):
+                    replacementEntry = nil
                     store.importError = error.localizedDescription
                 }
             } cancelled: {
+                replacementEntry = nil
                 store.notice = "已取消文件选择"
             }
             .confirmationDialog("删除来源？", isPresented: Binding(get: { selectedRemoval != nil }, set: { if !$0 { selectedRemoval = nil } })) {
@@ -76,8 +79,8 @@ struct LocalSourceSettingsView: View {
     private var importSection: some View {
         WithPerceptionTracking {
             SettingsGroup(title: "添加\(group.title)", footer: group == .python
-                ? "本地可多选 Python 文件或 ZIP，选完后点“打开”；有依赖的脚本请一起压缩为 ZIP。逐个导入并显示结果，失败文件不影响其它文件。支持远程 Python、脚本 JSON 和 MD5 地址。文件导入后保存副本，修改后请重新导入。Python 可同时启用多个，观看记录归入当前订阅。"
-                : "本地选择 JSON 或 ZIP 文件；多文件接口包请把 index.js、index.config.js 和对应 MD5 一起压缩为 ZIP。支持远程订阅和 MD5 地址。文件导入后保存副本，修改后请重新导入。同时只启用一个订阅，Python 来源可独立启用。") {
+                ? "本地可多选 Python 文件或 ZIP，选完后点“打开”；有依赖的脚本请一起压缩为 ZIP。逐个导入并显示结果，失败文件不影响其它文件。支持远程 Python、脚本 JSON 和 MD5 地址。文件导入后保存副本，修改后点该来源的“更新”选择新文件。Python 可同时启用多个，观看记录归入当前订阅。"
+                : "本地选择 JSON 或 ZIP 文件；多文件接口包请把 index.js、index.config.js 和对应 MD5 一起压缩为 ZIP。支持远程订阅和 MD5 地址。修改本地文件后点该订阅的“更新”选择新 ZIP、JSON，或同时选择 MD5 及其配套文件。同时只启用一个订阅，Python 来源可独立启用。") {
                 TextField("名称（可选，留空自动生成）", text: $name)
                     .accessibilityLabel("来源名称")
                     .accessibilityIdentifier("sources.\(group.rawValue).name")
@@ -124,7 +127,7 @@ struct LocalSourceSettingsView: View {
                             .accessibilityAddTraits(store.subscriptionUpdateFrequency == frequency ? [.isSelected] : [])
                             .accessibilityIdentifier("sources.subscription.autoUpdate.\(frequency.rawValue)")
                         }
-                        Text("进入前台时按所选频率检查已启用订阅，仅在内容变化时更新；本地文件请重新导入。")
+                        Text("进入前台时按所选频率检查已启用订阅，仅在内容变化时更新；本地文件请点订阅的“更新”选择新文件。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -168,7 +171,7 @@ struct LocalSourceSettingsView: View {
                         }) {
                         ForEach(store.managedSubscriptions(in: group)) { entry in
                             ManagedLocalSourceRow(entry: entry, group: group, reorderEnabled: !preparingSelection,
-                                reorderSession: $reorderSession, remove: { selectedRemoval = entry })
+                                reorderSession: $reorderSession, remove: { selectedRemoval = entry }, update: { update(entry) })
                                 .disabled(preparingSelection)
                                 .localSettingsReorderRow(id: entry.address)
                         }
@@ -178,35 +181,53 @@ struct LocalSourceSettingsView: View {
     }
 
     private func presentFile() {
+        replacementEntry = nil
         batchReport = nil
         store.importError = nil; store.notice = "正在打开文件选择器…"
         showsPicker = true
     }
 
+    private func update(_ entry: SubscriptionEntry) {
+        guard !preparingSelection, !store.importing, !showsPicker else { return }
+        preparingSelection = true
+        importProgress = "正在准备更新"
+        batchReport = nil
+        store.importError = nil; store.notice = nil
+        Task {
+            defer { preparingSelection = false; importProgress = "" }
+            do {
+                let needsFile = try await store.sourceUpdateRequiresFile(entry)
+                guard store.subscriptions.contains(where: { $0.address == entry.address }) else { return }
+                if needsFile {
+                    replacementEntry = entry
+                    store.notice = "请选择“\(entry.title)”的新文件；取消选择会保留原有版本"
+                    showsPicker = true
+                } else { await store.refreshSource(entry) }
+            } catch { store.importError = error.localizedDescription }
+        }
+    }
+
     private func importSelectedDocuments(_ selection: LocalDocumentSelection) {
-        guard !store.importing, !preparingSelection else { selection.release(); return }
+        guard !preparingSelection else { selection.release(); return }
         Diagnostics.shared.record(.info, "imports", "source picker import ready kind=\(selection.kind.rawValue)")
         preparingSelection = true
         batchReport = nil
-        let proposedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proposedName = name
+        let replacing = replacementEntry
+        replacementEntry = nil
         Task {
             defer { preparingSelection = false; importProgress = "" }
-            let report = await selection.importDocuments(progress: { index, total, filename in
+            if let replacing {
+                importProgress = "正在校验并更新“\(replacing.title)”"
+                do { store.notice = try await store.replaceLocalDocuments(selection, entry: replacing) }
+                catch is CancellationError { store.notice = "已取消更新，保留原有版本" }
+                catch { store.importError = error.localizedDescription }
+                return
+            }
+            let report = await store.importLocalDocuments(selection, group: group, name: proposedName) { index, total, filename in
                 importProgress = "正在导入 \(index) / \(total)：\(filename)"
-            }) { _, url in
-                guard !store.importing else {
-                    throw NSError(domain: "LocalSourceImport", code: 2, userInfo: [NSLocalizedDescriptionKey: "另一个来源正在导入或更新，请稍后重试此文件"])
-                }
-                let title = selection.urls.count > 1 && !proposedName.isEmpty
-                    ? proposedName + " · " + url.deletingPathExtension().lastPathComponent : proposedName
-                await store.importLocalSources([url], group: group, name: title, importingCopy: true)
-                if let error = store.importError {
-                    throw NSError(domain: "LocalSourceImport", code: 1, userInfo: [NSLocalizedDescriptionKey: error])
-                }
-                return store.notice ?? "已保存"
             }
             batchReport = report
-            store.importError = nil; store.notice = nil
             if report.successCount > 0 { name = "" }
         }
     }
@@ -220,6 +241,7 @@ private struct ManagedLocalSourceRow: View {
     let reorderEnabled: Bool
     @Binding var reorderSession: LocalSettingsReorderSession
     let remove: () -> Void
+    let update: () -> Void
     var body: some View {
         WithPerceptionTracking {
             VStack(alignment: .leading, spacing: 6) {
@@ -235,9 +257,10 @@ private struct ManagedLocalSourceRow: View {
                         .frame(minWidth: 44, minHeight: 44)
                         .accessibilityLabel("删除 " + entry.title)
                         .accessibilityIdentifier("sources.entry.\(entry.id).delete")
-                    Button("更新") { Task { await store.refreshSource(entry) } }
+                    Button("更新", action: update)
                         .frame(minWidth: 44, minHeight: 44)
                         .accessibilityLabel("更新\(entry.title)")
+                        .accessibilityIdentifier("sources.entry.\(entry.id).update")
                     if group == .python {
                         LocalSettingsReorderHandle(title: entry.title, id: entry.address,
                             enabled: reorderEnabled && !store.importing && !store.restoringBackup, session: $reorderSession)

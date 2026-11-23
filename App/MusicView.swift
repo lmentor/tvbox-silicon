@@ -35,28 +35,33 @@ struct MusicView: View {
             ScrollView {
                 WithPerceptionTracking {
                     LazyVStack(alignment: .leading, spacing: MusicLayout.rowSpacing) {
-                        WithPerceptionTracking {
-                            #if os(tvOS)
-                            let typed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !typed.isEmpty, typed != search.query {
-                                SearchQueryButton(query: typed) { search.search(typed, immediately: true) }
-                                    .padding(.bottom, 12)
-                            } else if typed.isEmpty {
-                                MusicNowPlayingButton()
-                            }
-                            #endif
-                            #if !os(macOS)
-                            if !search.query.isEmpty { kinds(search) }
-                            #endif
-                            if !search.query.isEmpty { filters(search) }
-                            content(search)
-                            paginationFooter(search)
+                        // Keep ForEach rows visible to the lazy stack rather
+                        // than hiding the whole list behind one dynamic tracking
+                        // child. The outer scope and each row track their reads.
+                        #if os(tvOS)
+                        let typed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !typed.isEmpty, typed != search.query {
+                            SearchQueryButton(query: typed) { search.search(typed, immediately: true) }
+                                .padding(.bottom, 12)
+                        } else if typed.isEmpty {
+                            MusicNowPlayingButton()
                         }
+                        #endif
+                        #if !os(macOS)
+                        if !search.query.isEmpty { kinds(search) }
+                        #endif
+                        if !search.query.isEmpty { filters(search) }
+                        content(search)
+                        paginationFooter(search)
                     }
                     .glassRowInsets()
                     .pageContainer()
                 }
             }
+            // Search can be thousands of rows deep. Returning to the short
+            // Home page needs a fresh scroll/lazy layout, while pushing and
+            // popping a result keeps the same search identity and position.
+            .id(search.query.isEmpty)
             .screenBackdrop()
         }
     }
@@ -137,7 +142,8 @@ struct MusicView: View {
             #if os(tvOS)
             .onPlayPauseCommand { store.music.toggle() }
             #endif
-            // The shelves load the first time the page shows with nothing searched, not at launch.
+            // The model retains the fetch when search or a detail cancels this
+            // view task; returning Home joins that same load.
             .task(id: search.query.isEmpty) { if search.query.isEmpty { await store.musicBrowse.load() } }
             .tabTitle(L10n.text("Music"))
             #if !os(tvOS)
@@ -384,66 +390,71 @@ private struct MusicHome: View {
             let library = store.music.library
             let browse = store.musicBrowse
             let resumable = store.music.track == nil ? library.resumePoint : nil
-            if let point = resumable, let track = point.queue.current {
-                MusicContinueCard(point: point, track: track).padding(.bottom, 20)
-            }
-            let liked = store.favorites.musicTracks.count
-            MusicLikedLink(count: liked).padding(.bottom, 12)
-            RouteLink { MusicFavoriteCollectionsView() } label: {
-                HStack(spacing: MusicLayout.gap) {
-                    Image(systemName: "music.note.list").font(.title2).foregroundStyle(Brand.accent)
-                        .frame(width: MusicLayout.art, height: MusicLayout.art)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("我的歌单").font(.headline)
-                        Text("收藏的歌单与专辑 · \(library.favoriteCollections.count)").font(.subheadline).foregroundStyle(.secondary)
+            // Home is a bounded group (at most twenty history entries). Give
+            // the enclosing lazy stack one measured layout instead of an
+            // opaque tracking view whose number of children changes on iOS 16.
+            VStack(alignment: .leading, spacing: MusicLayout.rowSpacing) {
+                if let point = resumable, let track = point.queue.current {
+                    MusicContinueCard(point: point, track: track).padding(.bottom, 20)
+                }
+                let liked = store.favorites.musicTracks.count
+                MusicLikedLink(count: liked).padding(.bottom, 12)
+                RouteLink { MusicFavoriteCollectionsView() } label: {
+                    HStack(spacing: MusicLayout.gap) {
+                        Image(systemName: "music.note.list").font(.title2).foregroundStyle(Brand.accent)
+                            .frame(width: MusicLayout.art, height: MusicLayout.art)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("我的歌单").font(.headline)
+                            Text("收藏的歌单与专辑 · \(library.favoriteCollections.count)").font(.subheadline).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                    }.padding(.vertical, 6).contentShape(Rectangle())
+                }.glassRow().padding(.bottom, 20)
+                let downloads = !MusicDownloadLibrary.shared.items.isEmpty
+                if downloads { MusicDownloadsLink().padding(.bottom, 20) }
+                if !browse.sections.isEmpty {
+                    MusicBrowseShelves(sections: browse.sections).padding(.bottom, 28)
+                } else if browse.loading {
+                    ProgressView().frame(maxWidth: .infinity).padding(.vertical, 60)
+                }
+                if browse.incomplete && !browse.loading {
+                    Button { Task { await browse.load() } } label: {
+                        Label(L10n.text("Some lists couldn't load. Try again."), systemImage: "arrow.clockwise")
+                            #if !os(tvOS)
+                            .font(.subheadline).frame(maxWidth: .infinity).padding(.vertical, 8)
+                            #endif
                     }
-                    Spacer()
-                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                }.padding(.vertical, 6).contentShape(Rectangle())
-            }.glassRow().padding(.bottom, 20)
-            let downloads = !MusicDownloadLibrary.shared.items.isEmpty
-            if downloads { MusicDownloadsLink().padding(.bottom, 20) }
-            if !browse.sections.isEmpty {
-                MusicBrowseShelves(sections: browse.sections).padding(.bottom, 28)
-            } else if browse.loading {
-                ProgressView().frame(maxWidth: .infinity).padding(.vertical, 60)
-            }
-            if browse.incomplete && !browse.loading {
-                Button { Task { await browse.load() } } label: {
-                    Label(L10n.text("Some lists couldn't load. Try again."), systemImage: "arrow.clockwise")
-                        #if !os(tvOS)
-                        .font(.subheadline).frame(maxWidth: .infinity).padding(.vertical, 8)
-                        #endif
+                    #if os(tvOS)
+                    .controlButton().frame(maxWidth: .infinity)
+                    #else
+                    .buttonStyle(.plain)
+                    #endif
+                    .padding(.bottom, 20)
                 }
-                #if os(tvOS)
-                .controlButton().frame(maxWidth: .infinity)
-                #else
-                .buttonStyle(.plain)
-                #endif
-                .padding(.bottom, 20)
-            }
-            if !library.history.isEmpty {
-                HStack {
-                    SectionHeader(title: "最近聆听 · 20首")
-                    Spacer()
-                    Button(L10n.text("Clear")) { library.clearHistory() }.controlButton()
-                }
-                .padding(.bottom, 8)
-                .tvFocusSection()
-                ForEach(library.history.prefix(MusicLibrary.historyLimit)) { entry in
-                    WithPerceptionTracking {
-                        if let collection = entry.collection {
-                            MusicCollectionRow(collection: collection)
-                        } else if let track = entry.track {
-                            MusicTrackRow(track: track) { store.music.play(track) }
+                if !library.history.isEmpty {
+                    HStack {
+                        SectionHeader(title: "最近聆听 · 20首")
+                        Spacer()
+                        Button(L10n.text("Clear")) { library.clearHistory() }.controlButton()
+                    }
+                    .padding(.bottom, 8)
+                    .tvFocusSection()
+                    ForEach(library.history.prefix(MusicLibrary.historyLimit)) { entry in
+                        WithPerceptionTracking {
+                            if let collection = entry.collection {
+                                MusicCollectionRow(collection: collection)
+                            } else if let track = entry.track {
+                                MusicTrackRow(track: track) { store.music.play(track) }
+                            }
                         }
                     }
+                } else if resumable == nil && !downloads && browse.sections.isEmpty && !browse.loading {
+                    EmptyPage(symbol: "music.note", title: L10n.text("Search for a Song"),
+                              message: L10n.text("Type a song's name, or its name and the artist. Yingxia finds the recording and plays it from the best channel available, lossless first."),
+                              action: L10n.text("Music Settings"), actionSymbol: "slider.horizontal.3", perform: openSettings)
+                        .frame(minHeight: 420)
                 }
-            } else if resumable == nil && !downloads && browse.sections.isEmpty && !browse.loading {
-                EmptyPage(symbol: "music.note", title: L10n.text("Search for a Song"),
-                          message: L10n.text("Type a song's name, or its name and the artist. Yingxia finds the recording and plays it from the best channel available, lossless first."),
-                          action: L10n.text("Music Settings"), actionSymbol: "slider.horizontal.3", perform: openSettings)
-                    .frame(minHeight: 420)
             }
         }
     }
@@ -592,36 +603,37 @@ struct MusicCollectionView: View {
         WithPerceptionTracking {
             ScrollView {
                 WithPerceptionTracking {
+                    let displayedTracks = tracks
                     LazyVStack(alignment: .leading, spacing: MusicLayout.rowSpacing) {
-                        WithPerceptionTracking {
-                            #if os(tvOS)
-                            MusicNowPlayingButton()
-                            #endif
-                            #if os(macOS)
-                            MusicCollectionHeader(collection: collection, tracks: tracks).padding(.bottom, 28)
-                            #else
-                            header.padding(.bottom, 24)
-                            #endif
-                            if loading && tracks.isEmpty { ProgressView().frame(maxWidth: .infinity).padding(.vertical, 60) }
-                            if let error {
-                                ErrorStateCard(title: L10n.text("Unable to Load Songs"), message: L10n.text("Check your network connection and try again."),
-                                               details: error, retry: { Task { await load() } }, busy: loading)
-                                    .padding(.vertical, 24).tvFocusSection()
-                            }
-                            #if os(macOS)
-                            MusicSongTable(tracks: tracks, numbered: collection.kind == .album) {
-                                store.music.play(MusicQueue(tracks: tracks, start: $0, collection: collection))
-                            }
-                            #else
-                            ForEach(Array(tracks.enumerated()), id: \.offset) { index, track in
-                                WithPerceptionTracking {
-                                    MusicTrackRow(track: track, number: index + 1) {
-                                        store.music.play(MusicQueue(tracks: tracks, start: index, collection: collection))
-                                    }
+                        #if os(tvOS)
+                        MusicNowPlayingButton()
+                        #endif
+                        #if os(macOS)
+                        MusicCollectionHeader(collection: collection, tracks: tracks).padding(.bottom, 28)
+                        #else
+                        header.padding(.bottom, 24)
+                        #endif
+                        if loading && tracks.isEmpty { ProgressView().frame(maxWidth: .infinity).padding(.vertical, 60) }
+                        if let error {
+                            ErrorStateCard(title: L10n.text("Unable to Load Songs"), message: L10n.text("Check your network connection and try again."),
+                                           details: error, retry: { Task { await load() } }, busy: loading)
+                                .padding(.vertical, 24).tvFocusSection()
+                        }
+                        #if os(macOS)
+                        MusicSongTable(tracks: tracks, numbered: collection.kind == .album) {
+                            store.music.play(MusicQueue(tracks: tracks, start: $0, collection: collection))
+                        }
+                        #else
+                        // Occurrence indices preserve duplicate songs in a
+                        // playlist without copying/enumerating every track on redraw.
+                        ForEach(displayedTracks.indices, id: \.self) { index in
+                            WithPerceptionTracking {
+                                MusicTrackRow(track: displayedTracks[index], number: index + 1) {
+                                    store.music.play(MusicQueue(tracks: displayedTracks, start: index, collection: collection))
                                 }
                             }
-                            #endif
                         }
+                        #endif
                     }
                     .glassRowInsets()
                     .pageContainer()

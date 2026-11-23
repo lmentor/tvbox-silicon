@@ -12,6 +12,11 @@ struct DiscoverDetailView: View {
     @Environment(\.isLocalPageActive) private var localPageActive
     #endif
     let item: TMDBCatalog.Item
+    #if os(iOS)
+    /// Keep the poster's query while an optional metadata match arrives in place.
+    var initialSearchQuery: String? = nil
+    private var quickQuery: String { initialSearchQuery ?? item.name }
+    #endif
     @State private var model = DiscoverDetailModel()
     @State private var seasonNumber: Int?
     @State private var season: TMDBMatch.Season?
@@ -22,8 +27,7 @@ struct DiscoverDetailView: View {
     @State private var trailerShown = false
     @State private var searchShown = false
     #if os(iOS)
-    @State private var panShown = false
-    @State private var panSettingsShown = false
+    @State private var quickSearch = LocalQuickSearchModel()
     @State private var calendarShown = false
     @State private var detailSectionsPresented = false
     @State private var trailerOperation: Task<Void, Never>?
@@ -44,17 +48,22 @@ struct DiscoverDetailView: View {
     private var seasons: [TMDBMatch.SeasonSummary] { details?.seasons.filter { $0.number > 0 } ?? [] }
     private var previewActive: Bool {
         #if os(iOS)
-        onScreen && localPageActive && scenePhase == .active && store.playing == nil && store.music.track == nil && !panSettingsShown && !calendarShown && !detailSectionsPresented
+        onScreen && localPageActive && scenePhase == .active && store.playing == nil && store.music.track == nil && !calendarShown && !detailSectionsPresented
         #else
         onScreen && scenePhase == .active
         #endif
     }
 
     var body: some View {
+        #if os(iOS)
+        WithPerceptionTracking { mobilePresentation }
+        #else
         WithPerceptionTracking {
             page
             #if os(iOS)
             .modifier(DiscoverHomeSearchPresentation(isPresented: $searchShown))
+            .modifier(LocalQuickSearchLifecycle(model: quickSearch, query: quickQuery, enabled: true))
+            .modifier(LocalDetailNavigation())
             #else
             .modifier(DiscoverSearchPresentation(isPresented: $searchShown))
             #endif
@@ -78,9 +87,6 @@ struct DiscoverDetailView: View {
             .task(id: seasonNumber) { await loadSeason() }
             #endif
             #if os(iOS)
-            .localGlassDialog(isPresented: $panSettingsShown, title: "盘搜设置", maxWidth: 520, maxHeight: 680, layout: .centered) {
-                PanSearchSettingsView()
-            }
             .localGlassDialog(isPresented: $calendarShown, title: "播出日历", maxWidth: 510, layout: .calendar) {
                 WithPerceptionTracking {
                     DiscoverBroadcastCalendarView(item: item, seasons: seasons, details: details)
@@ -169,7 +175,75 @@ struct DiscoverDetailView: View {
             }
             #endif
         }
+        #endif
     }
+
+    #if os(iOS)
+    private var mobileLifecycle: some View {
+        WithPerceptionTracking {
+            page
+                .modifier(DiscoverHomeSearchPresentation(isPresented: $searchShown))
+                .modifier(LocalQuickSearchLifecycle(model: quickSearch, query: quickQuery, enabled: true))
+                .modifier(LocalDetailNavigation())
+                .onAppear { onScreen = true }
+                .onDisappear { onScreen = false; trailerOperation?.cancel(); trailerOperation = nil; trailerShown = false }
+                .task(id: item.key) { await model.load(item) }
+                .onReceive(NotificationCenter.default.publisher(for: TMDBServiceSettings.changed)) { _ in
+                    model = DiscoverDetailModel(); season = nil
+                    let current = model
+                    Task { await current.load(item) }
+                }
+                .appOnChange(of: details?.id) { _, _ in if seasonNumber == nil { seasonNumber = seasons.first?.number } }
+        }
+    }
+
+    private var mobileDialogs: some View {
+        WithPerceptionTracking {
+            mobileLifecycle
+                .localGlassDialog(isPresented: $calendarShown, title: "播出日历", maxWidth: 510, layout: .calendar) {
+                    WithPerceptionTracking { DiscoverBroadcastCalendarView(item: item, seasons: seasons, details: details) }
+                }
+                .localGlassDialog(isPresented: $overviewShown, title: "剧情简介", maxWidth: 560, layout: .centered) {
+                    WithPerceptionTracking { LocalCatalogSynopsisSheet(title: details?.name ?? item.name, overview: detailOverview) }
+                }
+        }
+    }
+
+    private var mobilePresentation: some View {
+        WithPerceptionTracking {
+            mobileDialogs
+                .sheet(item: $episode) { selection in WithPerceptionTracking { mobileEpisodeSheet(selection) } }
+                .sheet(item: $still) { selection in
+                    WithPerceptionTracking {
+                        NavigationStack {
+                            WithPerceptionTracking {
+                                TMDBArtwork(url: selection.url, maxPixels: 2400, fill: false)
+                                    .background(.black).ignoresSafeArea(edges: .bottom)
+                                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button(L10n.text("Done")) { still = nil } } }
+                            }
+                        }.preferredColorScheme(.dark)
+                    }
+                }
+        }
+    }
+
+    private func mobileEpisodeSheet(_ selection: DiscoverEpisode) -> some View {
+        NavigationStack {
+            WithPerceptionTracking {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        PosterImage(url: selection.value.still ?? details?.backdrop)
+                            .aspectRatio(16.0 / 9, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 16))
+                        Text(selection.value.name).font(.title2.bold())
+                        Text(selection.value.overview).lineSpacing(4)
+                        sourceButton
+                    }.padding(20)
+                }.navigationTitle(selection.value.name)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button(L10n.text("Done")) { episode = nil } } }
+            }
+        }.presentationDetents([.medium, .large])
+    }
+    #endif
 
     @ViewBuilder private var page: some View {
         #if os(tvOS)
@@ -192,17 +266,8 @@ struct DiscoverDetailView: View {
                                         Button(L10n.text("Try Again")) { Task { await model.load(item) } }.padding(.horizontal, 20)
                                     }
                                     #if os(iOS)
-                                    if panShown {
-                                        PanSearchView(title: details?.name ?? item.name, year: item.year.map(String.init),
-                                                      metadataHint: MediaMetadataHint(id: item.id, mediaType: item.mediaType, season: seasonNumber,
-                                                                                     poster: details?.poster ?? item.poster),
-                                                      embedded: true, close: { panShown = false }, revealQuery: {
-                                                          withAnimation(.easeOut(duration: 0.2)) {
-                                                              scroll.scrollTo("discover.pan.query.anchor", anchor: .center)
-                                                          }
-                                                      })
-                                            .padding(.horizontal, 20)
-                                    }
+                                    LocalQuickSearchView(model: quickSearch, query: quickQuery, metadata: details)
+                                        .padding(.horizontal, 20)
                                     #else
                                     if !seasons.isEmpty { episodes }
                                     #endif
@@ -239,11 +304,12 @@ struct DiscoverDetailView: View {
         .navigationTitle("")
         #if os(macOS)
         .artUnderToolbar()
-        #else
+        #elseif !os(iOS)
         .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbarColorScheme(dark ? .dark : .light, for: .navigationBar)
         #endif
+        #if !os(iOS)
         .toolbar { WithPerceptionTracking {
 
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -259,11 +325,15 @@ struct DiscoverDetailView: View {
 
          }}
         #endif
+        #endif
     }
 
     private func identity(width: CGFloat) -> some View {
         VStack(spacing: 16) {
             Color.clear.frame(height: width < 600 ? width * 0.95 : width * 0.25)
+                .overlay(alignment: .bottom) {
+                    if model.paint == nil { DetailArtworkEmblem(compact: width >= 600).padding(.bottom, 40) }
+                }
             #if os(iOS)
             if let original = details?.originalName, !original.isEmpty, original != details?.name {
                 Text(original).font(.system(size: 13)).foregroundStyle(.secondary)
@@ -287,20 +357,6 @@ struct DiscoverDetailView: View {
             #if os(iOS)
             metadataTags
             overviewButton
-            HStack(spacing: 12) {
-                Button { panShown.toggle() } label: {
-                    Label("盘搜", systemImage: "cloud").font(.headline).lineLimit(1)
-                        .frame(maxWidth: .infinity)
-                }.controlButton().controlSize(.large).accessibilityIdentifier("discover.panSearch")
-                    .accessibilityValue(panShown ? "已展开" : "已收起")
-                Button { panSettingsShown = true } label: {
-                    Image(systemName: "slider.horizontal.3").font(.headline)
-                }.controlButton().controlSize(.large).accessibilityLabel("盘搜设置").accessibilityIdentifier("discover.panSettings")
-                Button { store.searchVideos(details?.name ?? item.name) } label: {
-                    Image(systemName: "magnifyingglass").font(.headline)
-                }.controlButton().controlSize(.large).disabled(store.subscription == nil)
-                    .accessibilityLabel("搜索当前作品").accessibilityIdentifier("discover.findSources")
-            }
             #else
             Text(metadata).font(.system(size: 13)).multilineTextAlignment(.center).opacity(0.88)
             HStack(spacing: 12) {
@@ -645,15 +701,29 @@ struct DiscoverDetailView: View {
     var loading = true
     var failed = false
     var scrollY: CGFloat = 0
+    @PerceptionIgnored private var generation = UUID()
     func load(_ item: TMDBCatalog.Item) async {
+        let token = UUID(); generation = token
         loading = true; failed = false
-        defer { loading = false }
+        defer { if generation == token { loading = false } }
+        // Home recommendations without a TMDB identity are still complete
+        // search entries. Paint their supplied poster while metadata resolves.
+        guard item.id > 0 else {
+            if let poster = item.poster {
+                let prepared = await DiscoverPainter.shared.paint(poster)
+                if !Task.isCancelled, generation == token { paint = prepared }
+            }
+            return
+        }
         do {
             let value = try await TMDBMatch.details(item.mediaType, id: item.id, season: nil)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, generation == token else { return }
             details = value
-            if let poster = value.heroPoster ?? item.poster { paint = await DiscoverPainter.shared.paint(poster) }
-        } catch { if !Task.isCancelled { failed = true } }
+            if let poster = value.heroPoster ?? item.poster {
+                let prepared = await DiscoverPainter.shared.paint(poster)
+                if !Task.isCancelled, generation == token { paint = prepared }
+            }
+        } catch { if !Task.isCancelled, generation == token { failed = true } }
     }
 }
 
@@ -665,7 +735,8 @@ private struct DiscoverDetailBackground: View {
     var body: some View {
         WithPerceptionTracking {
             DiscoverBackdrop(paint: model.paint, width: width, heroHeight: height, scrollY: model.scrollY,
-                             trailer: model.details?.trailer, playsTrailer: active && model.scrollY < height * 0.35)
+                             trailer: model.details?.trailer, playsTrailer: active && model.scrollY < height * 0.35,
+                             showsArtworkPlaceholder: true)
         }
     }
 }
@@ -740,7 +811,42 @@ struct DiscoverSearchPresentation: ViewModifier {
     }
 }
 
+#if os(iOS)
+/// List destinations follow the app appearance, independently of the home hero's artwork.
+private struct DiscoverListAppearance: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+    let poster: URL?
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                WithPerceptionTracking {
+                    if colorScheme == .dark { DiscoverCanvas(poster: poster) }
+                    else { Color(uiColor: .systemBackground).ignoresSafeArea() }
+                }
+            }
+            .foregroundStyle(.primary)
+            .toolbar(.visible, for: .navigationBar)
+            .toolbarBackground(colorScheme == .dark ? Color(white: 0.04) : Color(uiColor: .systemBackground), for: .navigationBar)
+            // iOS 16 only applies toolbarColorScheme while the backing is visible.
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(colorScheme, for: .navigationBar)
+            .navigationBarTitleDisplayMode(.inline)
+            .tint(colorScheme == .dark ? .white : .primary)
+    }
+}
+#endif
+
 extension View {
+    @ViewBuilder func discoverListAppearance(poster: URL?) -> some View {
+        #if os(iOS)
+        modifier(DiscoverListAppearance(poster: poster))
+        #else
+        background { WithPerceptionTracking { DiscoverCanvas(poster: poster) } }
+            .foregroundStyle(.white).preferredColorScheme(.dark)
+        #endif
+    }
+
     /// Artwork that runs under the bars. On the Mac it is laid out beside the sidebar: the split view's detail reports
     /// the sidebar's width as a leading inset, so ignoring every edge stretched the art under the sidebar. On macOS 26
     /// a mirrored, blurred copy fills the space under the floating sidebar instead, so the page has no hard edge there.

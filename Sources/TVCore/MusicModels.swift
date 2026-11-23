@@ -204,12 +204,19 @@ public struct MusicCandidate: Identifiable, Hashable, Codable, Sendable {
     public var platform: MusicPlatform
     public var songID: String
     public var provider: MusicProviderID
-    public init(platform: MusicPlatform, songID: String, provider: MusicProviderID) {
+    /// Imported sources keep their identity through caching, manual selection and recovery.
+    /// Optional so older saved candidates still decode as the aggregate provider.
+    public var sourceID: String?
+    public var sourceName: String?
+    public init(platform: MusicPlatform, songID: String, provider: MusicProviderID, sourceID: String? = nil, sourceName: String? = nil) {
         self.platform = platform; self.songID = songID; self.provider = provider
+        self.sourceID = sourceID; self.sourceName = sourceName
     }
-    public var id: String { provider.rawValue + "|" + platform.rawValue + "|" + songID }
+    public var id: String { provider.rawValue + "|" + platform.rawValue + "|" + songID + (sourceID.map { "|" + $0 } ?? "") }
     /// "VKeys · QQ Music".
-    public var name: String { provider.name + " · " + platform.name }
+    public var name: String { (sourceName ?? provider.name) + " · " + platform.name }
+    public static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    public func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// A temporary address from a provider. Its URL and headers stay in resolution and playback: they
@@ -357,6 +364,17 @@ public enum MusicProviderError: LocalizedError, Hashable, Sendable {
         case .rateLimited, .upstreamRisk, .authRequired, .timeout, .invalidResponse: true
         case .noMatch, .noResource, .preview, .differentRecording, .unsupportedFormat, .notLossless, .network, .cancelled: false
         }
+    }
+
+    /// Preserve a script's actionable failure without retaining its raw message, which can
+    /// contain signed URLs or credentials. Unclassified misses remain song-specific.
+    static func sourceFailure(_ message: String) -> MusicProviderError {
+        let text = message.lowercased()
+        if ["风控", "風控", "account blocked", "risk control"].contains(where: text.contains) { return .upstreamRisk }
+        if ["限流", "频繁", "頻繁", "rate limit", "too many requests"].contains(where: text.contains) { return .rateLimited(until: nil) }
+        if ["timeout", "timed out", "interrupted", "超时", "逾時"].contains(where: text.contains) { return .timeout }
+        if ["unauthorized", "invalid key", "无效密钥", "卡密无效", "需要认证"].contains(where: text.contains) { return .authRequired }
+        return .noResource
     }
 
     /// Maps a transport error; offline and cancelled never blame the channel.

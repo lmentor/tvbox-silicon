@@ -45,6 +45,7 @@ public struct NativeDanmakuCatalogSource: Identifiable, Sendable {
 public struct NativeDanmakuCatalogEpisode: Identifiable, Sendable {
     public let id: String, title: String
     public let url: String?
+    public init(id: String, title: String, url: String? = nil) { self.id = id; self.title = title; self.url = url }
 }
 public struct NativeDanmakuCatalogResult: Identifiable, Sendable {
     public let id: String, title: String
@@ -52,6 +53,17 @@ public struct NativeDanmakuCatalogResult: Identifiable, Sendable {
     public var episodes: [NativeDanmakuCatalogEpisode]
     public let animeID: String?
     public let raw: JSONValue
+    public init(id: String, title: String, source: NativeDanmakuCatalogSource,
+                episodes: [NativeDanmakuCatalogEpisode], animeID: String?, raw: JSONValue) {
+        self.id = id; self.title = title; self.source = source; self.episodes = episodes; self.animeID = animeID; self.raw = raw
+    }
+    /// Decorated catalog labels carry provider/year metadata after the real title.
+    /// History fallback searches the same identity used for the successful match.
+    public var matchingTitle: String {
+        if let title = raw.object?["SearchName"]?.string, !title.isEmpty { return title }
+        if let edition = decoratedEdition { return edition.edition.title }
+        return title
+    }
     private struct Edition: Equatable {
         let title: String, year: String, category: String
     }

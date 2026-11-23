@@ -2,19 +2,19 @@
   "format": 1,
   "project": "Yingxia-iOS",
   "version": "1.8.13",
-  "build": "01",
-  "snapshot_date": "2026-11-17",
-  "based_on_ipa_sha256": "02301ea6206b5c1038c804714e8621f7df50220f66faa4cebd48a0058c37ef6c",
+  "build": "06",
+  "snapshot_date": "2026-11-23",
+  "based_on_ipa_sha256": "7c1ef22ea94d233516ae042720811ce567e7b73c9739c40298247b23309c55ce",
   "scope": "iOS source publication snapshot; dependency archives prepared separately",
-  "file_count_excluding_manifest": 1467,
+  "file_count_excluding_manifest": 1532,
   "files": {
     ".gitattributes": {
-      "sha256": "efc322ecd6175a629cc6d7077b5c78c220ba60c2d4b57cc36865224a43a1af48",
-      "bytes": 225
+      "sha256": "c5eaa8301ceb2b442eb13acac3cdb377d31b32a8cfc0967c747ccb80374da0ab",
+      "bytes": 365
     },
     ".gitignore": {
-      "sha256": "70f97b4db219f1792f3213ae58ad922b081731e18ab7837d31c471fb10a42a41",
-      "bytes": 389
+      "sha256": "987e328cd8be0319ea5a0265d5730db58c4b8c62b51ec9b464e8b7387d1f0b75",
+      "bytes": 1350
     },
     "App/Announcements.swift": {
       "sha256": "853e10df61f2927e0a93c21890f04bade072430ee478d35770b1d36bfa79d6eb",
@@ -2405,8 +2405,8 @@
       "bytes": 8137
     },
     "App/CatalogDanmakuView.swift": {
-      "sha256": "5fae68508e97bbdc1cb60cd5b35b590b023154544233eadcb1ed9d02c188548b",
-      "bytes": 22283
+      "sha256": "c3ca0fb9140a0a01583b7217e4cd515272d01f1787e56656f1ab22b2f9f4547f",
+      "bytes": 22393
     },
     "App/CatalogDetailSections.swift": {
       "sha256": "6c17ccb4ee775be6a37e5543a2fb21f2b9b1a77b17003e79638d9c99379d8331",
@@ -2433,8 +2433,8 @@
       "bytes": 17386
     },
     "App/CompactPlayerPanels.swift": {
-      "sha256": "81ad60f495cd6c0c86030f43a72431f039054e5fb087fca9700a711712ea5de7",
-      "bytes": 23238
+      "sha256": "e2ca19abde5750acc64d449130958bdd2279ccbeb63e37a725aee46ba1ec3db0",
+      "bytes": 23700
     },
     "App/CompactPlayerQueuePanel.swift": {
       "sha256": "2bd9b94073a191f4a11970021f213969a943ec641a7c9961fd60f3d4281cb8b0",
@@ -2453,8 +2453,8 @@
       "bytes": 3598
     },
     "App/DanmakuView.swift": {
-      "sha256": "cdc16813f52789ecf36cdf1d6558e1b2d2f495df9e87bebd238599bf6d3d6340",
-      "bytes": 61611
+      "sha256": "d1c9ee8e84f28be80408a069e40788421d4098cb3b180f95afe89924bf6df608",
+      "bytes": 64869
     },
     "App/DetailAurora.swift": {
       "sha256": "bf1b40d2b2744558ec453fc132185e28c72634fef0ecae9c3d9ae1b5eff6eeb3",
@@ -2465,24 +2465,24 @@
       "bytes": 4223
     },
     "App/DiscoverArtwork.swift": {
-      "sha256": "eed900cc8d2071b508ef4383019720af131f131e184317e589c7dea547fa5cb5",
-      "bytes": 10752
+      "sha256": "4d3d3de469612812eadcd68e2cfd18913d768c7653c8a07a8064b01cf63ca6cd",
+      "bytes": 13282
     },
     "App/DiscoverBrowseView.swift": {
-      "sha256": "5a0c570ca1cacbb52840804e1bfcb41778ae95ef517179706723621fd6b310fa",
-      "bytes": 14014
+      "sha256": "5d14ac07b6a9ad235a1dd8ccceb282e83e28102500f9b8f6eb5a74e3e6271e8b",
+      "bytes": 14136
     },
     "App/DiscoverCalendarView.swift": {
-      "sha256": "43207536fee4dee0e7224f5b4e93df776390da376a2814f8e9d1018db2ddb189",
-      "bytes": 27337
+      "sha256": "f8cdaa48ff2d9f6957b54d7bb072464afb5af4f98ee5f717499b61647707956c",
+      "bytes": 27817
     },
     "App/DiscoverDetailPanels.swift": {
       "sha256": "391314b0e972b220a29c6887b551aabf709da4baa3a731f603516285a62eb5cf",
       "bytes": 14912
     },
     "App/DiscoverDetailView.swift": {
-      "sha256": "336a55757f2b3a89d07850f02f0010341e61fe3da8767206e1c35ecd1a7c9d3b",
-      "bytes": 61394
+      "sha256": "1c8c389da0d62916d94b1adfc9815bdf837df29275cf82f703926b0b8e939d7a",
+      "bytes": 65653
     },
     "App/DiscoverHomeSearchView.swift": {
       "sha256": "a5e1f2789ba8d273c587a33d099f737379ed144cc483e59de876458c0c488b29",
@@ -2509,12 +2509,12 @@
       "bytes": 11545
     },
     "App/DiscoverView.swift": {
-      "sha256": "75e07749161586f8e73b7b94f758f8dc5c2b0bd60d011e07209c6bdf747afa21",
-      "bytes": 114118
+      "sha256": "88ed9fadcab5605abd127d6ad393772be238367ff73f6a917f76c280f8997792",
+      "bytes": 115073
     },
     "App/DiscoveryView.swift": {
-      "sha256": "687e974499e480f7b39ce367aaf3925b196d08410c97b24667a9c1372317b421",
-      "bytes": 111923
+      "sha256": "ed002115df5f08d1ecae32aa11fd19f3b527d032b9348a7394226eca8bdafb40",
+      "bytes": 114473
     },
     "App/DouyinAccountView.swift": {
       "sha256": "53156daef18ded595b828af743ad3e174209b559fe674b541608e13bc397d716",
@@ -2545,40 +2545,80 @@
       "bytes": 45132
     },
     "App/GlassKit.swift": {
-      "sha256": "01884567705e69ae6f263776dc138d6467c77fae52ef3f4169eea94b344f08f5",
-      "bytes": 77779
+      "sha256": "56c18508f31d3303609e2d666963f12806ce5922e6f3541793bcbe141bbc954b",
+      "bytes": 79029
     },
     "App/HLSProxy.swift": {
       "sha256": "8546b60a366b029eb51d550fc57a2b4d8028ef682c5f0703a0466ff58291f226",
       "bytes": 9232
     },
     "App/HistoryCardGestures.swift": {
-      "sha256": "1fc2ba41ecf390599dbfd4c3691658e8fa1674ddb66efbeba75c65d67a1c1da3",
-      "bytes": 5804
+      "sha256": "528feaf86d74e684d40400107fc5ffbee7392229b888542430155abe34f0157a",
+      "bytes": 6577
+    },
+    "App/HistoryPlaybackPreparation.swift": {
+      "sha256": "80d1a17da7b1250ddc5508242eba89e9d49682a2d6590b8da2e2ba97c91be702",
+      "bytes": 1137
+    },
+    "App/HistoryPlaybackPreparationView.swift": {
+      "sha256": "5a82ee680bba20e4a81b5bf62e029115e23757c4f3c351eb552aa06bc0e935f8",
+      "bytes": 3436
     },
     "App/HomeView.swift": {
-      "sha256": "9eb5ad999baa436cace2d61d703741215c54f5bdad8e343bb72544c460292d84",
-      "bytes": 31371
+      "sha256": "cbeba1e9336fdb4e44c8666087cd3833fc373835f5b5f43fc1718ac84ce7edb8",
+      "bytes": 29483
     },
     "App/IOSPlaybackSession.swift": {
-      "sha256": "bb5e0e1545ee29e0865ca87e138e5e200077cd98e94bfabbfd5708355c7f9386",
-      "bytes": 53136
+      "sha256": "f199acf5385688df7a447520b239a43b975de5cfc259c7f7fd93b41cf627eb33",
+      "bytes": 82363
     },
     "App/IOSRemoteSkip.swift": {
-      "sha256": "c862d2f30ae9d211e9183333833b0916e72f78734205562edea609aa39518a58",
-      "bytes": 11083
+      "sha256": "0add2433914a97bd787e92135b748b700ca4376b3518297a9742dec53ee95c44",
+      "bytes": 10873
+    },
+    "App/IPTVBrowserView.swift": {
+      "sha256": "9d500997874607e55083a2ac98fc247766ebfc1a4f918e917dfef249122f8d0c",
+      "bytes": 20739
+    },
+    "App/IPTVGuideViews.swift": {
+      "sha256": "b4ecd59d9af92769f320975e02f47610315d9a3f49fff0e49ae7b535e32eaa7e",
+      "bytes": 11335
+    },
+    "App/IPTVPanelPosition.swift": {
+      "sha256": "8b25662078d79a1c9ae56dc707738d6341022821abd1873a48c740213b0fde40",
+      "bytes": 1829
+    },
+    "App/IPTVPlatformView.swift": {
+      "sha256": "35f4be13cb3323c4fcc2962f1127c031125d0f8e466da21bfa1dd45bf3523dd6",
+      "bytes": 6257
+    },
+    "App/IPTVPlayback.swift": {
+      "sha256": "fe342dd2fa0b89db14161825503dd268ee20e7cd9654f24fb7e32dda9e5b09a8",
+      "bytes": 4883
+    },
+    "App/IPTVPlayerPanels.swift": {
+      "sha256": "c8aedf8886bc3a3518fb059bc1cd1a33886b596259ba61dd2e8a8ad52584815b",
+      "bytes": 6614
+    },
+    "App/IPTVSettingsView.swift": {
+      "sha256": "21277051d7886a93262e25e13ca610227b43dd6a5bde2996786573fc20cb2cd0",
+      "bytes": 21800
     },
     "App/KSCompositedPictureInPicture.swift": {
-      "sha256": "bfd86353c19af558c2166d062489eb0d263bab38ae835f369257d042fad3b4b7",
-      "bytes": 10106
+      "sha256": "6c0a7350a889b262014b84e411562fd55541bd55d3b3a2cef77ac11e3ec80992",
+      "bytes": 20456
     },
     "App/KSPlaybackEngine.swift": {
-      "sha256": "aa4437dae640f1868426ceb6988a3a5844cd726e58a42b48dcf0dbcf8f958856",
-      "bytes": 47561
+      "sha256": "15918e824fbc13a2f823471dedf59be818c14d70f4210563e9012d23190aa9af",
+      "bytes": 58628
     },
     "App/KSPlaybackRecoveryOptions.swift": {
       "sha256": "5ab1f28abbc4b7e9d5f1395d44f2a62c16fcdd986199bc76fe10a7abdce7c36c",
       "bytes": 1105
+    },
+    "App/LivePlaybackWatchdog.swift": {
+      "sha256": "51f5087270fc867071695d624620e69b13bbf6e0b6106918cefe853b180d1006",
+      "bytes": 1903
     },
     "App/LiveRoomsView.swift": {
       "sha256": "b7db975ce029fbdf41a1a413630ed22cd2d06c0a9ef5c74b6279c2a47876c6e9",
@@ -2593,36 +2633,48 @@
       "bytes": 9051
     },
     "App/LocalAppearanceDataSettings.swift": {
-      "sha256": "03019072e6eb97e212c1d4ebf50442e0f0fd0aa64b31957e56583ca4a3980f58",
-      "bytes": 6937
+      "sha256": "466bea5d33cf5b3c2ad807c18b733daef75165b19fc556abebd3a3aadca5eb05",
+      "bytes": 7014
     },
     "App/LocalBackupCoordinator.swift": {
-      "sha256": "3e47b6bec53fea39fa5349d63827957f8e181c517ce7071a2c9feb335fa4c183",
-      "bytes": 12454
+      "sha256": "d552010969b194be6be7d1082891f30974f7d437de1c008c504f6ef474230394",
+      "bytes": 15553
     },
     "App/LocalCatalogDetailRules.swift": {
-      "sha256": "a56d5c0c3c6d14429eb30522fd4b6ecf26f44c2d046c92eb927a2b591b19db4c",
-      "bytes": 2742
+      "sha256": "db623ef29f31e18693ecd115448a9ae322b489aba0e2dfd952c118779d7ff5e8",
+      "bytes": 2752
+    },
+    "App/LocalCatalogEpisodePanel.swift": {
+      "sha256": "5d65a6f1d3aecfe14fdb1b84ddad0bd8b439fc3a1dcae35546b8ca375a283e82",
+      "bytes": 6334
+    },
+    "App/LocalCatalogEpisodeSnapshot.swift": {
+      "sha256": "e752a5cec7fd679640a860b64d5fe265c6faabdfc387d1b8c45c485f5f1b7107",
+      "bytes": 1812
     },
     "App/LocalCatalogEpisodes.swift": {
-      "sha256": "45ba2848db17cf6f1d995d7bc05c6421f87f8e2378d383c7684d56b0db3b12ee",
-      "bytes": 6787
+      "sha256": "d1caa52da19f83100ba519b435868e7b8cc7123e0f2aab3ea0594cb7ea7d5ab0",
+      "bytes": 6797
     },
     "App/LocalCatalogPresentation.swift": {
-      "sha256": "3658776bd3a07b325d0d19157ff62bceff125387d4602736d56990fe4ae3da29",
-      "bytes": 35170
+      "sha256": "3efdc06c1e673012e774fa48368b76ceddd0db872151b7e4e51347ac2cad6951",
+      "bytes": 36587
     },
     "App/LocalDanmakuAPISettings.swift": {
       "sha256": "532704818b4873bf1412389d90b36dd3f94adaa44f3fef1f37275534a5c9804c",
       "bytes": 2772
     },
     "App/LocalDanmakuCatalogPanel.swift": {
-      "sha256": "43addc0452fd424f4840e8347214814b6236f825b9f88c6a224a895bc0eb12f5",
-      "bytes": 12026
+      "sha256": "2f8e668cdf79ee262802bc005eed98081643a78adf3a9b439b1489b9cb729cbd",
+      "bytes": 12536
+    },
+    "App/LocalDetailNavigation.swift": {
+      "sha256": "09d675ff28341dd936ba872e29c28def1250e286d3cec6b3be08c42ece0bc33b",
+      "bytes": 3120
     },
     "App/LocalDockHitRegions.swift": {
-      "sha256": "2bf360353ea53c57b2b3f4a0293d9250908444c56349017f55822cbae81eb73f",
-      "bytes": 3470
+      "sha256": "02af0d85a5ee904de5a00bd0883351f81c52b803d6fb6e76dfd80d6280497fa2",
+      "bytes": 10404
     },
     "App/LocalDockScrollInsets.swift": {
       "sha256": "2ef5f41bcdceb497d966a5eb7876ab17d1604daab5a3d62e839655f1a91ff8d4",
@@ -2636,29 +2688,25 @@
       "sha256": "e28003c5d855f429ae508d2e5321b1a038161d19e7dd244b615bf60f7571036d",
       "bytes": 12852
     },
-    "App/LocalDocumentPicker.swift": {
-      "sha256": "f15d18a7f4239107a445f659ad9a4a1c081bc9d4efa5a37f7799bcb49aca622d",
-      "bytes": 2397
-    },
     "App/LocalDocumentSelection.swift": {
-      "sha256": "95309a2a62973212d78fa7a1600dcb634fb804a75826c51fdd1c5def8eb1e87b",
-      "bytes": 16145
+      "sha256": "21718bebd750af1fac36986275e78f1a56faeccc80a9e1fdc211746f6612ee3b",
+      "bytes": 16206
     },
     "App/LocalGlassControls.swift": {
       "sha256": "73ce7936ffc8c1300e0e5c00dab9e06a1a03999ceb91aa8dc37368b60efa19a6",
       "bytes": 6971
     },
     "App/LocalGlassPresentation.swift": {
-      "sha256": "32fa8805ddf1e43080786d59c525f967613ec6da8d674f812fd866755dfd639f",
-      "bytes": 17810
+      "sha256": "6fd381e584706ed5511853fb7413018a373bafb36a834c9ae279ac40254d5c2d",
+      "bytes": 20093
     },
     "App/LocalHTMLHomeActions.swift": {
-      "sha256": "ed70d60667bec2045a6740f64498100f151622b52f3465a2c80df2852ee2ea9e",
-      "bytes": 26610
+      "sha256": "3adbb155b6f6141a7c2c46f293da07066089c061aacf1c904100f47a962ad968",
+      "bytes": 27411
     },
     "App/LocalHTMLHomeBridge.swift": {
-      "sha256": "7c4d0aa5c2b23e2cee9f6ea0d8f83eac69b2dfa87f5ca9c73a74e9c168f04888",
-      "bytes": 40388
+      "sha256": "80a1eeebe012cb416d9d8a669e2715dc31925a212288760f9e5f7bd5c0a3d92e",
+      "bytes": 41439
     },
     "App/LocalHTMLHomeBrowser.swift": {
       "sha256": "e141695cf6ee1afa70fabea5682d73fff410c9568eaf2fd9510e900a328a30b7",
@@ -2669,20 +2717,36 @@
       "bytes": 6644
     },
     "App/LocalHTMLHomeNetwork.swift": {
-      "sha256": "753183116b659535905a1add77e00f0bb7aac85c38fc47d54304f03b4070dd62",
-      "bytes": 8872
+      "sha256": "36a3ec24f29705aeb698ed2096539da12870b9abb63cb978401af795bdb6ba9d",
+      "bytes": 11106
     },
     "App/LocalHTMLHomeView.swift": {
-      "sha256": "3f5df71f90272425433bdac5b50e6c8a6d0c305b98f91dc98e0b0b997aa2121e",
-      "bytes": 22361
+      "sha256": "f3b6bed1bc2e24a5ce81dbd54b7246d63b75f99e5ed731861f868a61f9682f0e",
+      "bytes": 23204
+    },
+    "App/LocalHomeAction.swift": {
+      "sha256": "892afc9d2a02d024e9cd3f2229b54a9e3cc6acf4d96ba7bd2ca6b94d1a3779b8",
+      "bytes": 2824
+    },
+    "App/LocalHomeActionSettings.swift": {
+      "sha256": "cce230dd54e1eddfa2e2504798734d7d2d9787cccaa9cce1eb8cb16b6781b3e7",
+      "bytes": 7605
     },
     "App/LocalHomeSourcePanel.swift": {
-      "sha256": "d88868c3d174c661d0faf1ca20436443d9ee03a76f11fa87ca3684bee5778758",
-      "bytes": 10979
+      "sha256": "472afd019ed412a7d0b4289e13a663306363a2d86b90565507594bb1278c60d5",
+      "bytes": 12510
     },
     "App/LocalHomeSourceSelection.swift": {
       "sha256": "c9a825736fde13bd4b9de17af8ff92937436c5d9978959fa9ba56782137987d5",
       "bytes": 2063
+    },
+    "App/LocalMangaSettingsView.swift": {
+      "sha256": "9be35f6d884448cb2f921be797cf088c6f984606b69bc633824d3e210b32137c",
+      "bytes": 5651
+    },
+    "App/LocalMangaSourceList.swift": {
+      "sha256": "02943bca6a722b71aed9377beec8527b27ec3b0e2aba68daeba374f7c42f645d",
+      "bytes": 5827
     },
     "App/LocalMediaBadgeSettingsView.swift": {
       "sha256": "21d7682b1bb41269aae370ced7e0a74f3941d07f190134b67d3fd431fa4ed392",
@@ -2693,28 +2757,36 @@
       "bytes": 3979
     },
     "App/LocalMediaEnhancements.swift": {
-      "sha256": "0db3efef90f13f282835e3f573e1bb09a55dbe36060bfb6c4cdebdafef0c74bf",
-      "bytes": 33913
+      "sha256": "7f2694838dbff0b9a1ddbbd918ebb99837fd366679f171a9e7072fa64131d729",
+      "bytes": 43852
     },
     "App/LocalMediaServiceSettings.swift": {
       "sha256": "ef181bdd61e6701b5e58f22c1cb78ae761aec33d1253bddfb46b27de22a50c2f",
       "bytes": 3326
     },
     "App/LocalNavigation.swift": {
-      "sha256": "fbd52c018687161ec20e83cff8c4c8800ee50badd80d48e7184e14c46ec28dbf",
-      "bytes": 23132
+      "sha256": "c4c30daebbd5de2550638fd78bf6daf9e5b2493edc77799aaba7660d3c4d2d2c",
+      "bytes": 28565
     },
     "App/LocalOnlineSubtitlePanel.swift": {
       "sha256": "d7730cd9ae7f90dc4655138eb3e725f5d136fbe20acb34f4b29176ebc2da66d9",
       "bytes": 15873
     },
     "App/LocalPlaybackSettings.swift": {
-      "sha256": "06669a83e2022234eee1a0730c54c5a354a05e68e6b8d59ff44460f7633b6f92",
-      "bytes": 3827
+      "sha256": "0273a36a7670c0edab120340d785367a748fc5e313de5669a7cb9f9386bf655e",
+      "bytes": 4652
     },
     "App/LocalPushView.swift": {
       "sha256": "1c4d1f6cd9c739168e64f534c8892ba4b2073100a1718230d6672841ef93a40f",
       "bytes": 14093
+    },
+    "App/LocalQuickSearchModel.swift": {
+      "sha256": "d4117ec2527540aec3844bb0542a2bc36650f2609d1a8cdf982b01bca20114d1",
+      "bytes": 16261
+    },
+    "App/LocalQuickSearchView.swift": {
+      "sha256": "b4a82dc4029749219caad481ee1cb666cc382bb81c64be3bbfc555d02ba32979",
+      "bytes": 30180
     },
     "App/LocalReadingImages.swift": {
       "sha256": "2304e1a12adde08eabc877ffd1210e05c80834731b086defa4d947cddb4035e5",
@@ -2729,56 +2801,72 @@
       "bytes": 5956
     },
     "App/LocalSearchSettingsView.swift": {
-      "sha256": "b3c8d5a1cdec09b1b1cdada65be235339b9955be13d90232e1aaa1317e320f2a",
-      "bytes": 7130
+      "sha256": "c55138db48f47c832be2893a579689965f750a528e32a6f33348b9c427586877",
+      "bytes": 9016
     },
     "App/LocalSettingsReorderRow.swift": {
       "sha256": "286b6d3b59c2a2a4bdd69c50b30237bfa66755807cd13c8cba612b011322b9bd",
       "bytes": 7279
     },
     "App/LocalSettingsView.swift": {
-      "sha256": "096b0004dee80142c440d7cc09c4794dd47c6d36436d7a0c6cd2a967373e140e",
-      "bytes": 5568
+      "sha256": "2f7d01c1c838dfcf15e4c1e584d3dd65c5634adad772c1ac749929d0e338f5a1",
+      "bytes": 6665
+    },
+    "App/LocalSourceActions.swift": {
+      "sha256": "30f9416ed05a59036516c66f54df444291d6e254e792ffb9b5ffb855f6ccd63b",
+      "bytes": 3909
     },
     "App/LocalSourceOwnership.swift": {
-      "sha256": "03f7134278557e2607f8906da52587b98500cb7dce66385875990b7e048f1ff9",
-      "bytes": 817
+      "sha256": "f4c5fc3cdcacfbbc5273f10859a24e19e98727f34158d4b023dc9998405b6fda",
+      "bytes": 1919
+    },
+    "App/LocalSourcePanelLayout.swift": {
+      "sha256": "725a1fddd77f6afdba75ccd789499fd2a86752643f1d995080a7c99689fda4df",
+      "bytes": 1054
     },
     "App/LocalSourcePanelScrollPosition.swift": {
       "sha256": "1ee4ed3ed5ca38d9790191d5d7b3a4a3d70f6108e95c246e175d504f35d3923f",
       "bytes": 6941
     },
     "App/LocalSourceSettingsView.swift": {
-      "sha256": "36bc4e2da5c84e1c8aa0f91785e20d1fe216a9a83daa7b66d963ae18c80db282",
-      "bytes": 15245
+      "sha256": "ea8c8e01c0b7bc087bc060c9e7928c88201ae6f399123a572e56b743568b99ee",
+      "bytes": 16266
+    },
+    "App/LocalTouchSurface.swift": {
+      "sha256": "50899a0b234176b3afd60942120133deeb6ba69fe115780fe2a32415c2037f25",
+      "bytes": 9311
     },
     "App/MacUpdater.swift": {
       "sha256": "eb8542d1c3ee845ed207f2b3cebb4c8b39f0d3aad3760ccedd61c041ee5118a5",
       "bytes": 15144
     },
     "App/MangaDetailView.swift": {
-      "sha256": "a9d09426605d08eab7067557bff4dfc8d04dfae341003e149a70905b5ce0288b",
-      "bytes": 20154
+      "sha256": "76c79dce29e390a3ec111156b7dee7f9690f7b833a567851fe9bfc7cce3f39c7",
+      "bytes": 20166
     },
     "App/MangaReaderView.swift": {
-      "sha256": "c809fe8d3462b7f0fd8d3589623aa268ba39b3af52945f7a36e7af77f7c04ba2",
-      "bytes": 72261
+      "sha256": "576cece01c4aea3695023ea3caea62b54677a2800e86bf0fcca27527a6ab1c3c",
+      "bytes": 85127
     },
     "App/MangaSourcesView.swift": {
-      "sha256": "9eb77af6cf4dea08ae08f69f03bde53f43fa055da3ad1760586a4e08a43c7224",
-      "bytes": 29329
+      "sha256": "c901548b5730360b407dec256d4a5566f1cd5146a2a494caa6fe60dc3a3da88a",
+      "bytes": 33143
     },
     "App/MangaStore.swift": {
-      "sha256": "f8ca97056717d9726f0d27d30f51dd0e4b7db5cf2fe4676a5b611c6923e9ec60",
-      "bytes": 23997
+      "sha256": "27c85ffdd01f28f20917c46b217cab2baaeca3bb4618e1452a520fbf6e799c18",
+      "bytes": 30079
     },
     "App/MangaView.swift": {
-      "sha256": "4ba99c7a1933684b343b6f15b87bf3c071424160a488d97dd22e71567fc8de1f",
-      "bytes": 34517
+      "sha256": "deea8b11ac4af552e48c5244a6af01b46033efb99f03d8aa98636a909bf83f50",
+      "bytes": 53387
+    },
+    "App/MangaWebLoginView.swift": {
+      "sha256": "250c2447144ffe96879f714cf885d6a473a05f3af7f91f30fcc83db733097ba5",
+      "bytes": 8960
     },
     "App/MobilePlayer.swift": {
-      "sha256": "d3ae7cf72d5993480f858e55adfd5a9db5090dad7a8af9b5e1e99aba2aec548a",
-      "bytes": 126222
+      "sha256": "7602f3c8153425ea57377adaea1fa48342ad2dab8931fefe72bb49ee7e28d546",
+      "bytes": 141578
     },
     "App/MoreView.swift": {
       "sha256": "350f83abedccd25793c2fa895ada0907fddd5a9fd2759bc7d6c3a908997f0356",
@@ -2789,8 +2877,8 @@
       "bytes": 26918
     },
     "App/MusicMacBrowse.swift": {
-      "sha256": "9fbadd1441ff67b569c96b63763678c4793734d71086f8d75c2eb97ad449e55a",
-      "bytes": 24974
+      "sha256": "0010157e09a1835d54a28f88c228566565eb82bd7afb4339b1c8875558cc7d51",
+      "bytes": 24861
     },
     "App/MusicMacMiniPlayer.swift": {
       "sha256": "2ff1b0d4ff6b968f99e15aaea1ad8b0c442a3e0de5b9f977ecbbfbe50f66acc5",
@@ -2801,28 +2889,44 @@
       "bytes": 25742
     },
     "App/MusicMiniPlayer.swift": {
-      "sha256": "fd34c53c552bb27918481cd14ed35564b74cbf83270535d550bc20967e9d2ec6",
-      "bytes": 6568
+      "sha256": "9e8076c68e0d092e781a94d4ab8a9879fda66007e65b1803e138a71159a9a22d",
+      "bytes": 8145
+    },
+    "App/MusicMiniPlayerLayout.swift": {
+      "sha256": "0ceeb05433ae81a6bfbc4aad074236e41f40de1bc4ee05201ddbcd62521acdca",
+      "bytes": 2894
+    },
+    "App/MusicMiniPlayerTouchSurface.swift": {
+      "sha256": "e7f55ff52daccb51186679cac9443816fcd15d3ee518d4615a5fb7471b7b4196",
+      "bytes": 5840
+    },
+    "App/MusicNowPlayingArtwork.swift": {
+      "sha256": "185d50eed2a1a4c8dc73205eadae2a8b344eecfdf7927216c1fd9892341bf03b",
+      "bytes": 9632
     },
     "App/MusicNowPlayingPanels.swift": {
       "sha256": "e825ce5d8195d684588ea662b772c5c941abc5ed1a326ab4cafded0e7cd6e198",
       "bytes": 10972
     },
     "App/MusicNowPlayingScreen.swift": {
-      "sha256": "7bd9e6e041894be27d08d82bccb3b69f486ee7477639e60c22929987e6babd22",
-      "bytes": 19207
+      "sha256": "923042a04c27957d8f4a8fe605adf9554a323bb9bb4c8ff1153d8acadbbc52ce",
+      "bytes": 21327
+    },
+    "App/MusicPlaybackBackgroundTask.swift": {
+      "sha256": "1c9e36b25c6862dce3981a858a041499a1e3b09c29ab16a9871b80c6dd4d2cf7",
+      "bytes": 1586
     },
     "App/MusicPlaybackSession.swift": {
-      "sha256": "7e3b7c9ad0e0baafa44cca4f63bce98d1673aa7db8243cdc7be6559a53235ab6",
-      "bytes": 49056
+      "sha256": "aaad678083c1092bf1c822dc2f0001d334ba0c81e003cc9782065c90fce6e018",
+      "bytes": 60489
     },
     "App/MusicPlayerViews.swift": {
       "sha256": "511da6a769edd1547756203b4ccac09cb390154efc8c092aaff18d7ef46236be",
       "bytes": 57840
     },
     "App/MusicRemoteControl.swift": {
-      "sha256": "8890afca521372ca804cfe2d770a19ac04b3957016b3252c0413b0843350f9b9",
-      "bytes": 6292
+      "sha256": "61d07b5f462c0dd6fe2afcd4799daf4aa521623e53493366c3abbb873d906cbd",
+      "bytes": 7373
     },
     "App/MusicTVPlayer.swift": {
       "sha256": "33b66eb2e48adca91e643f5af0034ab2f86ef9f45dcc1df0106d6d974b07982d",
@@ -2833,24 +2937,24 @@
       "bytes": 11380
     },
     "App/MusicView.swift": {
-      "sha256": "2c493efd05d9cd6ce2389141d70dbf628c74ed58468429def88509b786d16570",
-      "bytes": 39525
+      "sha256": "e6bd2e6174bedc3405fcf9ded15d802f2b4ae465c18a4c2f5146a6eb87a7dd2c",
+      "bytes": 40551
     },
     "App/MusicVinylArtwork.swift": {
-      "sha256": "b9b831f2202caafb07f671ce2fea841bda8b4d9dec9ca819a94a5858b2244d64",
-      "bytes": 3354
+      "sha256": "077bf77f1587e3752f1844ec00c2e94271b5b31adf5dc1e025273af78fc5f1d7",
+      "bytes": 3833
     },
     "App/NativeAISubtitles.swift": {
       "sha256": "112898d94789b074d73d2eb5d34ee5c53ab90eff3219d47c412bb2e54d1c4436",
       "bytes": 15075
     },
     "App/NativeBASRenderer.swift": {
-      "sha256": "8a1ab318799601a4e88a59e2b25a1ca31f4a31ab19e22d9adc766e5b57a28e8f",
-      "bytes": 7024
+      "sha256": "55b113ca269317f499b751251586ffd1be9e7b1046ee2afbaab6bdd511ba22cc",
+      "bytes": 7112
     },
     "App/NativeDanmakuSurface.swift": {
-      "sha256": "86dca00352ddff7871f379a80664b9639c32a96d51b1fca5ddfe8e36b7592f72",
-      "bytes": 16513
+      "sha256": "23055eabbb25cbc579778de7c0f9ed0df2470fafd975a326350ec28d52f47545",
+      "bytes": 17126
     },
     "App/NativeFancyDanmakuCatalog.swift": {
       "sha256": "b6a83ebcfe4f924cbac96fd76ed7ce25a54d5a32b994e987e9d0b4bee6f57aa3",
@@ -2901,8 +3005,8 @@
       "bytes": 15228
     },
     "App/PlaybackFailureDiagnostics.swift": {
-      "sha256": "932118294c82adf6a173e98f58cdc7fce1e98449c83300c88391233165926658",
-      "bytes": 1013
+      "sha256": "24ab063e50726f5be3b3994f7719ce6f1484db66c285df917d0782ce8e10d1e3",
+      "bytes": 1157
     },
     "App/PlaybackHistoryArtwork.swift": {
       "sha256": "78637dfbaa205811f1fc278b37e21b4e212c011884399ffac98a0eaebd3b4870",
@@ -2913,12 +3017,16 @@
       "bytes": 1236
     },
     "App/PlaybackHistoryView.swift": {
-      "sha256": "6659877e9bc527a96932a1af348fad3474c0db636c3d3471a776e98fb91a2d85",
-      "bytes": 14777
+      "sha256": "699589d24702d918db86187ba98bca6eb1a6c190913788f1675ec1863f169ec6",
+      "bytes": 22495
     },
     "App/PlaybackPiPTransition.swift": {
       "sha256": "7871fd02706bcd46a7f4b68f46a53c4d34f98ab5dc620f95dc6c48f1d24c5ea8",
       "bytes": 2051
+    },
+    "App/PlaybackSleepFade.swift": {
+      "sha256": "cda7a0a2baedcffcbdc5964503fc6c327c4f6b194ffbead1714431206596c0a5",
+      "bytes": 1832
     },
     "App/PlaybackView.swift": {
       "sha256": "19c03e98e44eccf9b6e940204393e189a4a4df69174c65d069691720bb8bac5a",
@@ -2928,9 +3036,17 @@
       "sha256": "42bc5ad130938984fc2d1b48e1d71d3a5d0de040beb3bb49f0186ec0f63cea62",
       "bytes": 17716
     },
+    "App/PlayerAudioInterruption.swift": {
+      "sha256": "9aa19863f4bdbcec04c5263e615e2b497a63956ed6ba3d1ff4e6204d4aac26e1",
+      "bytes": 1614
+    },
     "App/PlayerBadgeRules.swift": {
       "sha256": "a8860cb9b95c1f0cd95269e8316e28e916869c79620ee7e9b8290a9666900285",
       "bytes": 5788
+    },
+    "App/PlayerBatteryIndicator.swift": {
+      "sha256": "4bb4d421f820311cf5bec6478fa980c80cf73428660ee838f904584b556ddabe",
+      "bytes": 2573
     },
     "App/PlayerEpisodes.swift": {
       "sha256": "100d2598e6696d781092595db58c623bd6fdb6cebfaa1c9934f9a0e39dfd8441",
@@ -2948,6 +3064,10 @@
       "sha256": "3b1f426d9286dd530369a735f16a8be92e629b3171fd084b6a87b2037004fc7e",
       "bytes": 991
     },
+    "App/PlayerPopupKeyboard.swift": {
+      "sha256": "842ca96f161e944979054cb75966b36547c0924c8010f9fe315900f0b9cd543b",
+      "bytes": 2735
+    },
     "App/PlayerPopupLayout.swift": {
       "sha256": "47257e5b803bb399d03026ea5bf285fbf5d1f5f8d2c8023d1a633e8147c78fa6",
       "bytes": 717
@@ -2961,24 +3081,24 @@
       "bytes": 1301
     },
     "App/PlayerView.swift": {
-      "sha256": "d72bb806f42f75ad42461550c0e00591cd5a29a21ac57f775d0dba0bc587d0c3",
-      "bytes": 93055
+      "sha256": "5a09af1aa5bdff883c5040b8f55b2879983c80ca7a7015df9afc73ee258a5c01",
+      "bytes": 94688
     },
     "App/PluginSignInView.swift": {
       "sha256": "8a0b075e8c968378d16db69fb2e12548b8443ab29da94996784ae3602a9586b6",
       "bytes": 7216
     },
     "App/PosterArtworkCache.swift": {
-      "sha256": "e393466f423c5720f12f1126575e7a835b5cc25e06a74b0d4ff3b1e8c05e1455",
-      "bytes": 7373
+      "sha256": "d75e91c36ecb0d6703d6e900ee8724f9b8fab1c08b442315362f30dc68ea3a33",
+      "bytes": 10670
     },
     "App/ReaderBitmapCache.swift": {
       "sha256": "bc4818719351c66d8b817497def3772c850d2c2f370d2dc32fdf862b06e311c3",
       "bytes": 5436
     },
     "App/ReaderPageState.swift": {
-      "sha256": "03c5363b3eadd916825e7056e3b732aaef92fe23197ee2848e793bb2b95d8a35",
-      "bytes": 4711
+      "sha256": "40b50c2f56942a5ae429d026a914c41a7b7c4462ac5ce1663aad16dfe2e26484",
+      "bytes": 7527
     },
     "App/Resources/NativeASR-Licenses.txt": {
       "sha256": "869419f81412ee72a6b2d2af74a4e3856c7d08a5499c1ee5a7bfee6b8d8e368a",
@@ -3072,9 +3192,13 @@
       "sha256": "5ffe248502a4107a61f7cebbff666a6db1523e52a214606a91080333840a030f",
       "bytes": 12206
     },
+    "App/Resources/local-html-home-responsive.js": {
+      "sha256": "ef5c34dc66f7d28ed8f31a450502b13dfb57f96374e783bf74bcaea3fd90d828",
+      "bytes": 1626
+    },
     "App/Resources/local-html-home-sdk.js": {
-      "sha256": "defff1d5f0d2b5b813948504de3730fe8ca46a2bf3987787f24302042f334ea4",
-      "bytes": 14290
+      "sha256": "267da76147ec99e05f7da68f336b575294407e26215f48b9edc311f687ff6210",
+      "bytes": 14806
     },
     "App/Resources/maccat-media-badges.json": {
       "sha256": "53ef2045668c1d8ec68522523455a758fac02344c2c6b8b97f178c9492d6463a",
@@ -3089,24 +3213,40 @@
       "bytes": 296
     },
     "App/RootView.swift": {
-      "sha256": "33fdcbf3e746d378bbf7a856e82dae88c5e9c9764fcdfceddb4365731fd898a9",
-      "bytes": 35320
+      "sha256": "a12b052c343ec1a35c1380b047919f569b665f06cc061b82416d8d4e4c7d19c8",
+      "bytes": 37106
     },
     "App/RuntimeView.swift": {
       "sha256": "8d2683b47605cdc0557e344b8d2576cf2efca1fcdf619757fc226ad50cd9df39",
       "bytes": 3426
     },
+    "App/SearchPosterViewport.swift": {
+      "sha256": "a51e89f4d0e93c08a02fcfd91cd1907a31d737c83c805d684009e4f56e6b3263",
+      "bytes": 5115
+    },
     "App/SettingsView.swift": {
       "sha256": "03bc009a380db72be48b3454b0e42d8664203ce5ebf917083f6c97b2deea23eb",
       "bytes": 119309
     },
+    "App/ShortDramaEpisodeSwitch.swift": {
+      "sha256": "d00939c0ab80be5d29fb39858df8cf248a78af496718d81eb6012dad234c526a",
+      "bytes": 7651
+    },
     "App/SitesView.swift": {
-      "sha256": "b9b200d29e854e8d896cb3f74c64a26ce2684e6dd1acd1b081e9418182c0a05c",
-      "bytes": 190730
+      "sha256": "45372e7dd0bcc63fa0a29e3429614f7c86d4fdb65df70f2a7d12356e01e66cad",
+      "bytes": 189767
+    },
+    "App/SleepTimer.swift": {
+      "sha256": "a23dbf6e1c42d333cf5f2c1837e0dd9b729abce18314f1f35c0045af9de2ed22",
+      "bytes": 3034
+    },
+    "App/SleepTimerPanel.swift": {
+      "sha256": "c7e588cb54ab3ec63cc2d23cf5f966106c1f0ac876d85616b5bbf22f6bc361d9",
+      "bytes": 2662
     },
     "App/Store.swift": {
-      "sha256": "83595d8bc304cb65a348adce2b27dee655fb1f3229b79a42770bbbdd11fba64e",
-      "bytes": 89455
+      "sha256": "aaac3a8e18e96e7bb7d30fef59d0340ecf20fdc3b666185183309541882b468f",
+      "bytes": 105911
     },
     "App/SubtitleOverlay.swift": {
       "sha256": "a783ec7e3d227e88d3dba4138729eb988e58d0bff53291e766a4e80bc61e4cb9",
@@ -3125,12 +3265,12 @@
       "bytes": 3948
     },
     "App/TMDBViews.swift": {
-      "sha256": "9977221164fe312a4f69eb4670474e8af46945bef93a6760555c84b13968d480",
-      "bytes": 51894
+      "sha256": "e0490811410fb0ac0969eb4f607dbb3696a6434368c4d2fe2e966a6c527239f1",
+      "bytes": 52579
     },
     "App/TVBoxApp.swift": {
-      "sha256": "9a6a83476f94a48c16ff2afc1c9e457c51f273a246233e3794a2fef303685cb5",
-      "bytes": 13687
+      "sha256": "04793d01f006a56fb8c84e8a181713eec5b7dbdb935d65095f4db343b1e2d578",
+      "bytes": 13835
     },
     "App/Updates.swift": {
       "sha256": "dec8d81519b6a3175bb05f82322cf79a89391d16cd42cd59ce60675cc989a2a0",
@@ -3141,12 +3281,12 @@
       "bytes": 59118
     },
     "App/WatchNowPhone.swift": {
-      "sha256": "150a65e2644467392d9734edce16fea150b3ee6e368a89df2a702b3c8983a19c",
-      "bytes": 28947
+      "sha256": "35a2bca042923e529e851f95037b5a50abecb15ae2d4bf419588137854653753",
+      "bytes": 27580
     },
     "App/WatchNowTV.swift": {
-      "sha256": "d5c913485549d2cc4ce8ee382d508e108ba01a0baf98da09f07f531e73452b74",
-      "bytes": 34530
+      "sha256": "7b4ab293dd67abc56f12688be8256c0b10ac9cfe5a80a0c63e418a9a6445623d",
+      "bytes": 33143
     },
     "App/WebSignInView.swift": {
       "sha256": "e30d82a6eff771497ac5076fa3af1b6b80eb6c7c1ed39edc81ad7917a28be74b",
@@ -3161,7 +3301,7 @@
       "bytes": 8580
     },
     "Config/Info-TVBox-iOS.plist": {
-      "sha256": "f99a17025e2f8ddb63a344596f26cb4d9e6a6de43c98ec59bc4e54dcd32a6ba9",
+      "sha256": "eccd72131da3794b2573bf99a29a60345b7d24665a24557bc4bcefde1c14a577",
       "bytes": 2970
     },
     "Config/LocalIPA.xcconfig": {
@@ -3217,8 +3357,8 @@
       "bytes": 964
     },
     "README.md": {
-      "sha256": "56567068c55adde7cd860a167e881c24a609516039ae503940ee9140c7c3dda8",
-      "bytes": 5050
+      "sha256": "a8e82becb17bc36f50c4f870200723e41946cf9b9c0e78fd0a1a30d9501d694a",
+      "bytes": 5785
     },
     "Runtime/AppleRuntime/Native/ApplePython.c": {
       "sha256": "87c8cede4b639dea050b63c9d657c96633278d1c24a5b4a93bff5e6330ae2187",
@@ -3228,6 +3368,10 @@
       "sha256": "bb611da8bf08b41f6764f41c17941abda2cef8659b82343318ee2833e9819fd5",
       "bytes": 3307
     },
+    "Runtime/NodeHost/bili-official-quality.mjs": {
+      "sha256": "c93f62adbf42d5b22e4c874ac1cd0d0dfc288699468608adb7f07cd409900c23",
+      "bytes": 4544
+    },
     "Runtime/NodeHost/bundle-pool.mjs": {
       "sha256": "ee345c6a14cdf00f681b0e67d834e58718b7498d64e623dfeb1554f936f7228a",
       "bytes": 11126
@@ -3235,6 +3379,10 @@
     "Runtime/NodeHost/bundle-worker.mjs": {
       "sha256": "ab258acfb2a52f5b4d1b9821c66d4af17919cbd376b7007e762140b14d161dec",
       "bytes": 6345
+    },
+    "Runtime/NodeHost/cache-file-timeline.mjs": {
+      "sha256": "082c408cc466f58f497c27c5009e5aa894fb3f660c314c33590e5eba27034721",
+      "bytes": 4369
     },
     "Runtime/NodeHost/diagnostics.mjs": {
       "sha256": "50c80ee934be957266c9ac7a197015303906fb0b79e6943e8d38f76787ebf4f2",
@@ -3249,32 +3397,32 @@
       "bytes": 5002
     },
     "Runtime/NodeHost/main.mjs": {
-      "sha256": "aadc760b0484f0aac1623af8e64e2f34e0fead7e1c4fa40c3177efea0e17b082",
-      "bytes": 34716
+      "sha256": "6e2b19d67afbbbd547a221d1ab571bbde83078da17d264ca1ff7b6d5ca170dd2",
+      "bytes": 35501
     },
     "Runtime/NodeHost/mobile-deflate.mjs": {
       "sha256": "aaae7d9ed50af15586f78bbca706dae696cb8f64fa407ff5084a6c43941686f5",
       "bytes": 1447
     },
     "Runtime/NodeHost/mobile-fetch.mjs": {
-      "sha256": "ea87f776d678b8c21e3d149b42a7cdc6628a4810aad456c4bb2483e22aab3530",
-      "bytes": 5260
+      "sha256": "11ab7feb64ea92577c243c8914d9099281175c67e27269a6b5a82321b854b31f",
+      "bytes": 6702
     },
     "Runtime/NodeHost/mobile-playback.mjs": {
       "sha256": "d3f424ef423d1e48a0d00f66ae6ff46f856fd45e21dfc8c81f7abca33d09f10c",
       "bytes": 3841
     },
     "Runtime/NodeHost/mobile-services.mjs": {
-      "sha256": "77bb4a044140543797eb0039555ca325ea5f1d80010147152967006726bf2155",
-      "bytes": 27080
+      "sha256": "e3bfd0e2f6ed5ed3e32325a137303fb1609f3404b9ac3265ac70c5168412c973",
+      "bytes": 31984
     },
     "Runtime/NodeHost/pan-password-compat.mjs": {
-      "sha256": "0107f28030e7bdaa96eb9e72935b4fc5b1c006e6e4e35613420e4f503b7a2717",
-      "bytes": 3413
+      "sha256": "fe0fa68794becb1c6a1c068aa7ba7020a06fd39f59546040cd569622bc3def48",
+      "bytes": 3576
     },
     "Runtime/NodeHost/parity/LOCAL-SOURCE.json": {
-      "sha256": "bbbc710d0a0da223980c9882ef563fe56c873c82f89a17cefbcdd418f27a5f40",
-      "bytes": 8248
+      "sha256": "482121358c236696931ba6f64c235284774202eeca0f4295298748b0866d2106",
+      "bytes": 8463
     },
     "Runtime/NodeHost/parity/lib/abort.mjs": {
       "sha256": "d64a2900d57b80a1814f5c59d40db89169983ff9be09a1427ec910680340185f",
@@ -3313,8 +3461,8 @@
       "bytes": 2497
     },
     "Runtime/NodeHost/parity/lib/danmaku.mjs": {
-      "sha256": "97ebc8acd6b70ca21d50ecc2681f593af452417b6c76dfda6e3872b1c44f2255",
-      "bytes": 7884
+      "sha256": "be128bec96115b0c57ea932a8f9a0464d9043e889aa585643edb454e18ab4551",
+      "bytes": 9098
     },
     "Runtime/NodeHost/parity/lib/dash-cache.mjs": {
       "sha256": "5a518f674de407eb682b82062b97a3c3c0fc0098a5159fa586421317a63945d0",
@@ -3333,8 +3481,8 @@
       "bytes": 4098
     },
     "Runtime/NodeHost/parity/lib/forward-media.mjs": {
-      "sha256": "cd576185487fa264b89413d1804d6903d531274abaa0c0d356690ae8a61eba42",
-      "bytes": 6152
+      "sha256": "21b23055ada5cc57c0d55d4cf736a6133e3fce683458693ecbf90f78cd2b94a5",
+      "bytes": 6815
     },
     "Runtime/NodeHost/parity/lib/hls-ad-markers.mjs": {
       "sha256": "35642cf82c49e569474943500845a074d989c521f0cdeef3fadca3d4b6090e7c",
@@ -3345,12 +3493,12 @@
       "bytes": 5701
     },
     "Runtime/NodeHost/parity/lib/hls-cleaner.mjs": {
-      "sha256": "3ca3cf027e630eafb938e20727390a56df0dc1d7f787f4d3c9fedbc71fa26250",
-      "bytes": 8332
+      "sha256": "ee9937c9cceea1e3bfc825fe0e54f6f87dc3c4dc4ea547ab8048038f26e28347",
+      "bytes": 9695
     },
     "Runtime/NodeHost/parity/lib/hls-proxy.mjs": {
-      "sha256": "869c3c25834975c4f538b8e8a74b516ac7c47ff0ee29b90d76c342e73c494fc9",
-      "bytes": 21424
+      "sha256": "dbe648db19b70974c51a13532bb356bdacf1127f110125a7e0d2f07d4e8e44ae",
+      "bytes": 33094
     },
     "Runtime/NodeHost/parity/lib/home-library.mjs": {
       "sha256": "637f8d557884b8d15b147fcaebfc4ad309185ee3828924c05305583c33f1da82",
@@ -3385,8 +3533,8 @@
       "bytes": 1808
     },
     "Runtime/NodeHost/parity/lib/media-cache.mjs": {
-      "sha256": "36cd44c5d55d391bcc23540b87ec2500b49c06ad89a1a496a012c9547322f6c0",
-      "bytes": 43451
+      "sha256": "3263c4c92e3f76b51dc314d80d84642ec36dc5516535d76cb1df8ccf529df0e8",
+      "bytes": 47518
     },
     "Runtime/NodeHost/parity/lib/media-identity.mjs": {
       "sha256": "8934cd96d0622634a7cb5bbda2869ea3d08c3a631436871eb93f16c35aa7eae0",
@@ -3413,8 +3561,8 @@
       "bytes": 3984
     },
     "Runtime/NodeHost/parity/lib/playback.mjs": {
-      "sha256": "8a3c2e1b8fa77b37d33908ab7d1e9952cb64e24d5d0159ccb91e52a4c05aeff5",
-      "bytes": 13612
+      "sha256": "3ece3fe31c3fc274c61f025e10dd86e7414217a5d2cc3d747ca6a6c8656fabff",
+      "bytes": 13629
     },
     "Runtime/NodeHost/parity/lib/provider-http.mjs": {
       "sha256": "903c04ee5d6cac50d93887c2ef446387c69a1eab39c08ea41e3cb02a579c5a5c",
@@ -3432,13 +3580,17 @@
       "sha256": "e29704fc3213fbd1e292c9b4d42dc9d411003109a3b12a3e7b9bcece9bb49679",
       "bytes": 2017
     },
+    "Runtime/NodeHost/parity/lib/site-pan.mjs": {
+      "sha256": "7779c47536e38c149b331cd3fd893ff50c6a4b3d47785a58d0f56febfb4ec506",
+      "bytes": 2189
+    },
     "Runtime/NodeHost/parity/lib/source-media.mjs": {
       "sha256": "a570c0b785c0d73a71d0c53b63d5d6b61a8a693c4e259a61e0700ae83b5ee6ad",
       "bytes": 4217
     },
     "Runtime/NodeHost/parity/lib/source-requests.mjs": {
-      "sha256": "144ed1d610f2342bafa4f39cd9d087b49067d9dc0086e39543dee8d2b1ba9a68",
-      "bytes": 6132
+      "sha256": "23534fda6dad1253a0dd93303a85abb8c6e803b91fcdcaa3f78077380f30e4cd",
+      "bytes": 8592
     },
     "Runtime/NodeHost/parity/lib/subtitle-query.mjs": {
       "sha256": "356ea5219b6716faf2bb726026f2bf461c370659a566ce6d2a9d46eee7c80ae7",
@@ -3465,8 +3617,8 @@
       "bytes": 250
     },
     "Runtime/NodeHost/proxy-startup.mjs": {
-      "sha256": "ff6d91f0baa0ec7c5c69efe1498286ae6defc5d666d653a43f1581b70536547d",
-      "bytes": 1762
+      "sha256": "4415ff2308322fe80e7a4420c3f5c2988d58debd484545d23176357da3c7b76c",
+      "bytes": 1940
     },
     "Runtime/NodeHost/push-playback.mjs": {
       "sha256": "095397d17a4ba77f97acdebcc265797d7bc8d3b2e8ba8c5d1d1bc24b6e25c220",
@@ -3477,20 +3629,24 @@
       "bytes": 8683
     },
     "Runtime/NodeHost/segmented-mp4.mjs": {
-      "sha256": "874f611cc3401cdcd0fd94c0592681d02d5363250d74a3169d191baba9aeb5f3",
-      "bytes": 7630
+      "sha256": "34e31f595dff1208118e7fd202711ac12b930a960ca590a169544443990a8e44",
+      "bytes": 8037
     },
     "Runtime/NodeHost/source-fence.mjs": {
-      "sha256": "088829f7e31350b54599a208a03989c1bb346d36b0e70a47dbbd8977daddc868",
-      "bytes": 2444
+      "sha256": "aadd9b6aa80d950502038ea82e89a87a612e5537d64ea1a0f9f16dc58c89206a",
+      "bytes": 3039
+    },
+    "Runtime/NodeHost/source-website.mjs": {
+      "sha256": "f99738d7309d4400b68d209c26f1895896fbff228e1ef135b1f6ce12e20775d5",
+      "bytes": 1222
     },
     "Runtime/NodeHost/tmdb-transport.mjs": {
       "sha256": "5bbb1ebc16b3978ddaf0319a896f05a4efd64570e80fb3466becf4604352ab74",
       "bytes": 951
     },
     "Runtime/NodeHost/worker.mjs": {
-      "sha256": "6daa82e06ad370831bd1fc31d32acb65ea98952ac18818310ad4d87671a7cbe6",
-      "bytes": 7534
+      "sha256": "83db52a9cc7a310729bc30d702cbd3cd90100f0c66d4cf0597a4904c4fc8b300",
+      "bytes": 7576
     },
     "Runtime/PythonHost/base/__init__.py": {
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -3505,8 +3661,8 @@
       "bytes": 5416
     },
     "Runtime/PythonHost/host.py": {
-      "sha256": "6f9d1286486161b228cc4a3febe0d67d75c69e463f3e370772f17677578e17d8",
-      "bytes": 51594
+      "sha256": "87adc0f4b70697f05756bb9b7e5708453a00f19552229bfa1210183a8355e26f",
+      "bytes": 59608
     },
     "Runtime/PythonHost/requirements.txt": {
       "sha256": "83622c7cfdba84f10ac19b83fb20ef4f50c50181789addd82d6138484f2a3e2e",
@@ -3553,8 +3709,8 @@
       "bytes": 5017
     },
     "Scripts/build-ios-ipa.py": {
-      "sha256": "b2c9446fb1c69c224dbe416753ea1bc72a60468e7cb95f053935cc07decde2f5",
-      "bytes": 7150
+      "sha256": "c2cdc9612ac24710d1016e32d38269ebce6a4e59e44b7175d12edf836ea1155a",
+      "bytes": 7322
     },
     "Scripts/embed-apple-python.sh": {
       "sha256": "116418c61054c81780c1d642854f022a5007450740493b497ff83ac1c2b46b5b",
@@ -3585,8 +3741,8 @@
       "bytes": 1643
     },
     "Scripts/package-ios-ipa.py": {
-      "sha256": "d7d9dbcff2fe81276e32f93e53185b0a2b58e9f3f0827a899beb7a4416eeb2a5",
-      "bytes": 8611
+      "sha256": "8e3f092ce5c6e39e5ecb4875d67eb065fea267c1fc20c501971c58cc46b7e947",
+      "bytes": 8727
     },
     "Scripts/prepare-ffmpeg-av3a.py": {
       "sha256": "2e03893f1158fe07fb25d7c36deded21261246547b8894944d7ee4ab6799107a",
@@ -3597,8 +3753,8 @@
       "bytes": 9660
     },
     "Scripts/prepare-ios-dependencies.py": {
-      "sha256": "85d988cfe6c0c3e1792afe10e18ecb6768d46f9031289584d254eeda2c187655",
-      "bytes": 3282
+      "sha256": "9d63d0de84318f6f575130eea40f066d7f9e3cd5fac25343acb4c217cdd27117",
+      "bytes": 3265
     },
     "Scripts/source_snapshot.py": {
       "sha256": "2907e8f0e9b6f3cd683c28b466435aad7fae6d88acb97d8b54d2cedb08244126",
@@ -3752,25 +3908,37 @@
       "sha256": "321fa4bd48e2e35a52378c44555a1d07fcbe3b3339db883c99790caef9763ed9",
       "bytes": 5859
     },
+    "Sources/TVCore/BoundedHTTPData.swift": {
+      "sha256": "84d8259447e62de10d652871de71e1feb09fbe43f1bda047eb6ccda037d7fcda",
+      "bytes": 7499
+    },
     "Sources/TVCore/CatPawDanmaku.swift": {
       "sha256": "9a77554fa971c577f91ab95f8aa4c9f9715e73e7c0af8dbcc19c3f492c1351a6",
       "bytes": 12335
     },
     "Sources/TVCore/CatPawOpen.swift": {
-      "sha256": "608a53b606afeb7602bf3dcbeadf3849efac957eb639cb864ba9dd6049fa3c56",
-      "bytes": 13974
+      "sha256": "ae9a284839c20a271aa2a97edc6d665785537a30d309c5719dc59d0a6aae70aa",
+      "bytes": 14380
     },
     "Sources/TVCore/Catalog.swift": {
-      "sha256": "36da5edc0a35c68ad921f13d7111728ec234cccab066895cc3f1892e0ff71a2b",
-      "bytes": 63742
+      "sha256": "e07bfa30e8700f7e3989f3f65c2d6c35c759b58d5f4b59e33523d9d15b55fb01",
+      "bytes": 65632
     },
     "Sources/TVCore/CatalogBrowser.swift": {
-      "sha256": "abb97b5ec5d07ccbc86c9fd215a3fa7c3fd71a2681f22d1b304f7a28c6411aa1",
-      "bytes": 9966
+      "sha256": "699515b25ef98b784a4deeead33f55d760ac5981563e0ee2d04f202f0b023d86",
+      "bytes": 12018
     },
     "Sources/TVCore/CatalogDanmaku.swift": {
-      "sha256": "942897a3b525c086ed12a999e3acd74a8738c61fd1b53febecaf1259c272d85f",
-      "bytes": 15145
+      "sha256": "d9883b8a0ec950628a216b651c06b0ef945af711231f50b5b2d5a357bcd06bbb",
+      "bytes": 15512
+    },
+    "Sources/TVCore/CatalogResponseParser.swift": {
+      "sha256": "bc49cd7ac9a8b683929e27e877476ca24be33ab5cec775f3858395052ab5a05b",
+      "bytes": 1878
+    },
+    "Sources/TVCore/CatalogVideoCategory.swift": {
+      "sha256": "bd904cbb4859a696bc3cae08ccc6ae96b1107928133784fd3eddac4217dd1958",
+      "bytes": 1970
     },
     "Sources/TVCore/CloudDriveAccounts.swift": {
       "sha256": "b820891630115986fc58406635eadbee09c49a1622704516418a9f7c8577a64e",
@@ -3821,8 +3989,8 @@
       "bytes": 2596
     },
     "Sources/TVCore/Danmaku.swift": {
-      "sha256": "5019be784616582782f7284a362219a33704e683f5b32a703ce2eff482e17aa7",
-      "bytes": 14821
+      "sha256": "1e3eda02101e1aadffbf7139d5197405140c8e289a2d6153e96828c26cf688f9",
+      "bytes": 16233
     },
     "Sources/TVCore/DanmakuBAS.swift": {
       "sha256": "4ad1ec5d09382d5a438dc1712bfb6bc08c4ebd63ae9bbe7d428a0962dcc5a80a",
@@ -3852,6 +4020,10 @@
       "sha256": "ff53c878992ba7a76bb066a4d1d56cab8ff89a134032f3f8dc83382d1ac93455",
       "bytes": 2140
     },
+    "Sources/TVCore/DetailResourceMetadata.swift": {
+      "sha256": "64fa90a984321b4c3b0f7c16fa209c5c8d6e46982773d3785c1748cd9b290486",
+      "bytes": 1182
+    },
     "Sources/TVCore/Diagnostics.swift": {
       "sha256": "00831e62abae5b852bca8e4b697c4db8ca866c9916c6ed1f4816a2f26e3ff300",
       "bytes": 10307
@@ -3869,8 +4041,8 @@
       "bytes": 4201
     },
     "Sources/TVCore/Discovery.swift": {
-      "sha256": "a283d72257f6eb82913750ea10674f132276760617738d6289cfc7a1a808ac05",
-      "bytes": 7545
+      "sha256": "a2e76b23e4fbd45db5cdf6628f5ed762b43b42c0121dbe527e861627ee0a7c4f",
+      "bytes": 10103
     },
     "Sources/TVCore/DoubanCatalog.swift": {
       "sha256": "04c18b4f0bfd92936c614fb09acd7fc99cb31fe8a49ad3212558c586760edc06",
@@ -3905,12 +4077,12 @@
       "bytes": 19826
     },
     "Sources/TVCore/EmbeddedNodeHost.swift": {
-      "sha256": "14c307e944242350e115e05a3c9665a27c63a12fc40b946284d663f137eb9746",
-      "bytes": 21244
+      "sha256": "09c6d21bbc8c70adcffb6f7c669e41b0207508f0860fbe2d218c4db4932c700d",
+      "bytes": 21092
     },
     "Sources/TVCore/EmbeddedPythonHost.swift": {
-      "sha256": "3ad2b65f7dfebcad0ff2b8fa4445c765172b68df482796d869c5fec58c92659b",
-      "bytes": 9587
+      "sha256": "07138a0df3ce0ec9f1c98d44c2f8d188bd7d31275f707d006a8244b60aa654b6",
+      "bytes": 9645
     },
     "Sources/TVCore/Emby.swift": {
       "sha256": "5d19d19f3b2a807c4db80a3fe40951a393776e15c6b03392fdbc6a379a791e22",
@@ -3933,12 +4105,12 @@
       "bytes": 5512
     },
     "Sources/TVCore/ErrorReports.swift": {
-      "sha256": "23108616619aa33499e3d11ff42d599dac328b55a2d7a33d6b79f368e0d20b44",
-      "bytes": 16764
+      "sha256": "eedc6f308ebd47d17b3dd66944008d0b3cd0d273b884068861ae358522c03f02",
+      "bytes": 17565
     },
     "Sources/TVCore/Favorites.swift": {
-      "sha256": "fc9d6be7aefd8f72e3a5205222a7c949dee5614036d564af76722377b15605eb",
-      "bytes": 11776
+      "sha256": "4576a3976b0966e85814b8e5e5fb2f075f1840cd6ce5c4795041599fe221d1c8",
+      "bytes": 13602
     },
     "Sources/TVCore/FeaturedCatalog.swift": {
       "sha256": "01d510aff4801decc2bdd585885d295b0638bcdf064298c7828616266b3dcc71",
@@ -3961,12 +4133,12 @@
       "bytes": 29491
     },
     "Sources/TVCore/HTMLHomePlayback.swift": {
-      "sha256": "b259f3c734154155323bbe84983bddd8f27e2300fb6306f485f90daa541f5eda",
-      "bytes": 11171
+      "sha256": "421c2e3c75a3d9098a00e709529aeda104a0c21d27843083123829d2323f7de9",
+      "bytes": 18050
     },
     "Sources/TVCore/HiddenSources.swift": {
-      "sha256": "21bce7db613fd71c9c62d618bd93347d61362ba49200f56ce9966a1227f3cc9b",
-      "bytes": 4438
+      "sha256": "80e7cf7062e33963cc7ca665f310f6ef4aba3175b56cb16d6227ccbb818f7836",
+      "bytes": 5524
     },
     "Sources/TVCore/HongguoMedia.swift": {
       "sha256": "4be5dea032fff272e280e66fa144274cdb736eceac518303f9e83d124f703b83",
@@ -3979,6 +4151,42 @@
     "Sources/TVCore/HongguoStreams.swift": {
       "sha256": "39cac78d3471210608586ab229293480642d642810e74f86499057101584bb86",
       "bytes": 28005
+    },
+    "Sources/TVCore/IPTVCatalog.swift": {
+      "sha256": "fd7ad9355d2bdfad84ed0b373e20a0c467abdc3d326efc09ea825fad3a148030",
+      "bytes": 32943
+    },
+    "Sources/TVCore/IPTVGuide.swift": {
+      "sha256": "aa78cdefe12401d2180dfe0a4bef0f356e683145bdbe7be181c261da39bbc134",
+      "bytes": 17882
+    },
+    "Sources/TVCore/IPTVGuideCatchup.swift": {
+      "sha256": "aace6a683dd67e6dd7cdd33b2c9cf28d21e7aab35a91d55fad0a7f32dedc9f5a",
+      "bytes": 4959
+    },
+    "Sources/TVCore/IPTVGuideStore.swift": {
+      "sha256": "22040057fd7cf30673760cdcf1ce72f733c34c94952d150a0b9f517aeb3b66db",
+      "bytes": 14270
+    },
+    "Sources/TVCore/IPTVPlatform.swift": {
+      "sha256": "c1a952c6051b923adc2b2ed796a37b40a9894dc8d8e5ae4071b94852926508d9",
+      "bytes": 6902
+    },
+    "Sources/TVCore/IPTVPlatformCatalog.swift": {
+      "sha256": "a0fce59088d23fac03e652c9efb6d6b86568ec447fd3bf4144a99e6fb82e7933",
+      "bytes": 12823
+    },
+    "Sources/TVCore/IPTVPlatformHTTP.swift": {
+      "sha256": "ac867f6c7df40108bc080115567a77aad771166a437122cb742b38fafe72df7f",
+      "bytes": 3157
+    },
+    "Sources/TVCore/IPTVStationReference.swift": {
+      "sha256": "776e8917b5ca60d77113aeb7564a8a34d250d2f34e23d2ec576d219ec7effab6",
+      "bytes": 1244
+    },
+    "Sources/TVCore/IPTVSubscriptionLibrary.swift": {
+      "sha256": "78d34874fcdf201f31ba7662d18181e84a8c4ac1719e86c2f34146352524db79",
+      "bytes": 36672
     },
     "Sources/TVCore/JarRuntime.swift": {
       "sha256": "77bcabe52a82c884bb5a817c63beb90f721a13117769a36d44e488321e9bebf8",
@@ -3993,8 +4201,8 @@
       "bytes": 4299
     },
     "Sources/TVCore/LiveCatalog.swift": {
-      "sha256": "00feddb2974db1db2627f332838ef81dea010d262ad6024e14b34e76ac28965e",
-      "bytes": 18055
+      "sha256": "29848f4f1d901aa52318776a38491fcbec7a9dcd9a0efa5b06956579772dd8a2",
+      "bytes": 18243
     },
     "Sources/TVCore/LiveEdge.swift": {
       "sha256": "cbc8aec6d5e9cd1c9c2b0d34f22a5df1786dafb87e24c52bd94df51a2eb8da33",
@@ -4017,12 +4225,12 @@
       "bytes": 14584
     },
     "Sources/TVCore/LocalAppPreferences.swift": {
-      "sha256": "01d429d5dc78ca5e5b41c9785d68849e538ffa321f9fa88b3591f245d63954cd",
-      "bytes": 345
+      "sha256": "b8b95a6aa6771763d1972a5bd6fed53e8bbac23bb0cb5fd48fc020971c432a91",
+      "bytes": 650
     },
     "Sources/TVCore/LocalBackupArchive.swift": {
-      "sha256": "7c37daac8a04380aaa70703a7486f4f793d802773d83d085ab10f5eb03af03d3",
-      "bytes": 7281
+      "sha256": "8191e8ffce6a1ea24f36ee825062432baa6b6ed7f8d015682d6d1274db2bcf2d",
+      "bytes": 7832
     },
     "Sources/TVCore/LocalDanmakuAPISettingsModel.swift": {
       "sha256": "a56af0c02da6ddee19c6ab0c5f10b6320324b2a03f731097f86ca82d55c24fe4",
@@ -4036,17 +4244,21 @@
       "sha256": "45c3f8c38056c5fa659354dd4ec1258c0638333dbc3d86f9e09fff1ca523a40e",
       "bytes": 8826
     },
+    "Sources/TVCore/LocalDetailSearchPreferences.swift": {
+      "sha256": "95a06614cb08245ebe5631af2ea073752a8ba7328665097ab8f5edf3c8bcf482",
+      "bytes": 966
+    },
     "Sources/TVCore/LocalDockLayout.swift": {
-      "sha256": "c450f735b6b9ef5bfac15f0d2906a3029e90de8b31c9590ce8d2949a5016d3f0",
-      "bytes": 3135
+      "sha256": "a0e796072246dc87d582c37e85566e1f418179c671a7f3b3926f1e1c27614c98",
+      "bytes": 4558
     },
     "Sources/TVCore/LocalEditionPolicy.swift": {
       "sha256": "081804d8e88b225ab58c380a7c4ab13c93c3287ba1d1e07217439af6193bb961",
       "bytes": 1454
     },
     "Sources/TVCore/LocalHTMLHomeStore.swift": {
-      "sha256": "397390058eab5e0a8091e0394e8260bb575ecbfbba5ec4bd9b9ae52d75cde441",
-      "bytes": 9522
+      "sha256": "d55eb706bc074367b58650092a3585f0f6d2abb3f2f647505673ed7b726e2917",
+      "bytes": 11931
     },
     "Sources/TVCore/LocalHomeDestination.swift": {
       "sha256": "422eb06f7d63a01650aa8fed9954b082a7995c48f895794932b52ac792e192dc",
@@ -4064,17 +4276,33 @@
       "sha256": "ec007e6c14e08918bd5cda15f593ce00f06657e2e26a06a5a02f72383203eb29",
       "bytes": 7477
     },
+    "Sources/TVCore/LocalSearchManga.swift": {
+      "sha256": "ff6d4f97a44fcf06dfc46c50038046ac44fc03c5b1056c2d47c35c03e2b49f32",
+      "bytes": 3717
+    },
     "Sources/TVCore/LocalSearchPreferences.swift": {
-      "sha256": "67b97752b0fa3c1f5b214bb799247ae8aeb63925e7e12307d03cb613692a4025",
-      "bytes": 5155
+      "sha256": "314c6d58e43750101dc2038c8b28c257725b30987cb141bbd48921c1769f796a",
+      "bytes": 7256
     },
     "Sources/TVCore/LocalSettingsReorderSession.swift": {
       "sha256": "6b2c33a20b732dbee1ab66449a59dec0c4437e3da68886caacbf52eca861dad2",
       "bytes": 2484
     },
+    "Sources/TVCore/LocalSiteIntegration.swift": {
+      "sha256": "e8ee2cd9b8b6e89ab47154454b13f4f9f00615c38f78b7de72a1405efe605131",
+      "bytes": 1352
+    },
+    "Sources/TVCore/LocalSiteLinkChecks.swift": {
+      "sha256": "93f7f0e4c8a761b06e6a07a2ca7e9def0d2996f0869184102cde9c4c292d966c",
+      "bytes": 6563
+    },
+    "Sources/TVCore/LocalSiteLinkService.swift": {
+      "sha256": "0ffd2963b3c4bf0749af06722455ea951481a15fd4bd025958542697dd0a2d2b",
+      "bytes": 1439
+    },
     "Sources/TVCore/LocalSourceLibrary.swift": {
-      "sha256": "f51321dfe19218f6ebccc2b394e09d28148fbd531479231671504eacf5d97d65",
-      "bytes": 49524
+      "sha256": "dc07bf38d15591b13b5c36c71732f0188e9bd92d8b9211ada096774d2b9fb705",
+      "bytes": 54067
     },
     "Sources/TVCore/LocalSourcePolicy.swift": {
       "sha256": "e8b0dd4fa1d2c328211ed6cdb5552ce28587e5b6a9dc896f81fa51218dffea5d",
@@ -4089,28 +4317,32 @@
       "bytes": 1672
     },
     "Sources/TVCore/MangaHost.swift": {
-      "sha256": "dbafb2e8336ab1e5a89a2ee8ad75cfa377800c18a888af22f96ff9b5e046c9eb",
-      "bytes": 14187
+      "sha256": "bc2b11413c77300ec408c960f8a020931efd0329bbe7eb5017122ed2181007aa",
+      "bytes": 16249
     },
     "Sources/TVCore/MangaLibrary.swift": {
-      "sha256": "0684a86603ee08f94db72a58e2a7fd66d64e657bb4a071e13fa55a5c7c1e7428",
-      "bytes": 10063
+      "sha256": "d4741c322ad8ce0cd5a1c73b96b724a5d38371464d602257f0f8f1e7749684c5",
+      "bytes": 17068
     },
     "Sources/TVCore/MangaModels.swift": {
-      "sha256": "1de2d86cee125e2fa1bf6639c992994ce2a63761d55adf7851927e33c91f66ee",
-      "bytes": 14377
+      "sha256": "293c66e0fcf05f6abc1da6e72d1aaa1d37cf97cedeeca42bf10e694c64946331",
+      "bytes": 15933
     },
     "Sources/TVCore/MangaNetwork.swift": {
-      "sha256": "777c6af146129eb99ca0bfeb337321741d6bb4a81bbfe3a9d0e049e3d1aab36f",
-      "bytes": 20580
+      "sha256": "64a27ace739b6d19b77b560bc13b036b25bece4330300d2c1f39273945cf42c0",
+      "bytes": 24593
     },
     "Sources/TVCore/MangaRuntime.swift": {
-      "sha256": "164a0711157aaa272cd4fa15874a8da2d56758fa783fbf5d19878f909d01ef31",
-      "bytes": 18509
+      "sha256": "9f697772b9fd048f8c95cb448677a5f8820fe00d6ac1e1e30d9392a3ddada199",
+      "bytes": 28905
     },
     "Sources/TVCore/MangaSources.swift": {
-      "sha256": "746445709827b1698093405026b67117076984d81e32906278b0d60e3eaa8d04",
-      "bytes": 7965
+      "sha256": "9c6826d903f83ff46b90dff60ed6110ec4b937fbf28d1cf08797618f241f6161",
+      "bytes": 19408
+    },
+    "Sources/TVCore/MangaWebLogin.swift": {
+      "sha256": "f2d334618574df0da0ed07452ecfe17f0ee34ae242c29b9dab957edccc1c36cd",
+      "bytes": 2353
     },
     "Sources/TVCore/MediaAddress.swift": {
       "sha256": "0128ef93b2a73a8255679440d7b3f790f3a02320c1a1366b1cfbef326d8eb32f",
@@ -4137,24 +4369,24 @@
       "bytes": 6516
     },
     "Sources/TVCore/MediaPush.swift": {
-      "sha256": "237b42da741c90f08bc54943510892d0494b1d3892b63654b7181f22dcd20e63",
-      "bytes": 17907
+      "sha256": "ab68057907ed18c95a11f9e726ce71cfdba4b0796628ccda01e1c19520108a1c",
+      "bytes": 18181
     },
     "Sources/TVCore/MessageFeed.swift": {
       "sha256": "7a5271cdfd14dfa57e11adcb5c9057f988f3e1c2e4efc89793ee9de7912d2af0",
       "bytes": 6106
     },
     "Sources/TVCore/MobileMediaServices.swift": {
-      "sha256": "84f7a1167898d52778bcaa5ccaee733601687a8ac006ad437e6f731a511517d8",
-      "bytes": 9172
+      "sha256": "a62da7b0e785487740ad4b033e5181d62d6c41b99aa7d2a1f09a05d56f2b7447",
+      "bytes": 15617
     },
     "Sources/TVCore/Models.swift": {
       "sha256": "39c2ff56effdd635f6bed3274cf448e9fba90e0d9ac0c99c67ae975bf2370e9b",
       "bytes": 22085
     },
     "Sources/TVCore/MusicBrowse.swift": {
-      "sha256": "4a0336fc174136aedf2e456c0e9aff45a1f3daa0750099b453b624e9ab1e632c",
-      "bytes": 13330
+      "sha256": "b6471654c141e87ec31749a39a3005644a5cb85e5b0c202e473f30273601fb4b",
+      "bytes": 14587
     },
     "Sources/TVCore/MusicCatalog.swift": {
       "sha256": "4d11840f781386d1bd7edef71f63dbb866a2092db7fb4d76a7d93e3d1b02777f",
@@ -4165,8 +4397,8 @@
       "bytes": 7299
     },
     "Sources/TVCore/MusicCollectionCatalogs.swift": {
-      "sha256": "1e7692f0ccaaaccecbdbb75fba44aca850ebd74192b11ef0e6ca84ce9d57a0a5",
-      "bytes": 5855
+      "sha256": "1cdba2145e2e7e295ec30dbd20d9d5276b7af7ba6d8bec6cb377aa486481e23b",
+      "bytes": 8278
     },
     "Sources/TVCore/MusicCollections.swift": {
       "sha256": "917c0c0d726d6ac839cb7d360cd0c6db07f0f61313bbd6814bbdf56ef9355424",
@@ -4189,8 +4421,8 @@
       "bytes": 8037
     },
     "Sources/TVCore/MusicLXSources.swift": {
-      "sha256": "e6cca279ae5eaa7a1abf6b3263dd54d22617ed558acf584b721e88ef2c32bf47",
-      "bytes": 33723
+      "sha256": "d87e8412c1e6e303f766027e9e85009627aea369bb466b180c77e79e0b05ab52",
+      "bytes": 35222
     },
     "Sources/TVCore/MusicLyrics.swift": {
       "sha256": "f06e253fc77314d05faa8880a6f5c430d9f59d284ff5f758530ed0894c17f805",
@@ -4209,8 +4441,8 @@
       "bytes": 15541
     },
     "Sources/TVCore/MusicModels.swift": {
-      "sha256": "2c6bdbb8bc972d3d3ccb72590ae2881cc61a7060dfd13d3a007f6608d0121622",
-      "bytes": 18007
+      "sha256": "548fad814315e1d8811e2666237eda0c9e1e5ef1a21f5cae3d0f0ce675079472",
+      "bytes": 19428
     },
     "Sources/TVCore/MusicNeteaseCollections.swift": {
       "sha256": "c0880839b6407a7bfc640c520f374cc2bfe2b698f079a8d3e2f41dac4c5a1764",
@@ -4225,16 +4457,16 @@
       "bytes": 1657
     },
     "Sources/TVCore/MusicProviders.swift": {
-      "sha256": "bd18880e802d41759ae18cadbca5b6e7a175e9ef5c6bce87299f19452d25c425",
-      "bytes": 12672
+      "sha256": "706184852595838b1f04a5023b0af862f65f4e2d45c3d1c318d20364abbc363d",
+      "bytes": 13305
     },
     "Sources/TVCore/MusicQueue.swift": {
-      "sha256": "b2c6ea60799622c1e8360a25174dbbdc47b600e02fdd7f475fe70d89cbe4c513",
-      "bytes": 13393
+      "sha256": "46af5ce6d6d387a9b3673a839d3757a77856e9bd98ba2d6b873c9397af059908",
+      "bytes": 14632
     },
     "Sources/TVCore/MusicResolution.swift": {
-      "sha256": "921332089bc5dbd24acaa4d479eb95d9a1183e87b9f21f265896e6e6ded4191b",
-      "bytes": 33769
+      "sha256": "a9ce84927ff86821e08ab3d76629ce872218c71249d70b71c5ce0f617ab0ca45",
+      "bytes": 37438
     },
     "Sources/TVCore/MusicScriptImportPolicy.swift": {
       "sha256": "e56bec5057cce9a05554f02d516e0b61140f37391132f6f3c9ff78b04686e89b",
@@ -4253,12 +4485,12 @@
       "bytes": 6076
     },
     "Sources/TVCore/NativeDanmakuCatalog.swift": {
-      "sha256": "95b32c500df85d5e55e5a060ce37d6b935bfbf4d1653961a9a86e7f343b325fc",
-      "bytes": 25268
+      "sha256": "a290d03d78167dcef244675b4a7c7aa67252037c77bd08bbec785a31edab3a9f",
+      "bytes": 26089
     },
     "Sources/TVCore/Network.swift": {
-      "sha256": "c77c1b8ab8c46c5f2cc69c808d62ff8f37b58f7de697f4dfa3342ede9b68340a",
-      "bytes": 2776
+      "sha256": "2734abc73c5e0ec3f084a29698c207e1a389bd591e782ca54468666878212d31",
+      "bytes": 2809
     },
     "Sources/TVCore/Pan115Files.swift": {
       "sha256": "4ff1a170f347f05df586f2d0e7d77adb0fe548ff6bc7e4c5aeb50d5806811073",
@@ -4276,21 +4508,25 @@
       "sha256": "48ac9d1bc6ac38c5a139930fb79d771bf61e8d7edb7d12fa61c03744b531bc99",
       "bytes": 3683
     },
-    "Sources/TVCore/PinnedSources.swift": {
-      "sha256": "a2046c2bec192d26b1f104cf0b08de56af5855b833ca593173d1c8e0f2461a67",
-      "bytes": 2106
-    },
     "Sources/TVCore/PlayOn.swift": {
       "sha256": "01adb1ebdf2d4ec619e5d50f74086f3e2d02951f58c86818a6d4b2aede6a48bb",
       "bytes": 14100
+    },
+    "Sources/TVCore/PlaybackBufferTimeline.swift": {
+      "sha256": "78f20a665111c6b2886a2e1a352ef18471ad20fd5426a34426a6aeceada283f6",
+      "bytes": 1263
+    },
+    "Sources/TVCore/PlaybackDanmakuSelection.swift": {
+      "sha256": "cf5e8d2b851ae7a8fe6a7ea276921462d8c99f08373b1ccae30f88e9ff16bc93",
+      "bytes": 1625
     },
     "Sources/TVCore/PlaybackDropRecovery.swift": {
       "sha256": "ddc4ac8392b4b349e177f580293279ec8c66463f0d08ebfec563be72ed0c562d",
       "bytes": 2988
     },
     "Sources/TVCore/PlaybackHistory.swift": {
-      "sha256": "9f908119a3b26f368d976f0a2fadfbe37cbb93523c42700ae86d4624f6bff069",
-      "bytes": 23330
+      "sha256": "209f855dd1ed37f52fbdd687b5613e4736acc25d0240f6694f2631bcdd1fb382",
+      "bytes": 32443
     },
     "Sources/TVCore/PlaybackHistoryPersistence.swift": {
       "sha256": "2e8acdf1dbbfbc25e9d50e7c9f5c08cdce5d7434c1d6432becfa132d92d06d5e",
@@ -4327,6 +4563,10 @@
     "Sources/TVCore/PlaybackResolution.swift": {
       "sha256": "e65159e931c3a38424eaba9dbfd41b21c1fe9467186ab06e49bc9f6d0667ab0d",
       "bytes": 2848
+    },
+    "Sources/TVCore/PlaybackSleepSchedule.swift": {
+      "sha256": "2fbbd4d3c10cbcfb250d7552bc82d2842304540bd676f2aca687d6098de76d1e",
+      "bytes": 1682
     },
     "Sources/TVCore/PlaybackSourceContext.swift": {
       "sha256": "4265e77c6e12665fa620fd90bb12bef15540bb9db5d00be95c45b4dc7b8ad569",
@@ -4393,8 +4633,8 @@
       "bytes": 11055
     },
     "Sources/TVCore/PosterPresentation.swift": {
-      "sha256": "8efab8bc5a4eb6b756764a0f6f0bb824067599e5c4bdd589721c208a5f7ab6d4",
-      "bytes": 5432
+      "sha256": "2e64a100919b3d074634238fe2ab5e99bb983a095b179b94576b632cec3a8fac",
+      "bytes": 5632
     },
     "Sources/TVCore/QuarkFiles.swift": {
       "sha256": "5809f9abf368eba8725c2a5e5705fb6c07e86c8571041ae8e018120fea6595a6",
@@ -4409,8 +4649,8 @@
       "bytes": 7714
     },
     "Sources/TVCore/Recommendations.swift": {
-      "sha256": "1b22f49685bfeb7d2a318a09528693d8a9d9603ff63279d6ad0f8d990e44a72d",
-      "bytes": 6050
+      "sha256": "c0dbed8dca203f42496271cde26b7bee264dd7cbf8e8b44f04361e0dd39b2bd0",
+      "bytes": 8363
     },
     "Sources/TVCore/ReleaseFeed.swift": {
       "sha256": "e75633b1f18b96aa904651d744e544add442efe533feb45662e558c438432a4d",
@@ -4681,28 +4921,36 @@
       "bytes": 38706
     },
     "Sources/TVCore/ScriptAssets/venera/prelude.js": {
-      "sha256": "42e7a7e3e80a53e754189df02cdb45a4b782e834ba3e472942c12a2219ff93cb",
-      "bytes": 21313
+      "sha256": "49a4406dad6e4d4c13745fbb800f98f804e1101b4f0381ec4ad5431b59f90ba1",
+      "bytes": 24046
     },
     "Sources/TVCore/ScriptCrypto.swift": {
       "sha256": "6254aa93953a75f9290707ce70f0be2e00bd62edc7d69e378924dc9db0b303b1",
       "bytes": 12359
     },
     "Sources/TVCore/ScriptRuntime.swift": {
-      "sha256": "e84686c4264c22a33da3d5f88497041ac7c489365f11bca4116f9521dabddef4",
-      "bytes": 33785
+      "sha256": "a0b2d88dcb8a67d5af8d8f70082ac49c3c73d04ea87ba221ead7ae97d8e51aa5",
+      "bytes": 42656
     },
     "Sources/TVCore/ScriptSniffing.swift": {
-      "sha256": "59f32a810b9763e40b0d5bd3a38bb1b33e0111e3f4484e9ce3efbd0ab1f022b5",
-      "bytes": 2763
+      "sha256": "843740f65c6a7f82312c0113b1e87cec8440bf66dcd56b92bfeeb45186529a2d",
+      "bytes": 2770
     },
     "Sources/TVCore/SearchModel.swift": {
-      "sha256": "438e0486d63735a1c18fca8ec93b27bdcee76cc632374834119b7310b34e98c9",
-      "bytes": 22729
+      "sha256": "d9c4c2cb28eccf7d9887dab7a14834641106a4cf04454203668ec55756913adc",
+      "bytes": 30116
+    },
+    "Sources/TVCore/SearchResultCache.swift": {
+      "sha256": "70d545986941bd0531bac6315d2da3902f81c1c6ece1101e8bcc51e80f6b02ba",
+      "bytes": 5210
+    },
+    "Sources/TVCore/SearchResultPolicy.swift": {
+      "sha256": "39dce4951c01d1770dbb060422c505bd8a5b13c600cf2c668d7fe46d99765328",
+      "bytes": 3987
     },
     "Sources/TVCore/SearchScheduler.swift": {
-      "sha256": "0d7a6a581b9721c6f5047a30640ce2867864a1058faffffc4f9cd79489a3a21f",
-      "bytes": 5743
+      "sha256": "b7e167e6e02f01e3e49277398b4a1a9ac1b23a4ac90795b0ea5d7d89cf72da7d",
+      "bytes": 7584
     },
     "Sources/TVCore/SearchSuggestions.swift": {
       "sha256": "48281a5cb54a970d0ed35750528d6c2e8116d7a84606d90bf58ecda62d170dad",
@@ -4713,32 +4961,36 @@
       "bytes": 10989
     },
     "Sources/TVCore/SingleSpider.swift": {
-      "sha256": "28eda7649ebff765bc5f79bbd1c6f3c4c74e47a602f01fa8d1d7ca5cd546c536",
-      "bytes": 5749
+      "sha256": "a49bfc4e71962143562d51e0628b917febf66ec934db98db411aab9149359e37",
+      "bytes": 6380
+    },
+    "Sources/TVCore/SitePanShare.swift": {
+      "sha256": "d678453786eccb0453b6fb9bf788de96d5011cc590663e7a7ec0af1d85a83cc1",
+      "bytes": 732
     },
     "Sources/TVCore/SniffRules.swift": {
       "sha256": "082a5f990287fa54708302b5bfce58f61dfa5a3986fe914c95368519afc623a9",
       "bytes": 5832
     },
     "Sources/TVCore/SourceGroups.swift": {
-      "sha256": "b78776363b2a4d2172de7ae42fddc4e4d1799a0c9396289257afaa26e336bfe2",
-      "bytes": 4611
+      "sha256": "7c09481359e898f03147b41fc89f05c56d7a4d7b33731e1d77c7a9cb847946fa",
+      "bytes": 4026
     },
     "Sources/TVCore/SourceHealth.swift": {
-      "sha256": "0c024f7dd5652c55c928be76c3a4f980c151745c3120805b3b1b3d842b1d2860",
-      "bytes": 6486
+      "sha256": "9fd37955a16756dc60f7c2e11b0be7921a0e2e4512f09072b058a4849e7b807d",
+      "bytes": 7026
     },
     "Sources/TVCore/SourceOrder.swift": {
-      "sha256": "b85b09cdb74aa316ebfed5ddff7513dc4df2a1b170c67f52c4fe1fb91acceda4",
-      "bytes": 3161
+      "sha256": "9307568fb34a5654a082def7dddc51a61e2b95582783b1cb386dd463d63a1dfc",
+      "bytes": 3112
     },
     "Sources/TVCore/SourceStrategy.swift": {
       "sha256": "7a742892f01c169296d00d4f1d6aa041185bec48b93c0624de11b790e6d1e1a6",
       "bytes": 4686
     },
     "Sources/TVCore/SpeedBoost.swift": {
-      "sha256": "3bb0de54a14b01e63bc8463f3f815390c83d5c1e7db7c56dbf71c4d55865f6a0",
-      "bytes": 4517
+      "sha256": "ebd9b12ecea1aac71f0c80c7923c6903622caebe8992477314eec99123714525",
+      "bytes": 4983
     },
     "Sources/TVCore/SpiderSandbox.swift": {
       "sha256": "e5178e912e25edbbc776b93793b950005ccae80e21111c53ec77e4c16ad04f35",
@@ -4813,8 +5065,8 @@
       "bytes": 25831
     },
     "Sources/TVCore/TMDBNetworkTransport.swift": {
-      "sha256": "80aafdae7ff0a119719784e42ce5245680d63a37f9495b9683624e2a81777997",
-      "bytes": 1682
+      "sha256": "5779bc95806614cb7505409af98c816c00c39d6878fd47eccf78963014e082d0",
+      "bytes": 1746
     },
     "Sources/TVCore/TMDBServiceSettings.swift": {
       "sha256": "9905a70d36066685500cd1dcefc8f5fb632c2c84b315966ef92407ece8c3c513",
@@ -4981,8 +5233,8 @@
       "bytes": 710
     },
     "Vendor/FFmpegKit/include/avformat_shim.h": {
-      "sha256": "47c6af29a577c9256fd92e6b469e16be0c3f3279dfdcb5d6d7d59df280c0f2fd",
-      "bytes": 2070
+      "sha256": "4110579276b4d9001a9a0102838cf2a81ebf7e9e74efa4b7b5ced64056909260",
+      "bytes": 2068
     },
     "Vendor/FFmpegKit/include/avutil_shim.h": {
       "sha256": "e997a1527f3c458dfb70fdc0263ef93d75dd0df95f1125bfcbf4f1d620a45332",
@@ -5009,8 +5261,8 @@
       "bytes": 20440
     },
     "Vendor/KSPlayer/Sources/KSPlayer/AVPlayer/KSOptions.swift": {
-      "sha256": "0f36f34ffdfa0a5bb8792dbf302ed734fadc6b7d3515f58db16a3122d73333a4",
-      "bytes": 35124
+      "sha256": "2868e2820d2d6a74a2fb1b4816ceb851903c92e19c81aa4722020b0bacd526fb",
+      "bytes": 35964
     },
     "Vendor/KSPlayer/Sources/KSPlayer/AVPlayer/KSPictureInPictureController.swift": {
       "sha256": "0d57c034c3a549b17bff64c4c66c5faebab25a7d09c754b0a039d65a85218906",
@@ -5029,8 +5281,8 @@
       "bytes": 10977
     },
     "Vendor/KSPlayer/Sources/KSPlayer/AVPlayer/PlayerDefines.swift": {
-      "sha256": "036e26d937c709b4f0bb0132ffa7ecb1326d52615ebfc6be98130259385d2905",
-      "bytes": 10377
+      "sha256": "dcbf0112683f18a1963a6a02ba217f273dd3a149baa33a35ffb8cb61078191a4",
+      "bytes": 10509
     },
     "Vendor/KSPlayer/Sources/KSPlayer/Audio/AudioPlayerView.swift": {
       "sha256": "d4b49716f6ae79c0165a92a55e79a4e9b1feb53a0f9b2ee05848c122fcc6492c",
@@ -5061,8 +5313,8 @@
       "bytes": 28519
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/AVFFmpegExtension.swift": {
-      "sha256": "8d11f5698a112824bfb8ef3a2b498093e5189ff87dc357680d0d900bd0e9440d",
-      "bytes": 24106
+      "sha256": "d7e5d8a661f7286d1c363e14bc1977ccd0ddbacf1efc5cd57886ce5f1bb47d25",
+      "bytes": 24780
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/AVFoundationExtension.swift": {
       "sha256": "f54fba9223ea57f8a1cc8ad038a652db53e2b2e43dc01772cd1315078392570f",
@@ -5085,8 +5337,8 @@
       "bytes": 8094
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/CircularBuffer.swift": {
-      "sha256": "321133eebe8eb7c9c3e609ddc0b0af5a77abf17a2d1ca778667ab72e21f72229",
-      "bytes": 9800
+      "sha256": "fcea0deabb419e46d671f4747e9db75d05052ce585d3cad3695522b6a305badf",
+      "bytes": 11654
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/DolbyVisionInlineConverter.swift": {
       "sha256": "05753e9b7ce42c2aca05c744d3115d926d89cfe984f45c5c87026fefe87229ac",
@@ -5109,48 +5361,56 @@
       "bytes": 1198
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/FFmpegAssetTrack.swift": {
-      "sha256": "f3b49b7c0a094eb5b6ed925bd838f29da503a5ded59c6fc723ef3623ddece1d6",
-      "bytes": 18781
+      "sha256": "a1e0c818be47a0a91f4474f1bc8c3b331606315a44272aa9f1d5b450bc7cb93d",
+      "bytes": 20591
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/FFmpegDecode.swift": {
-      "sha256": "c2a157ab82d5c7dda65f4fcc6fb19b9b96b641e6bed857b8eb48f6653c3a9cc2",
-      "bytes": 14981
+      "sha256": "71e1e03f7b6b845ee4fd00eb5e340d84fa2cd401084b5dddc7118834ef1c8887",
+      "bytes": 17485
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/Filter.swift": {
       "sha256": "9869b2095c1efcab5f02cb8455d33ad02af4eaa62262f07e659e831377962a62",
       "bytes": 8335
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/KSMEPlayer.swift": {
-      "sha256": "107c170b6eb9222dc0af56b3dd7eeb1e7cd164f44538c860a035262022636a52",
-      "bytes": 26415
+      "sha256": "bc433839c960503bf1f73f94722d03e0fbc7f9c214fe1455e5d25c49c8bc8b24",
+      "bytes": 30343
+    },
+    "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/MEPlaybackReadState.swift": {
+      "sha256": "c23691717e9d608a4b6961af7f36f132ac684463f15c364ca48d8174f8d276c8",
+      "bytes": 1868
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/MEPlaybackSource.swift": {
-      "sha256": "56be0beeaaf532089534eb07bab387ce13a78e9d3bffe1e7426759772765e199",
-      "bytes": 11279
+      "sha256": "6d3016f00459b217ef865dec327cb9da4a4d60d8c1be01b1cc5cb4ef468afc9e",
+      "bytes": 12048
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/MEPlayerItem.swift": {
-      "sha256": "8931187fb1553f36509780ef65a1a800835cd7de18267624b8e11b4811f0458f",
-      "bytes": 74552
+      "sha256": "aa244c782e7a0b973507272ff7dd607cc5083f8eebb94429571c69fbfbfef240",
+      "bytes": 82790
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/MEPlayerItemTrack.swift": {
-      "sha256": "1ca650d7eec2d7bfbe9cbade25e9bd6448d0432c3dbcbe0bea0ca34b6677d361",
-      "bytes": 17348
+      "sha256": "7cb7c6e1a322df8d26c6e9bc113589e3582758a16bd81b558e6909c10640b8ae",
+      "bytes": 23132
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/MetalPlayView.swift": {
       "sha256": "08be84a6a1fff7544cfbb038bcd204727a05026feedc8d836e5a524553ce7524",
       "bytes": 25710
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/Model.swift": {
-      "sha256": "941c92ca07516b831204263615b3845a9edc2b809efcb17850789e146d72af1b",
-      "bytes": 17685
+      "sha256": "c71e51d5578bd7f6592c1945c495d0900a34197e2038ce24554e42e47aee9f3a",
+      "bytes": 17755
+    },
+    "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/PlaybackCacheTimeline.swift": {
+      "sha256": "d605fbfd119538d1020cd4f48c2d89763dbedc4db6fb442a61ee638c1b72c9a6",
+      "bytes": 6040
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/PlaybackInputIO.swift": {
-      "sha256": "f6dba6119001f3b38cf2cf0186f1f46b54f66bb55ac874c857d80ef1993b9272",
-      "bytes": 4869
+      "sha256": "b3d3bfe7991765424da9ad780657867ff20dacf32772ccd4c0cae85c995ff93a",
+      "bytes": 6064
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/Resample.swift": {
-      "sha256": "3b91ac8c41a86376b1cc5b5d5cf17fe0c25419d9738ae6451aa4b6664d5c0617",
-      "bytes": 16132
+      "sha256": "7638eb5b9294b5fd1e3ab4c61ce488f70ad3c8721278b1ca01793240255e91e0",
+      "bytes": 17728
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/SubtitleDecode.swift": {
       "sha256": "de72f12deca5511308cf7d03b84d6823492ca817ef99e885c378cd2b3a72837e",
@@ -5173,8 +5433,8 @@
       "bytes": 1738
     },
     "Vendor/KSPlayer/Sources/KSPlayer/MEPlayer/VideoToolboxDecode.swift": {
-      "sha256": "c947a7f0041da80e39b16b61d381d2411ba83f657d4d4aa7ec9b24f7b403ad69",
-      "bytes": 13074
+      "sha256": "2cb85abf280d7000ab7072a080d43bc5ed1cff6856d7e00a7843addf9bd25572",
+      "bytes": 14252
     },
     "Vendor/KSPlayer/Sources/KSPlayer/Metal/DisplayModel.swift": {
       "sha256": "afd5ae5a31f62caf51d14a9e0ff4143a35df6cb6bacffef8ce3b12caf597831f",
@@ -5485,7 +5745,7 @@
       "bytes": 2130
     },
     "project.yml": {
-      "sha256": "872fca61dfb5ee14a81516949be54c547872759ededcbaa8d7faace4bcdfa258",
+      "sha256": "f397507b68ba5d0a7f9c1d15d47ca91dd6f934b0504e72a221ec7705cd45fd93",
       "bytes": 6961
     },
     "website/.gitignore": {

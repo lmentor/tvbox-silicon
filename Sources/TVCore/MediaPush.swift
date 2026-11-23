@@ -48,7 +48,7 @@ public enum MediaPush {
         return Video(id: video.id, name: title, poster: video.poster, posterHeaders: video.posterHeaders, year: video.year,
                      remarks: video.remarks, synopsis: video.synopsis, episodes: video.episodes, category: video.category,
                      action: video.action, folderCategoryID: video.isFolder ? video.folderCategoryID : nil, folderFilters: video.folderFilters,
-                     area: video.area, director: video.director, actor: video.actor)
+                     area: video.area, director: video.director, actor: video.actor, panShare: video.panShare)
     }
     public static func applyingMetadata(_ request: MediaPushRequest, to video: Video) -> Video {
         let named = applyingTitle(request.title, to: video)
@@ -167,9 +167,13 @@ public final class LocalMediaLibrary: @unchecked Sendable {
     private func file(sourceKey: String, id: String) -> URL {
         directory.appendingPathComponent(PluginChecksum.sha256(Data((sourceKey + "\n" + id).utf8)) + ".json")
     }
-    @discardableResult public func register(_ request: MediaPushRequest, mode: Mode) throws -> Record {
+    @discardableResult public func register(_ request: MediaPushRequest, mode: Mode, htmlSourceID: String? = nil) throws -> Record {
         let original = try MediaPush.directVideo(request, sniff: mode == .sniff)
-        let id = original.id + "-" + mode.rawValue
+        let id: String
+        if let htmlSourceID {
+            let key = try JSONEncoder().encode([htmlSourceID, original.id])
+            id = "html-direct-" + PluginChecksum.sha256(key) + "-" + mode.rawValue
+        } else { id = original.id + "-" + mode.rawValue }
         let video = Video(id: id, name: original.name, poster: original.poster, posterHeaders: original.posterHeaders,
                           year: original.year, remarks: original.remarks, synopsis: original.synopsis,
                           episodes: original.episodes.map { .init(id: $0.id + "-" + mode.rawValue, name: $0.name, address: $0.address, flag: $0.flag, videoID: id) })

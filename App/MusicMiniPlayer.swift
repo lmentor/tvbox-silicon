@@ -30,77 +30,114 @@ struct MusicMiniPlayer: View {
     var body: some View {
         WithPerceptionTracking {
             let music = store.music
-            HStack(spacing: 0) {
-                // A real label-wide button owns the artwork, text and empty space.
-                // A parent tap/drag gesture around transport buttons can lose the
-                // initial touch to the covered song list on iOS 16.
-                Button { music.presentsPlayer = true } label: {
-                    HStack(spacing: inline ? 10 : 12) {
-                        MusicArtwork(url: music.track?.artwork, size: inline ? 28 : 34)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(music.track?.title ?? "").font(.subheadline.weight(.semibold)).lineLimit(1)
-                            if let failure = music.failure {
-                                Text(failure).font(.caption).foregroundStyle(Brand.amber).lineLimit(1)
-                            } else if !inline {
-                                Text(music.track?.artistLine ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .padding(.leading, inline ? 6 : 10).padding(.trailing, inline ? 4 : 6)
-                    .frame(maxWidth: .infinity, minHeight: 44, maxHeight: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint(L10n.text("Now Playing"))
-                .accessibilityIdentifier("music.miniPlayer.open")
-                HStack(spacing: inline ? 0 : 2) {
-                    if music.failure != nil {
-                        button("arrow.clockwise", label: "Retry") { music.retry() }
-                    } else if music.busy && !music.isPlaying {
-                        Button { music.presentsPlayer = true } label: {
-                            ProgressView().frame(width: 44, height: 44).contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain).accessibilityLabel(L10n.text("Now Playing"))
-                    } else {
-                        button(music.isPlaying ? "pause.fill" : "play.fill", label: music.isPlaying ? "Pause" : "Play") { music.toggle() }
-                            .modifier(MusicPlayPauseTransition())
-                    }
-                    if !inline {
-                        button("forward.fill", label: "Next") { music.next() }.disabled(!music.canAdvance)
-                        // Closes the strip without opening Now Playing first; Continue Playing keeps the song.
-                        button("xmark", label: "Stop") { music.stop() }.font(.body).foregroundStyle(.secondary)
-                    }
-                }
-                .font(.title3)
-                .fixedSize(horizontal: true, vertical: false)
-                .padding(.trailing, inline ? 4 : 8)
+            ZStack {
+                MusicMiniPlayerProgress()
+                labels(music).allowsHitTesting(false).accessibilityHidden(true)
+                // A single native responder owns both the painted empty space
+                // and the controls; these visual labels have no second action.
+                MusicMiniPlayerTouchSurface(inline: inline,
+                    title: [music.track?.title, music.track?.artistLine, music.failure].compactMap { $0 }.joined(separator: ", "),
+                    transportLabel: L10n.text(music.failure != nil ? "Retry" : music.busy && !music.isPlaying ? "Now Playing" : music.isPlaying ? "Pause" : "Play"),
+                    canAdvance: music.canAdvance,
+                    open: { music.presentsPlayer = true },
+                    transport: {
+                        if music.failure != nil { music.retry() }
+                        else if music.busy && !music.isPlaying { music.presentsPlayer = true }
+                        else { music.toggle() }
+                    },
+                    next: { music.next() }, stop: { music.stop() })
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .contextMenu {
-                WithPerceptionTracking {
-                    Button(role: .destructive) { music.stop() } label: { Label(L10n.text("Stop"), systemImage: "xmark") }
-                }
-            }
+            .contentShape(Capsule())
             .accessibilityElement(children: .contain)
-            .accessibilityAction(named: L10n.text("Now Playing")) { music.presentsPlayer = true }
-            .accessibilityAction(named: L10n.text("Stop")) { music.stop() }
         }
     }
 
-    private func button(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol).frame(width: 44, height: 44).contentShape(Rectangle())
+    private func labels(_ music: MusicPlaybackSession) -> some View {
+        HStack(spacing: 0) {
+            HStack(spacing: inline ? 10 : 12) {
+                MusicArtwork(url: music.track?.artwork, size: inline ? 28 : 34)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(music.track?.title ?? "").font(.subheadline.weight(.semibold)).lineLimit(1)
+                    if let failure = music.failure {
+                        Text(failure).font(.caption).foregroundStyle(Brand.amber).lineLimit(1)
+                    } else if !inline {
+                        Text(music.track?.artistLine ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, inline ? 6 : 10).padding(.trailing, inline ? 4 : 6)
+            .frame(maxWidth: .infinity, minHeight: 44, maxHeight: .infinity, alignment: .leading)
+            HStack(spacing: MusicMiniPlayerLayout.spacing(inline: inline)) {
+                if music.failure != nil {
+                    symbol("arrow.clockwise")
+                } else if music.busy && !music.isPlaying {
+                    ProgressView().frame(width: MusicMiniPlayerLayout.buttonWidth, height: 44)
+                } else {
+                    symbol(music.isPlaying ? "pause.fill" : "play.fill")
+                        .modifier(MusicPlayPauseTransition())
+                }
+                if !inline {
+                    symbol("forward.fill").opacity(music.canAdvance ? 1 : 0.35)
+                    symbol("xmark").font(.body).foregroundStyle(.secondary)
+                }
+            }
+            .font(.title3)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.trailing, MusicMiniPlayerLayout.trailing(inline: inline))
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(L10n.text(label))
+    }
+
+    private func symbol(_ name: String) -> some View {
+        Image(systemName: name).frame(width: MusicMiniPlayerLayout.buttonWidth, height: 44)
+    }
+}
+
+/// Only this leaf reads the 4 Hz music clock. The artwork, controls, dock and
+/// retained browsing lists do not rebuild for each progress sample.
+private struct MusicMiniPlayerProgress: View {
+    @Environment(Store.self) private var store
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { geometry in
+            WithPerceptionTracking {
+                let music = store.music
+                let fraction = MusicMiniPlayerLayout.progress(position: music.seekingTo ?? music.position, duration: music.duration)
+                let dark = scheme == .dark
+                Rectangle()
+                    .fill(LinearGradient(colors: dark
+                        ? [Color.cyan.opacity(0.13), Color.white.opacity(0.16)]
+                        : [Color.blue.opacity(0.10), Color.cyan.opacity(0.20)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .overlay(alignment: .trailing) {
+                        if fraction > 0 && fraction < 1 {
+                            Rectangle().fill(Color.white.opacity(dark ? 0.24 : 0.48)).frame(width: 1)
+                        }
+                    }
+                    .frame(width: geometry.size.width * fraction)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    // Seeks and item replacement create a new clock identity, so
+                    // they reset immediately instead of sweeping across the song.
+                    .animation(reduceMotion || !music.isPlaying ? nil : .linear(duration: 0.22), value: fraction)
+                    .id(music.timelineRevision)
+            }
+        }
+        .environment(\.layoutDirection, .leftToRight)
+        .clipShape(Capsule())
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
 private struct MusicPlayPauseTransition: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ViewBuilder func body(content: Content) -> some View {
-        if #available(iOS 17.0, *) {
+        if reduceMotion {
+            content
+        } else if #available(iOS 17.0, *) {
             content.contentTransition(.symbolEffect(.replace))
         } else {
             content.contentTransition(.opacity)

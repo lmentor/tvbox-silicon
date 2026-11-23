@@ -5,11 +5,19 @@ import TVCore
 /// The Manga section: what the viewer is reading and saved, then the chosen Venera source's explore pages.
 struct MangaView: View {
     @State private var store = MangaStore.shared
+    @Environment(Store.self) private var appStore
     @Environment(\.openRoute) private var openRoute
 
     var body: some View {
         WithPerceptionTracking {
             Group {
+                #if os(iOS)
+                if let source = store.currentSource {
+                    MangaSourceBrowse(source: source.key).id(source.key + source.revision)
+                } else {
+                    MangaWelcome()
+                }
+                #else
                 if store.sources.isEmpty && store.history.isEmpty && store.favorites.isEmpty {
                     MangaWelcome()
                 } else {
@@ -34,6 +42,8 @@ struct MangaView: View {
                                     #endif
                                     if let source = store.currentSource {
                                         MangaSourceBrowse(source: source.key).id(source.key + source.revision)
+                                    } else {
+                                        EmptyResults(symbol: "eye.slash", title: "漫画来源已隐藏", message: "可在来源管理中重新显示已安装站点。")
                                     }
                                 }
                             }
@@ -42,11 +52,18 @@ struct MangaView: View {
                         }
                     }
                 }
+                #endif
             }
             .background { WithPerceptionTracking { Backdrop() } }
             .modifier(MangaNoticeBanner())
+            .onAppear { store.applyHiddenSources(appStore.hiddenSources) }
+            .appOnChange(of: store.sources) { _, _ in store.applyHiddenSources(appStore.hiddenSources) }
+            #if os(iOS)
+            .modifier(LocalSitePageTitle(title: L10n.text("Manga")))
+            #else
             .tabTitle(L10n.text("Manga"))
-            #if !os(tvOS)
+            #endif
+            #if os(macOS)
             .toolbar { WithPerceptionTracking {
 
                     ToolbarItemGroup {
@@ -76,11 +93,24 @@ private struct MangaWelcome: View {
                     .frame(width: icon, height: icon).background(Brand.accent.opacity(0.14), in: Circle())
                     .accessibilityHidden(true)
                 Text(L10n.text("Read Comics")).font(.system(size: titleSize, weight: .bold))
+                #if os(iOS)
+                Text("在设置中添加漫画订阅，站点准备后即可开始阅读。")
+                    .font(.system(size: text)).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: width)
+                #else
                 Text(L10n.text("Add comic sources in Settings › Comic Sources to read comics here."))
                     .font(.system(size: text)).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: width)
+                #endif
                 // Goes straight to the sources. On Apple TV it is also the page's only focusable control: with none, focus
                 // had nowhere to land when the section opened directly, and Back did nothing.
-                RouteLink { WithPerceptionTracking { MangaSourcesView() } } label: { WithPerceptionTracking { Label(L10n.text("Comic Sources"), systemImage: "books.vertical") } }
+                RouteLink {
+                    WithPerceptionTracking {
+                        #if os(iOS)
+                        LocalMangaSettingsView()
+                        #else
+                        MangaSourcesView()
+                        #endif
+                    }
+                } label: { WithPerceptionTracking { Label(L10n.text("Comic Sources"), systemImage: "books.vertical") } }
                     .controlButton(prominent: true).padding(.top, 10)
                     .accessibilityIdentifier("manga.welcome.sources")
             }
@@ -118,42 +148,314 @@ private struct MangaSourceBar: View {
 }
 
 /// One source's explore pages (shelves or a grid), with its categories and ranking a tap away.
+private struct MangaBrowseCategory: Identifiable {
+    let id: String
+    let name: String
+    let param: String?
+    let isSearch: Bool
+}
+
 struct MangaSourceBrowse: View {
     let source: String
+    @Environment(Store.self) private var appStore
     @Environment(\.openRoute) private var openRoute
+    #if os(iOS)
+    @State private var showsActions = false
+    @State private var refreshAfterActions = false
+    @State private var hideAfterActions = false
+    @State private var accountAfterActions = false
+    @State private var favoritesAfterActions = false
+    @State private var showsSourceSettings = false
+    @State private var showsFilters = false
+    @State private var query = ""
+    @State private var submitted = ""
+    @State private var selectedCategory: MangaBrowseCategory?
+    @State private var options: [String] = []
+    @State private var ranking: String?
+    @AppStorage("manga.browse.landscapePosters") private var landscapePosters = false
+    @Environment(\.localDockInset) private var localDockInset
+    @Environment(\.openLocalHomeSources) private var openHomeSources
+    #endif
     @State private var info: MangaSourceInfo?
     @State private var failure: String?
     @State private var page = 0
     @State private var shelves: [MangaShelf] = []
     @State private var loadingShelves = false
     @State private var shelfFailure: String?
+    @State private var refreshRevision = 0
 
     var body: some View {
         WithPerceptionTracking {
-            VStack(alignment: .leading, spacing: Layout.headerSpacing) {
-                if let info {
-                    #if os(tvOS)
-                    header(info)
-                    #else
-                    phoneHeader(info)
-                    #endif
-                    content(info)
-                } else if let failure {
-                    EmptyResults(symbol: "exclamationmark.triangle", title: L10n.text("Unable to Load"), message: failure, action: L10n.text("Try Again")) {
-                        Task { await load() }
-                    }
-                } else {
-                    ProgressView().frame(maxWidth: .infinity).padding(40)
-                }
-            }
-            .task { await load() }
+            #if os(iOS)
+            mobilePresentations
+            #else
+            browsePage
+            #endif
         }
     }
 
+    private var browsePage: some View {
+        WithPerceptionTracking {
+            Group {
+                #if os(iOS)
+                mobileBrowser
+                #else
+                VStack(alignment: .leading, spacing: Layout.headerSpacing) {
+                    if let info {
+                        #if os(tvOS)
+                        header(info)
+                        #else
+                        phoneHeader(info)
+                        #endif
+                        content(info)
+                    } else if let failure {
+                        EmptyResults(symbol: "exclamationmark.triangle", title: L10n.text("Unable to Load"), message: failure, action: L10n.text("Try Again")) {
+                            Task { await load() }
+                        }
+                    } else { ProgressView().frame(maxWidth: .infinity).padding(40) }
+                }
+                #endif
+            }
+            .task(id: refreshRevision) {
+                if refreshRevision > 0 {
+                    await MangaRuntime.shared.refreshExplore(source)
+                    guard !Task.isCancelled else { return }
+                    info = nil; shelves = []
+                }
+                await load()
+            }
+        }
+    }
+
+    #if os(iOS)
+    private var mobilePresentations: some View {
+        browsePage
+            .localGlassDialog(isPresented: $showsActions, title: info?.name ?? "漫画站点", maxWidth: 460, onDismiss: completeActions) { sourceActions }
+            .sheet(isPresented: $showsSourceSettings, onDismiss: { refreshRevision += 1 }) { sourceSettings }
+            .localGlassDialog(isPresented: $showsFilters, title: "筛选", maxWidth: 460) { filterContent }
+    }
+
+    private func completeActions() {
+        if refreshAfterActions { refreshAfterActions = false; refreshRevision += 1 }
+        if hideAfterActions, let installed = MangaStore.shared.sources.first(where: { $0.key == source }) {
+            hideAfterActions = false
+            appStore.hiddenSources.setHidden([LocalSearchManga.site(installed)], origin: LocalSearchManga.origin, hidden: true)
+            MangaStore.shared.applyHiddenSources(appStore.hiddenSources)
+        }
+        if accountAfterActions { accountAfterActions = false; showsSourceSettings = true }
+        if favoritesAfterActions { favoritesAfterActions = false; openRoute?(Route { AnyView(MangaLibraryView(kind: .favorites)) }) }
+    }
+
+    private var sourceActions: some View {
+        WithPerceptionTracking {
+            ScrollView {
+                WithPerceptionTracking {
+                    VStack(spacing: 10) {
+                        if let info, info.canSignIn || !info.cookieFields.isEmpty || info.signInPage != nil {
+                            Button { accountAfterActions = true; showsActions = false } label: { Label("登录账号", systemImage: "person.crop.circle") }
+                                .accessibilityIdentifier("manga.actions.account")
+                        } else if info?.settings.isEmpty == false {
+                            Button { accountAfterActions = true; showsActions = false } label: { Label("站点设置", systemImage: "slider.horizontal.3") }
+                        }
+                        Button { favoritesAfterActions = true; showsActions = false } label: { Label("漫画收藏", systemImage: "heart") }
+                        Button { refreshAfterActions = true; showsActions = false } label: { Label("刷新站点", systemImage: "arrow.clockwise") }
+                            .accessibilityIdentifier("manga.actions.refresh")
+                        Button { hideAfterActions = true; showsActions = false } label: { Label("隐藏站点", systemImage: "eye.slash") }
+                            .accessibilityIdentifier("manga.actions.hide")
+                    }.buttonStyle(LocalSiteActionRowStyle()).padding(16).localDialogContentHeight()
+                }
+            }
+        }
+    }
+
+    private var sourceSettings: some View {
+        NavigationStack {
+            MangaSourceSettingsView(key: source, opensWebLogin: info?.canSignIn == false && info?.cookieFields.isEmpty == true && info?.settings.isEmpty == true)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showsSourceSettings = false } } }
+        }
+    }
+
+    private var filterContent: some View {
+        WithPerceptionTracking {
+            ScrollView {
+                WithPerceptionTracking {
+                    if let info {
+                        VStack(alignment: .leading, spacing: 14) {
+                            ForEach(Array(activeOptions(info).enumerated()), id: \.offset) { index, option in
+                                WithPerceptionTracking { filterRow(option, index: index, info: info) }
+                            }
+                        }.padding(16).localDialogContentHeight()
+                    }
+                }
+            }
+        }
+    }
+
+    private func filterRow(_ option: MangaSourceInfo.Option, index: Int, info: MangaSourceInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(info.text(option.label)).font(.subheadline.weight(.semibold))
+            MangaFlow(spacing: 8) {
+                ForEach(option.choices, id: \.value) { choice in
+                    WithPerceptionTracking {
+                        Chip(title: info.text(choice.text), selected: options.indices.contains(index) && option.contains(choice.value, in: options[index])) {
+                            if options.indices.contains(index) { options[index] = option.selecting(choice.value, in: options[index]) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #endif
+
     private func load() async {
         failure = nil
-        do { info = try await MangaRuntime.shared.info(source) } catch { failure = error.mangaMessage }
+        do {
+            let result = try await MangaRuntime.shared.info(source)
+            guard !Task.isCancelled else { return }
+            info = result
+            #if os(iOS)
+            if options.isEmpty { options = MangaOptionRows.defaults(activeOptions(result)) }
+            #endif
+        } catch { if !Task.isCancelled { failure = error.mangaMessage } }
     }
+
+    #if os(iOS)
+    private var mobileBrowser: some View {
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                WithPerceptionTracking {
+                    ScrollView {
+                        WithPerceptionTracking {
+                            VStack(alignment: .leading, spacing: Layout.headerSpacing) {
+                                Color.clear.frame(height: 0).id("manga.top")
+                                if let info {
+                                    mobileCategories(info)
+                                    mobileResources(info)
+                                } else if let failure {
+                                    EmptyResults(symbol: "exclamationmark.triangle", title: L10n.text("Unable to Load"), message: failure, action: L10n.text("Try Again")) {
+                                        refreshRevision += 1
+                                    }
+                                } else { ProgressView().frame(maxWidth: .infinity).padding(40) }
+                            }.padding(.vertical, Layout.gutter)
+                                .frame(maxWidth: Layout.maxWidth).frame(width: viewport.size.width, alignment: .topLeading)
+                        }
+                    }
+                    .frame(width: viewport.size.width, height: viewport.size.height)
+                    .overlay(alignment: .bottomTrailing) {
+                        WithPerceptionTracking {
+                            VStack(spacing: 10) {
+                                if let info, !activeOptions(info).isEmpty {
+                                    Button { showsFilters = true } label: { Image(systemName: "line.3.horizontal.decrease").frame(width: 44, height: 44) }
+                                        .accessibilityLabel("筛选").accessibilityIdentifier("manga.filters")
+                                }
+                                Button { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("manga.top", anchor: .top) } } label: {
+                                    Image(systemName: "arrow.up").frame(width: 44, height: 44)
+                                }.accessibilityLabel("回到顶部").accessibilityIdentifier("manga.top")
+                            }.font(.headline).buttonStyle(.plain)
+                                .padding(6).background(.regularMaterial, in: Capsule())
+                                .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
+                                .localDockHitRegion().padding(16).padding(.bottom, localDockInset).localDockHitRegions()
+                        }
+                    }
+                }
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) { mobileHeader }
+        .environment(\.mangaLandscapePosters, landscapePosters)
+    }
+
+    private var mobileHeader: some View {
+        WithPerceptionTracking {
+            HStack(spacing: 4) {
+                Button { openHomeSources?() } label: {
+                    HStack(spacing: 4) {
+                        Text(info?.name ?? MangaStore.shared.name(of: source)).font(.headline).lineLimit(2)
+                        Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                    }.frame(minWidth: 48, idealWidth: 86, maxWidth: 132, minHeight: 44, alignment: .leading).contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityLabel("选择漫画来源").accessibilityIdentifier("manga.source.open")
+                Button { landscapePosters.toggle() } label: {
+                    Image(systemName: landscapePosters ? "rectangle.grid.1x2" : "square.grid.2x2").frame(width: 44, height: 44)
+                }.buttonStyle(.plain).accessibilityLabel(landscapePosters ? "切换为竖版海报网格" : "切换为横版海报网格")
+                    .accessibilityIdentifier("manga.layout")
+                HStack(spacing: 5) {
+                    Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(.secondary)
+                    TextField("搜索当前站点", text: Binding(get: { query }, set: { value in
+                        query = value
+                        if value.isEmpty, !submitted.isEmpty {
+                            submitted = ""
+                            if let info { options = MangaOptionRows.defaults(activeOptions(info)) }
+                        }
+                    })).font(.subheadline).submitLabel(.search).autocorrectionDisabled().textInputAutocapitalization(.never)
+                        .onSubmit {
+                            guard let info, info.canSearch else { return }
+                            submitted = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                            options = MangaOptionRows.defaults(activeOptions(info))
+                        }.disabled(info?.canSearch != true).accessibilityIdentifier("manga.search")
+                    if !query.isEmpty {
+                        Button {
+                            query = ""; submitted = ""
+                            if let info { options = MangaOptionRows.defaults(activeOptions(info)) }
+                        } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(minWidth: 28, minHeight: 44) }
+                            .buttonStyle(.plain).accessibilityLabel("清除漫画搜索")
+                    }
+                }.padding(.horizontal, 9).frame(minWidth: 98, minHeight: 44)
+                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                Button { showsActions = true } label: {
+                    Image(systemName: "ellipsis").rotationEffect(.degrees(90)).frame(width: 44, height: 44).contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityLabel("漫画站点更多操作").accessibilityIdentifier("manga.source.menu")
+            }.padding(.horizontal, 16).padding(.vertical, 8).background(.regularMaterial)
+        }
+    }
+
+    private func categories(_ info: MangaSourceInfo) -> [MangaBrowseCategory] {
+        info.categoryParts.enumerated().flatMap { partIndex, part in
+            part.categories.enumerated().map { index, name in
+                MangaBrowseCategory(id: "category.\(partIndex).\(index)", name: name,
+                                    param: part.params.indices.contains(index) ? part.params[index] : nil,
+                                    isSearch: part.itemType == "search")
+            }
+        }
+    }
+
+    private func mobileCategories(_ info: MangaSourceInfo) -> some View {
+        let categories = categories(info)
+        let selected = submitted.isEmpty ? selectedCategory?.id ?? ranking.map { "ranking." + $0 } ?? "explore.\(page)" : ""
+        let items = info.explore.indices.map { SourceStrip.Item(id: "explore.\($0)", name: info.text(info.explore[$0].title)) }
+            + categories.map { SourceStrip.Item(id: $0.id, name: info.text($0.name)) }
+            + info.rankingOptions.map { SourceStrip.Item(id: "ranking." + $0.value, name: info.text($0.text)) }
+        return SourceStrip(items: items, selection: selected) { key in
+            guard key != selected else { return }
+            query = ""; submitted = ""; selectedCategory = nil; ranking = nil
+            if key.hasPrefix("explore.") { page = Int(key.dropFirst("explore.".count)) ?? 0; shelves = [] }
+            else if key.hasPrefix("ranking.") { ranking = String(key.dropFirst("ranking.".count)) }
+            else { selectedCategory = categories.first { $0.id == key } }
+            options = MangaOptionRows.defaults(activeOptions(info))
+        }.padding(.horizontal, Layout.gutter)
+    }
+
+    private func activeOptions(_ info: MangaSourceInfo) -> [MangaSourceInfo.Option] {
+        if !submitted.isEmpty || selectedCategory?.isSearch == true { return info.searchOptions }
+        if selectedCategory != nil { return info.categoryOptions }
+        return []
+    }
+
+    @ViewBuilder private func mobileResources(_ info: MangaSourceInfo) -> some View {
+        if !submitted.isEmpty {
+            MangaComicGrid(load: { cursor in
+                try await MangaRuntime.shared.search(source, keyword: submitted, options: info.searchArguments(options), cursor: cursor)
+            }, id: "search|\(source)|\(submitted)|\(options)|\(refreshRevision)")
+        } else if let category = selectedCategory {
+            MangaComicGrid(load: { cursor in
+                if category.isSearch {
+                    return try await MangaRuntime.shared.search(source, keyword: category.param ?? category.name, options: info.searchArguments(options), cursor: cursor)
+                }
+                return try await MangaRuntime.shared.category(source, name: category.name, param: category.param, options: options, cursor: cursor)
+            }, id: "\(source)|\(category.id)|\(options)|\(refreshRevision)")
+        } else if let ranking {
+            MangaComicGrid(load: { cursor in try await MangaRuntime.shared.ranking(source, option: ranking, cursor: cursor) }, id: "\(source)|ranking|\(ranking)|\(refreshRevision)")
+        } else { content(info) }
+    }
+    #endif
 
     #if !os(tvOS)
     /// As Watch Now's Recommendations: a heading, then the source as a glass capsule that opens its categories and a
@@ -179,6 +481,11 @@ struct MangaSourceBrowse: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("manga.source.open")
                 MangaSourceSwitch()
+                #if os(iOS)
+                Spacer(minLength: 0)
+                Button { showsActions = true } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }
+                    .buttonStyle(.plain).accessibilityLabel("漫画站点更多操作").accessibilityIdentifier("manga.source.menu")
+                #endif
             }
             if info.explore.count > 1 {
                 SourceStrip(items: info.explore.indices.map { .init(id: "\($0)", name: info.text(info.explore[$0].title)) }, selection: "\(page)") { page = Int($0) ?? 0 }
@@ -243,23 +550,25 @@ struct MangaSourceBrowse: View {
                         }
                     }
                 }
-                .task(id: page) { await loadShelves() }
+                .task(id: "\(page)|\(refreshRevision)") { await loadShelves() }
             case "mixed":
-                MangaMixedPage(source: source, page: page)
+                MangaMixedPage(source: source, page: page).id("\(page)|\(refreshRevision)")
             default:
-                MangaComicGrid(load: { cursor in try await MangaRuntime.shared.explore(source, page: page, cursor: cursor).page }, id: "\(source)-\(page)")
+                MangaComicGrid(load: { cursor in try await MangaRuntime.shared.explore(source, page: page, cursor: cursor).page }, id: "\(source)-\(page)-\(refreshRevision)")
             }
         }
     }
 
     private func loadShelves() async {
+        let revision = refreshRevision, selectedPage = page
         loadingShelves = true; shelfFailure = nil
-        defer { loadingShelves = false }
+        defer { if revision == refreshRevision, selectedPage == page { loadingShelves = false } }
         do {
             let result = try await MangaRuntime.shared.explore(source, page: page, cursor: nil)
             await MangaImages.shared.prepareCovers(source: source, urls: result.shelves.flatMap { $0.comics.map(\.cover) })
+            guard !Task.isCancelled, revision == refreshRevision, selectedPage == page else { return }
             shelves = result.shelves
-        } catch { shelves = []; shelfFailure = error.mangaMessage }
+        } catch { if !Task.isCancelled, revision == refreshRevision, selectedPage == page { shelves = []; shelfFailure = error.mangaMessage } }
     }
 }
 
@@ -376,8 +685,8 @@ struct MangaOptionRows: View {
                         HStack(spacing: 10) {
                             ForEach(option.choices, id: \.value) { choice in
                                 WithPerceptionTracking {
-                                    Chip(title: info.text(choice.text), selected: values.indices.contains(index) && values[index] == choice.value) {
-                                        if values.indices.contains(index) { values[index] = choice.value }
+                                    Chip(title: info.text(choice.text), selected: values.indices.contains(index) && option.contains(choice.value, in: values[index])) {
+                                        if values.indices.contains(index) { values[index] = option.selecting(choice.value, in: values[index]) }
                                     }
                                 }
                             }
@@ -390,26 +699,43 @@ struct MangaOptionRows: View {
             #else
             // As a source's category filters on Watch Now: one glass "Sort: Popular" chip per option, each a menu.
             if !options.isEmpty {
-                CategoryFilterBar(filters: filters, choices: Dictionary(uniqueKeysWithValues: values.enumerated().map { ("\($0.offset)", $0.element) })) { next in
-                    for index in options.indices where values.indices.contains(index) {
-                        if let value = next["\(index)"] { values[index] = value }
+                VStack(alignment: .leading, spacing: 10) {
+                    CategoryFilterBar(filters: filters, choices: Dictionary(uniqueKeysWithValues: values.enumerated().map { ("\($0.offset)", $0.element) })) { next in
+                        for index in options.indices where values.indices.contains(index) {
+                            if let value = next["\(index)"] { values[index] = value }
+                        }
                     }
-                }
-                .padding(.horizontal, Layout.gutter)
+                    ForEach(Array(options.enumerated()).filter { $0.element.type == "multi-select" }, id: \.offset) { index, option in
+                        WithPerceptionTracking {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(info.text(option.label)).font(.subheadline.weight(.medium))
+                                MangaFlow(spacing: 8) {
+                                    ForEach(option.choices, id: \.value) { choice in
+                                        WithPerceptionTracking {
+                                            Chip(title: info.text(choice.text), selected: values.indices.contains(index) && option.contains(choice.value, in: values[index])) {
+                                                if values.indices.contains(index) { values[index] = option.selecting(choice.value, in: values[index]) }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }.padding(.horizontal, Layout.gutter)
             }
             #endif
         }
     }
 
     private var filters: [CategoryFilter] {
-        options.enumerated().map { index, option in
+        options.enumerated().filter { $0.element.type != "multi-select" }.map { index, option in
             CategoryFilter(key: "\(index)", name: info.text(option.label),
                            options: option.choices.map { CategoryFilter.Option(name: info.text($0.text), value: $0.value) },
                            initial: option.defaultValue ?? option.choices.first?.value)
         }
     }
 
-    static func defaults(_ options: [MangaSourceInfo.Option]) -> [String] { options.map { $0.defaultValue ?? $0.choices.first?.value ?? "" } }
+    static func defaults(_ options: [MangaSourceInfo.Option]) -> [String] { options.map(\.initialValue) }
 }
 
 struct MangaCategoryComicsView: View {
@@ -559,7 +885,7 @@ private struct MangaSearchShelf: View {
                 do {
                     let info = try await MangaRuntime.shared.info(source.key)
                     guard info.canSearch else { comics = []; return }
-                    let page = try await MangaRuntime.shared.search(source.key, keyword: keyword, options: MangaOptionRows.defaults(info.searchOptions).map(Optional.some), cursor: nil)
+                    let page = try await MangaRuntime.shared.search(source.key, keyword: keyword, options: info.searchArguments(MangaOptionRows.defaults(info.searchOptions)), cursor: nil)
                     await MangaImages.shared.prepareCovers(source: source.key, urls: page.comics.map(\.cover))
                     comics = page.comics
                 } catch { failure = error.mangaMessage }
@@ -580,9 +906,9 @@ struct MangaSourceResults: View {
                 WithPerceptionTracking {
                     VStack(alignment: .leading, spacing: Layout.headerSpacing) {
                         if let info {
-                            MangaOptionRows(options: info.searchOptions.filter { $0.type != "multi-select" }, info: info, values: $values)
+                            MangaOptionRows(options: info.searchOptions, info: info, values: $values)
                             MangaComicGrid(load: { cursor in
-                                try await MangaRuntime.shared.search(source, keyword: keyword, options: values.map(Optional.some), cursor: cursor)
+                                try await MangaRuntime.shared.search(source, keyword: keyword, options: info.searchArguments(values), cursor: cursor)
                             }, id: keyword + values.joined(separator: "|"))
                         }
                     }
@@ -699,7 +1025,7 @@ private struct MangaSourceSwitch: View {
             Menu {
                 WithPerceptionTracking {
                     Picker(L10n.text("Comic Sources"), selection: Binding(get: { store.currentSource?.key ?? "" }, set: { store.selectedSource = $0 })) {
-                        ForEach(store.sources) { perceptionArgument0 in WithPerceptionTracking { Text(perceptionArgument0.name).tag(perceptionArgument0.key) } }
+                        ForEach(store.visibleSources) { perceptionArgument0 in WithPerceptionTracking { Text(perceptionArgument0.name).tag(perceptionArgument0.key) } }
                     }
                     .pickerStyle(.inline)
                 }

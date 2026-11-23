@@ -147,6 +147,21 @@ public struct MangaSourceInfo: Sendable {
         public var label: String
         public var choices: [(value: String, text: String)]
         public var defaultValue: String?
+        public var initialValue: String {
+            defaultValue ?? (type == "multi-select" ? "[]" : type == "dropdown" ? "" : choices.first?.value ?? "")
+        }
+        public func contains(_ choice: String, in value: String) -> Bool {
+            type == "multi-select" ? selectedValues(value).contains(choice) : value == choice
+        }
+        public func selecting(_ choice: String, in value: String) -> String {
+            guard type == "multi-select" else { return choice }
+            var selected = selectedValues(value)
+            if let index = selected.firstIndex(of: choice) { selected.remove(at: index) } else { selected.append(choice) }
+            return (try? JSONEncoder().encode(selected)).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
+        }
+        private func selectedValues(_ value: String) -> [String] {
+            (try? JSONDecoder().decode([String].self, from: Data(value.utf8))) ?? []
+        }
         public static func == (a: Option, b: Option) -> Bool { a.label == b.label && a.choices.map(\.value) == b.choices.map(\.value) }
         public func hash(into hasher: inout Hasher) { hasher.combine(label); hasher.combine(choices.map(\.value)) }
     }
@@ -186,6 +201,12 @@ public struct MangaSourceInfo: Sendable {
     public var translation: [String: String]
 
     public func text(_ key: String) -> String { translation[key] ?? key }
+    public func searchArguments(_ values: [String]) -> [String?] {
+        searchOptions.enumerated().map { index, option in
+            let value = values.indices.contains(index) ? values[index] : option.initialValue
+            return option.type == "dropdown" && value.isEmpty ? nil : value
+        }
+    }
 
     init(_ value: Any?) throws {
         guard let item = value as? [String: Any], let key = MangaValue.string(item["key"]) else { throw TVError.unsupported(L10n.text("This is not a Venera comic source.")) }
@@ -233,8 +254,13 @@ public struct MangaSourceInfo: Sendable {
     }
     private static func options(_ value: Any?) -> [Option] {
         (value as? [[String: Any]] ?? []).map { item in
-            Option(type: MangaValue.string(item["type"]) ?? "select", label: MangaValue.string(item["label"]) ?? "",
-                   choices: MangaValue.strings(item["options"]).map(choice), defaultValue: MangaValue.string(item["default"]))
+            let type = MangaValue.string(item["type"]) ?? "select"
+            let initial: String?
+            if type == "multi-select", let values = item["default"] as? [String] {
+                initial = (try? JSONEncoder().encode(values)).map { String(decoding: $0, as: UTF8.self) }
+            } else { initial = MangaValue.string(item["default"]) }
+            return Option(type: type, label: MangaValue.string(item["label"]) ?? "",
+                          choices: MangaValue.strings(item["options"]).map(choice), defaultValue: initial)
         }.filter { !$0.choices.isEmpty }
     }
 }

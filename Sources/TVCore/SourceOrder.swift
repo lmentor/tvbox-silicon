@@ -2,8 +2,8 @@ import Foundation
 import Perception
 
 /// The viewer's own source order. While it is on, it replaces the automatic one (`SourceStrategy`):
-/// the Sources page lists sources in it, and search asks sources and lists their matches in it, top first.
-/// Keys are subscription-qualified like `PinnedSources`, so the order survives re-imports.
+/// the Sources page lists sources in it. Global search follows Settings order.
+/// Keys are subscription-qualified, so the order survives re-imports.
 @MainActor @Perceptible public final class SourceOrder {
     public var enabled: Bool {
         didSet { defaults.set(enabled, forKey: "sourceOrder.enabled"); revision += 1; onChange?() }

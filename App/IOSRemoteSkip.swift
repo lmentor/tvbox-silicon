@@ -32,12 +32,10 @@ import TVCore
         let duration: Double
         let chapters: [RemoteEpisodeSkipChapter]
     }
-    private func setStatus(_ message: String, kind: PlayerNotice.Kind = .information) {
+    // Matching status belongs in the skip panel. Only a completed seek posts a player notice.
+    private func setStatus(_ message: String) {
         guard status != message else { return }
         status = message
-        if kind == .information, notice?.kind == .success,
-           notice?.isVisible(at: ProcessInfo.processInfo.systemUptime) == true { return }
-        notice = message.isEmpty ? nil : PlayerNotice(message: message, kind: kind)
     }
 
     func begin(channel: Channel, isLive: Bool) {
@@ -102,11 +100,11 @@ import TVCore
                 self.setStatus(self.remote.isEmpty ? (message.isEmpty ? "没有匹配的远程片段，已保留本地时间" : message) : "已匹配片头片尾 · " + Array(Set(self.remote.map(\.source))).sorted().joined(separator: " / "))
                 if result.object?["retryable"] == .bool(true) {
                     self.retryAt = Date().addingTimeInterval(15)
-                    self.setStatus(self.attempts < 2 ? "部分在线信息暂不可用，稍后重试；已保留可用时间" : "在线匹配暂不可用，已保留可用时间", kind: .warning)
+                    self.setStatus(self.attempts < 2 ? "部分在线信息暂不可用，稍后重试；已保留可用时间" : "在线匹配暂不可用，已保留可用时间")
                 } else { self.attempts = 2 }
             } catch {
                 guard active == self.generation, !Task.isCancelled else { return }
-                self.setStatus("在线匹配暂不可用，已保留本地时间", kind: .warning)
+                self.setStatus("在线匹配暂不可用，已保留本地时间")
                 self.retryAt = Date().addingTimeInterval(15)
             }
         }

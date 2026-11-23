@@ -20,7 +20,6 @@ import TVCore
     let recommendationModel = RecommendationModel()
     let playbackHistory: PlaybackHistory
     let playbackDefaults: UserDefaults
-    let pinnedSources: PinnedSources
     let hiddenSources: HiddenSources
     let sourceOrder: SourceOrder
     /// Keeps the viewer's library the same on their other devices when using the standard preferences.
@@ -28,8 +27,29 @@ import TVCore
     /// The history entry being resumed; another entry, or leaving the page, replaces or cancels it.
     private(set) var resumingHistoryID: String?
     private var resumeTask: Task<Void, Never>?
+    private var resumeRequest = UUID()
+    private(set) var historyPlaybackPreparation: HistoryPlaybackPreparation?
+    private(set) var retiringHistoryPresentationID: UUID?
+    private(set) var playerPresentationLifetime: PlayerPresentationLifetime?
+    @PerceptionIgnored private var changesPlayerPresentationContent = false
     /// The selected subscription and all enabled Python sources, merged in list order.
-    var subscription: Subscription?
+    var subscription: Subscription? {
+        didSet {
+            // A restored/replaced document can have the same count and an older
+            // importedAt than another enabled document. Never reuse source objects
+            // merely because the merged timestamp and row count happen to match.
+            siteListStamp = ""
+            automaticCache = nil
+            orderedCache = nil
+            recommendationCache = nil
+            homeSourceCache = nil
+            groupsCache = [:]
+            subscriptionRevision &+= 1
+        }
+    }
+    /// Cheap navigation identity for each merged catalog replacement. Tabs do
+    /// not need to concatenate every source URL while responding to a touch.
+    private(set) var subscriptionRevision: UInt64 = 0
     /// The address being typed in to add a subscription.
     var subscriptionAddress: String
     /// What to call the subscription being added; empty shows where it lives instead.
@@ -125,6 +145,12 @@ import TVCore
     var notice: String?
     var localReading: LocalReadingSession?
     var playing: Channel? {
+        // A direct playback/close intent also invalidates pending history work.
+        willSet {
+            if changesPlayerPresentationContent { return }
+            cancelResume(dismissingPresentation: newValue == nil)
+            if newValue == nil { retirePlayerPresentation() }
+        }
         // An episode of a listening source (audiobooks, radio, songs) plays in the music player instead (#289).
         didSet {
             if let channel = playing, let media = channel.playback?.reading {
@@ -188,12 +214,13 @@ import TVCore
     @PerceptionIgnored private var automaticCache: [Site]?
     @PerceptionIgnored private var orderedCache: [Site]?
     @PerceptionIgnored private var recommendationCache: [Site]?
+    @PerceptionIgnored private var homeSourceCache: [Site]?
     @PerceptionIgnored private var groupsCache: [Bool: [SourceGroup]] = [:]
-    /// What the cached rows were built from: the merged subscription, which subscriptions are on, and the viewer's pins, hides, and order.
+    /// What the cached rows were built from: the merged subscription, which subscriptions are on, and the viewer's hides and order.
     private func currentSiteListStamp() -> String {
         let imported = subscription?.importedAt.timeIntervalSince1970 ?? 0
         let entries = subscriptions.map { "\($0.address)=\($0.enabled)" }.joined(separator: "\n")
-        return "\(subscription?.origin.absoluteString ?? "")|\(imported)|\(subscription?.sites.count ?? 0)|\(entries)|\(pinnedSources.revision)|\(hiddenSources.revision)|\(sourceOrder.revision)"
+        return "\(subscription?.origin.absoluteString ?? "")|\(imported)|\(subscription?.sites.count ?? 0)|\(entries)|\(hiddenSources.revision)|\(sourceOrder.revision)"
     }
     private var persistsChanges: Bool {
         return true
@@ -213,7 +240,6 @@ import TVCore
         defaults.removeObject(forKey: "local.library.historyScope")
         playbackDefaults = defaults
         playbackHistory = .shared
-        pinnedSources = PinnedSources(defaults: playbackDefaults)
         hiddenSources = HiddenSources(defaults: playbackDefaults)
         #if os(macOS) || os(iOS)
         WebSniff.install(WKWebSniffer())
@@ -257,12 +283,13 @@ import TVCore
             defaults.removeObject(forKey: "subscription")
         }
         rebuildSubscription(resetting: false)
-        searchModel.currentCatalog = { [weak self] in self?.subscription }
+        searchModel.currentCatalog = { [weak self] in self?.subscription ?? LocalSearchManga.catalog }
         // Signing in to a drive or adding a server adds its source; signing out or removing one takes it away.
         cloudDrivesObserver = NotificationCenter.default.addObserver(forName: CloudFiles.drivesChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshCloudFilesSources() }
         }
-        searchModel.order = sourceOrder
+        hiddenSources.onVisibilityChange = { [weak self] in self?.sourceVisibilityChanged() }
+        MangaStore.shared.applyHiddenSources(hiddenSources)
         DownloadLibrary.shared.resolver = { [weak self] item in
             guard let self else { throw CancellationError() }
             return try await self.resolveDownload(item)
@@ -308,7 +335,7 @@ import TVCore
             var context = source.context; context.historyScope = self.historyScope ?? ""
             self.playbackHistory.record(context, position: position, duration: duration)
         }
-        music.handOffSource = { [weak self] stream, position, picture, covered in
+        music.handOffSource = { [weak self] stream, position, picture, covered, request in
             guard let self, let context = stream.historyContext else { return }
             if picture { AudioSourceVerdicts(defaults: self.playbackDefaults).recordVideo(context) }
             let channel = Channel(name: stream.name, group: stream.group, url: stream.url, logo: stream.logo, headers: stream.headers,
@@ -317,7 +344,8 @@ import TVCore
             Task { @MainActor [weak self] in
                 // The video player can't open while Now Playing is still closing (as PlayOn waits for the player).
                 if covered { try? await Task.sleep(for: .milliseconds(700)) }
-                guard let self, self.playing == nil else { return }
+                guard let self, !Task.isCancelled, self.playing == nil,
+                      self.music.consumeVideoHandoff(request) else { return }
                 self.playsAsVideo = true
                 self.playing = channel
                 self.playsAsVideo = false
@@ -505,28 +533,121 @@ import TVCore
         guard !importing else { return }
         importing = true; importError = nil; notice = nil
         defer { importing = false }
+        do {
+            notice = try await saveLocalSources(urls, group: group, containingFolder: containingFolder,
+                                              name: name, importingCopy: importingCopy)
+        } catch { importError = error.localizedDescription }
+    }
+    /// A file selection owns the source mutation lock until every item and its
+    /// provider lease have finished. Per-file unlocks schedule automatic updates
+    /// that would otherwise race the next file's asynchronous validation.
+    func importLocalDocuments(_ selection: LocalDocumentSelection, group: LocalSourceGroup, name: String? = nil,
+                              progress: (Int, Int, String) -> Void = { _, _, _ in }) async -> LocalDocumentBatchReport {
+        guard !importing, !restoringBackup, !backupRecoveryRequired else {
+            return await selection.importDocuments(progress: progress) { _, _ in
+                throw TVError.unsupported("另一个来源正在导入或更新，请稍后重试此文件")
+            }
+        }
+        importing = true; importError = nil; notice = nil
+        defer { importing = false }
+        let proposedName = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return await selection.importDocuments(progress: progress) { _, url in
+            let title = selection.urls.count > 1 && !proposedName.isEmpty
+                ? proposedName + " · " + url.deletingPathExtension().lastPathComponent : proposedName
+            return try await saveLocalSources([url], group: group, name: title, importingCopy: true)
+        }
+    }
+    /// Copied imports have no remote origin to refresh. Legacy bookmarks also
+    /// use Files now, so Update never needs another containing-folder grant.
+    func sourceUpdateRequiresFile(_ entry: SubscriptionEntry) async throws -> Bool {
+        guard let url = URL(string: entry.address) else { throw TVError.invalidURL }
+        if ImportedFiles.isImported(entry.address) { return true }
+        guard url.host()?.lowercased() == "sources.yingxia.invalid" else { return false }
+        guard let record = try await LocalSourceLibrary.shared.records().first(where: { $0.address.absoluteString == entry.address }) else {
+            throw TVError.unsupported("此设备没有接口文件，请重新导入")
+        }
+        return record.input.isEmpty || record.input.contains(where: \.isFileURL)
+    }
+    /// Replace exactly one existing entry. Name, ordering and activation belong
+    /// to that entry; unlike an Add operation, an update must not change them.
+    func replaceLocalDocuments(_ selection: LocalDocumentSelection, entry: SubscriptionEntry) async throws -> String {
+        defer { selection.release() }
+        guard !importing, !restoringBackup, !backupRecoveryRequired else {
+            throw TVError.unsupported("另一个来源正在导入或更新，请稍后重试此文件")
+        }
+        guard subscriptions.contains(where: { $0.address == entry.address }) else {
+            throw TVError.unsupported("此来源已不存在，请重新选择要更新的来源")
+        }
+        importing = true; importError = nil; notice = nil
+        defer { importing = false }
+        try Task.checkCancellation()
+        try await selection.validateKind()
+        if ImportedFiles.isImported(entry.address) {
+            guard selection.urls.count == 1, let file = selection.urls.first,
+                  !["zip", "md5"].contains(file.pathExtension.lowercased()), let origin = URL(string: entry.address) else {
+                throw TVError.unsupported("此旧版单文件来源请选择更新后的 JSON 或脚本文件；保留原有版本")
+            }
+            let data = try await selection.readData(maxBytes: 20_000_000)
+            let value = try await Subscription.parse(data, origin: origin).sniffingScripts(http: http)
+            try Task.checkCancellation()
+            guard subscriptions.contains(where: { $0.address == entry.address }), !restoringBackup else { throw CancellationError() }
+            try ImportedFiles.replace(data, at: entry.address)
+            await ScriptRuntime.shared.invalidateImportedFile(entry.address)
+            keep(value, for: entry)
+        } else {
+            let prepared = try await LocalSourceLibrary.shared.prepareReplacement(selection.urls, address: entry.address, http: http)
+            do {
+                try Task.checkCancellation()
+                let copies = try await prepared.subscriptions(http: http)
+                try Task.checkCancellation()
+                guard subscriptions.contains(where: { $0.address == entry.address }), !restoringBackup,
+                      prepared.records.count == 1, prepared.records[0].address.absoluteString == entry.address,
+                      copies.count == 1 else { throw CancellationError() }
+                try await LocalSourceLibrary.shared.commit(prepared)
+                keep(copies[0], for: entry)
+            } catch {
+                do { try await LocalSourceLibrary.shared.discard(prepared) }
+                catch { Diagnostics.shared.failure("imports", "discard uncommitted replacement files", error) }
+                throw error
+            }
+        }
+        saveSubscriptionList(); rebuildSubscription()
+        return "已更新“\(entry.title)”"
+    }
+    /// Both public entry points already own importing. Failures propagate to the
+    /// individual caller, without another task's mutable error/notice fields.
+    private func saveLocalSources(_ urls: [URL], group: LocalSourceGroup, containingFolder: URL? = nil,
+                                  name: String? = nil, importingCopy: Bool) async throws -> String {
+        try Task.checkCancellation()
         let scoped = (urls + (containingFolder.map { [$0] } ?? [])).filter { $0.startAccessingSecurityScopedResource() }
         defer { scoped.forEach { $0.stopAccessingSecurityScopedResource() } }
+        let prepared = try await LocalSourceLibrary.shared.prepare(urls, group: group, http: http, containingFolder: containingFolder,
+                                                                   name: name, importingCopy: importingCopy)
+        let copies: [Subscription]
         do {
-            let prepared = try await LocalSourceLibrary.shared.prepare(urls, group: group, http: http, containingFolder: containingFolder,
-                                                                       name: name, importingCopy: importingCopy)
-            let copies = try await prepared.subscriptions(http: http)
+            try Task.checkCancellation()
+            copies = try await prepared.subscriptions(http: http)
+            try Task.checkCancellation()
             try await LocalSourceLibrary.shared.commit(prepared)
-            for (record, copy) in zip(prepared.records, copies) {
-                let entry = SubscriptionEntry(address: record.address.absoluteString, name: record.name, enabled: false)
-                if let index = subscriptions.firstIndex(where: { $0.address == entry.address }) {
-                    subscriptions[index].name = record.name
-                } else { subscriptions.append(entry) }
-                localSourceGroups[entry.address] = group
-                keep(copy, for: entry)
-            }
-            let enabled = group == .python ? prepared.records : Array(prepared.records.prefix(1))
-            for record in enabled {
-                subscriptions = LocalSourcePolicy.setting(record.address.absoluteString, enabled: true, in: subscriptions, groups: localSourceGroups)
-            }
-            saveSubscriptionList(); rebuildSubscription()
-            notice = "已导入 \(copies.reduce(0) { $0 + $1.sites.count }) 个来源"
-        } catch { importError = error.localizedDescription }
+        } catch {
+            do { try await LocalSourceLibrary.shared.discard(prepared) }
+            catch { Diagnostics.shared.failure("imports", "discard uncommitted source files", error) }
+            throw error
+        }
+        for (record, copy) in zip(prepared.records, copies) {
+            let entry = SubscriptionEntry(address: record.address.absoluteString, name: record.name, enabled: false)
+            if let index = subscriptions.firstIndex(where: { $0.address == entry.address }) {
+                subscriptions[index].name = record.name
+            } else { subscriptions.append(entry) }
+            localSourceGroups[entry.address] = group
+            keep(copy, for: entry)
+        }
+        let enabled = group == .python ? prepared.records : Array(prepared.records.prefix(1))
+        for record in enabled {
+            subscriptions = LocalSourcePolicy.setting(record.address.absoluteString, enabled: true, in: subscriptions, groups: localSourceGroups)
+        }
+        saveSubscriptionList(); rebuildSubscription()
+        return "已导入 \(copies.reduce(0) { $0 + $1.sites.count }) 个来源"
     }
     func importSourceAddresses(_ text: String, group: LocalSourceGroup, name: String? = nil) async {
         let addresses = text.split(whereSeparator: { $0.isNewline }).map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -550,13 +671,17 @@ import TVCore
         guard !importing else { return }
         importing = true; importError = nil
         defer { importing = false }
-        await fetch(managedSubscriptions(in: group).filter(\.enabled))
+        let entries = managedSubscriptions(in: group).filter(\.enabled)
+        await fetch(entries)
+        let failures = entries.compactMap { entry in subscriptionErrors[entry.address].map { entry.title + "：" + $0 } }
+        importError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
     func refreshSource(_ entry: SubscriptionEntry) async {
         guard !importing else { return }
         importing = true; importError = nil
         defer { importing = false }
         await fetch([entry])
+        importError = subscriptionErrors[entry.address]
     }
     func moveManagedSubscription(_ entry: SubscriptionEntry, by offset: Int) {
         guard !restoringBackup, !importing, offset != 0 else { return }
@@ -846,16 +971,15 @@ import TVCore
         PlaybackSession.current?.stop()
         #endif
     }
-    /// Favorites, Continue Watching, subscriptions and the viewer's pins, hides and order follow them to their other
+    /// Favorites, Continue Watching, subscriptions and the viewer's hides and order follow them to their other
     /// devices. Continue Watching changes every few seconds while a video plays, so it waits longer between writes.
     private func setUpCloudSync() {
         guard let sync = cloudSync else { return }
-        let favorites = favorites, history = playbackHistory, pinned = pinnedSources, hidden = hiddenSources, order = sourceOrder
+        let favorites = favorites, history = playbackHistory, hidden = hiddenSources, order = sourceOrder
         sync.register("favorites", current: { favorites.syncValues }, apply: { favorites.adopt($0) })
         sync.register("history", delay: .seconds(30), current: { Dictionary(history.entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }) },
                       apply: { history.adopt($0.map(\.value)) })
         sync.register("subscriptions", current: { [weak self] in self?.syncedSubscriptions ?? [:] }, apply: { [weak self] in self?.adoptSubscriptions($0) })
-        sync.register("pinnedSources", current: { CloudSync.ranks(pinned.savedKeys) }, apply: { pinned.adopt(CloudSync.ordered($0)) })
         sync.register("hiddenSources", current: { Dictionary(hidden.savedKeys.map { ($0, true) }, uniquingKeysWith: { first, _ in first }) },
                       apply: { hidden.adopt($0.sorted { ($0.stamp, $0.id) < ($1.stamp, $1.id) }.map(\.id)) })
         sync.register("sourceOrder", current: { CloudSync.ranks(order.savedKeys) }, apply: { order.adopt(CloudSync.ordered($0)) })
@@ -863,10 +987,17 @@ import TVCore
         sync.register("sourceOrderOn", current: { order.enabled ? ["on": true] : [:] }, apply: { if order.enabled == $0.isEmpty { order.enabled = !$0.isEmpty } })
         favorites.onChange = { sync.changed("favorites") }
         history.onChange = { sync.changed("history") }
-        pinned.onChange = { sync.changed("pinnedSources") }
         hidden.onChange = { sync.changed("hiddenSources") }
         order.onChange = { sync.changed("sourceOrder"); sync.changed("sourceOrderOn") }
     }
+    /// Hidden choices immediately reach the retained source stacks and any active search.
+    private func sourceVisibilityChanged() {
+        subscriptionRevision &+= 1
+        searchModel.reset()
+        recommendationModel.reset()
+        MangaStore.shared.applyHiddenSources(hiddenSources)
+    }
+
     private var syncedSubscriptions: [String: SyncedSubscription] {
         Dictionary(subscriptions.enumerated().map { ($0.element.address, SyncedSubscription(entry: $0.element, rank: $0.offset, group: localSourceGroups[$0.element.address] ?? .subscription)) },
                    uniquingKeysWith: { first, _ in first })
@@ -899,7 +1030,8 @@ import TVCore
     /// Shows every enabled subscription that has a copy, merged in list order.
     private func rebuildSubscription(resetting: Bool = true) {
         if resetting { cancelResume(); searchModel.reset(); recommendationModel.reset() }
-        var enabledDocuments = subscriptions.filter(\.enabled).compactMap { documents[$0.address] }
+        let orderedEntries = managedSubscriptions(in: .subscription) + managedSubscriptions(in: .python)
+        var enabledDocuments = orderedEntries.filter(\.enabled).compactMap { documents[$0.address] }
         #if os(iOS)
         enabledDocuments = enabledDocuments.map(LocalEditionPolicy.importedCatalog)
         #endif
@@ -962,7 +1094,7 @@ import TVCore
         #endif
     }
     func searchVideos(_ title: String) {
-        guard let config = subscription else { return }
+        guard let config = subscription ?? LocalSearchManga.catalog else { return }
         let keyword = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !keyword.isEmpty else { return }
         let old = defaults.data(forKey: "videoSearchHistory").flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
@@ -1007,15 +1139,14 @@ import TVCore
         playFile(cloud, in: CloudFilesFolder(drive: drive, id: file.folderID, name: file.folderName, files: [cloud]))
     }
 
-    /// The Watch Now source row: pinned, then built-in, then the sources page's subscription order.
+    /// The Watch Now source row follows built-ins and the sources page's subscription order.
     func recommendationSites(_ config: Subscription) -> [Site] {
         let stamp = currentSiteListStamp()
         if stamp == siteListStamp, let cached = recommendationCache { return cached }
         let leading = automaticSites(config)
-        let pinned = leading.filter { pinnedSources.contains($0, origin: config.origin) }
-        let builtIn = leading.filter { $0.isBuiltIn && !pinnedSources.contains($0, origin: config.origin) }
+        let builtIn = leading.filter(\.isBuiltIn)
         let groups = sourceGroups(includeHidden: false)
-        let result = SourceGroups.homeRow(pinned: pinned, builtIn: builtIn, groups: groups)
+        let result = SourceGroups.homeRow(builtIn: builtIn, groups: groups)
         rememberSiteLists(stamp)
         recommendationCache = result
         return result
@@ -1033,19 +1164,24 @@ import TVCore
     }
 
     /// The home selector follows the subscription's own order, including changes
-    /// made in its website. Pins and search runtime priority belong to their own lists.
+    /// made in its website, without runtime priority changing the displayed order.
     func homeSourceSites(_ config: Subscription) -> [Site] {
-        SourceLists.browsable(config.sites, jarURL: config.spiderURL) {
+        let stamp = currentSiteListStamp()
+        if stamp == siteListStamp, let cached = homeSourceCache { return cached }
+        let sites = SourceLists.browsable(config.sites, jarURL: config.spiderURL) {
             hiddenSources.contains($0, origin: config.origin)
         }
+        rememberSiteLists(stamp)
+        homeSourceCache = sites
+        return sites
     }
 
-    /// The order the app picks: built-in sources, then `SourceStrategy`'s, with pinned sources first. Hidden sources stay out.
+    /// Built-in sources followed by subscription order. Hidden sources stay out.
     func automaticSites(_ config: Subscription) -> [Site] {
         let stamp = currentSiteListStamp()
         if stamp == siteListStamp, let cached = automaticCache { return cached }
         let sites = SourceLists.browsable(config.sites, jarURL: config.spiderURL) { hiddenSources.contains($0, origin: config.origin) }
-        let arranged = pinnedSources.arrange(sites.filter(\.isBuiltIn) + sites.filter { !$0.isBuiltIn }, origin: config.origin)
+        let arranged = sites.filter(\.isBuiltIn) + sites.filter { !$0.isBuiltIn }
         rememberSiteLists(stamp)
         automaticCache = arranged
         return arranged
@@ -1058,6 +1194,7 @@ import TVCore
         automaticCache = nil
         orderedCache = nil
         recommendationCache = nil
+        homeSourceCache = nil
         groupsCache = [:]
     }
 
@@ -1077,13 +1214,12 @@ import TVCore
         sourceOrder.save(sites, origin: config.origin)
     }
 
-    /// The sources page's sections: pinned, built-in, then one per subscription.
+    /// The sources page's sections: built-in, then one per subscription.
     func sourceGroups(includeHidden: Bool) -> [SourceGroup] {
         let stamp = currentSiteListStamp()
         if stamp == siteListStamp, let cached = groupsCache[includeHidden] { return cached }
         guard let config = subscription else { return [] }
-        let pins = pinnedSources.arrange(config.sites, origin: config.origin).filter { pinnedSources.contains($0, origin: config.origin) }
-        var groups = SourceGroups.make(entries: subscriptions, documents: documents, builtIns: config.sites.filter(\.isBuiltIn), builtInOrigin: config.origin, mergedSites: config.sites, pinOrder: pins, userHidden: { hiddenSources.contains($0, origin: config.origin) }, includeHidden: includeHidden, jarURL: config.spiderURL)
+        var groups = SourceGroups.make(entries: subscriptions, documents: documents, builtIns: config.sites.filter(\.isBuiltIn), builtInOrigin: config.origin, mergedSites: config.sites, userHidden: { hiddenSources.contains($0, origin: config.origin) }, includeHidden: includeHidden, jarURL: config.spiderURL)
         // The viewer's own order, while it is on, orders the sources inside each group too.
         if sourceOrder.enabled { groups = sourceOrder.arrange(groups, origin: config.origin) }
         rememberSiteLists(stamp)
@@ -1104,6 +1240,7 @@ import TVCore
                                 resumePosition: Double? = nil) -> Channel {
         var context = PlaybackHistoryContext(origin: client.origin, site: client.site, video: video, episode: episode)
         context.historyScope = historyScope ?? ""
+        context.danmakuSelection = playbackHistory.danmakuSelection(for: context)
         if resolved.playback?.reading != nil, resumePosition != 0 {
             context.readingProgress = visibleHistory.first {
                 PlaybackHistoryContext.sourceIdentity($0.context.origin) == PlaybackHistoryContext.sourceIdentity(context.origin) &&
@@ -1217,24 +1354,138 @@ import TVCore
         }
     }
 
-    func cancelEpisodeSelection() {
+    @discardableResult func cancelEpisodeSelection() -> Task<Void, Never>? {
+        let previous = episodeTask
         episodeRequest = UUID()
         episodeTask?.cancel(); episodeTask = nil; resolvingEpisode = nil
+        return previous
     }
+
+    func waitForEpisodeSelection() async { let task = episodeTask; await task?.value }
 
     /// Resumes a watched title. Choosing another title while one is still being prepared switches
     /// to it: the earlier request is cancelled, which also stops its plugin call.
     func resume(_ entry: PlaybackHistoryEntry, mode: PlaybackResumeMode = .resume) {
         guard entry.context.libraryScope == historyScope else { error = "订阅已切换，请刷新观看记录"; return }
         guard historySourceEnabled(entry.context) else { error = L10n.text("This history source is no longer in the current subscription. Restore that subscription to continue."); return }
-        resumeTask?.cancel()
-        resumingHistoryID = entry.id
-        resumeTask = Task { await resumeHistory(entry, mode: mode) }
+        if let preparation = historyPlaybackPreparation, preparation.entry == entry, preparation.mode == mode,
+           preparation.failure == nil, preparation.handoff == nil { return }
+        let inheritedPresentationID = playerPresentationLifetime.flatMap { $0.canPresent ? $0.id : nil }
+        changesPlayerPresentationContent = true
+        playing = nil
+        changesPlayerPresentationContent = false
+        let request = beginHistoryResume(entry)
+        #if os(macOS)
+        resumeTask = Task { await resolveHistoryResume(entry, mode: mode, request: request) }
+        #else
+        historyPlaybackPreparation = HistoryPlaybackPreparation(id: request, entry: entry, mode: mode, startedAt: Date(),
+                                                                presentationID: inheritedPresentationID)
+        // Its appearance starts the provider task, so even a cold plugin cannot
+        // gate the first player screen or its Close button.
+        Diagnostics.shared.record(.info, "player.startup", "entry=history request=\(request) stage=presentation-requested")
+        #endif
     }
 
-    func cancelResume() {
+    func cancelResume(dismissingPresentation: Bool = true) {
+        if dismissingPresentation, historyPlaybackPreparation != nil { retirePlayerPresentation() }
+        resumeRequest = UUID()
         resumeTask?.cancel(); resumeTask = nil
         resumingHistoryID = nil
+        historyPlaybackPreparation = nil
+    }
+
+    private func beginHistoryResume(_ entry: PlaybackHistoryEntry) -> UUID {
+        cancelResume(dismissingPresentation: false)
+        resumingHistoryID = entry.id
+        return resumeRequest
+    }
+
+    private func retirePlayerPresentation() {
+        guard let lifetime = playerPresentationLifetime, !lifetime.finished else { return }
+        lifetime.close()
+        retiringHistoryPresentationID = lifetime.id
+    }
+
+    /// Own the cover before any preparation task starts. The initial slot must
+    /// still match; a cancelled pre-appearance cover cannot adopt a later tap.
+    func playerPresentationAppeared(_ lifetime: PlayerPresentationLifetime, initialPreparationID: UUID?, initialChannel: Channel?) {
+        guard lifetime.canPresent, retiringHistoryPresentationID == nil else { return }
+        if let current = playerPresentationLifetime {
+            if current === lifetime { return }
+            lifetime.close()
+            return
+        }
+        playerPresentationLifetime = lifetime
+        if let initialPreparationID {
+            guard let preparation = historyPlaybackPreparation, preparation.id == initialPreparationID,
+                  preparation.isPresented else { retirePlayerPresentation(); return }
+            historyPlaybackPreparation?.presentationID = lifetime.id
+        } else {
+            guard let initialChannel, playing == initialChannel, historyPlaybackPreparation == nil else { retirePlayerPresentation(); return }
+        }
+    }
+
+    func dismissPlayerPresentation(_ lifetime: PlayerPresentationLifetime) {
+        guard lifetime.canPresent, retiringHistoryPresentationID == nil else { return }
+        guard playerPresentationLifetime === lifetime else { lifetime.close(); return }
+        if historyPlaybackPreparation?.handoff != nil { return }
+        retirePlayerPresentation()
+        cancelResume(dismissingPresentation: false)
+        playing = nil
+    }
+
+    func historyPreparation(in lifetime: PlayerPresentationLifetime) -> HistoryPlaybackPreparation? {
+        guard lifetime.canPresent, playerPresentationLifetime === lifetime,
+              retiringHistoryPresentationID == nil, let preparation = historyPlaybackPreparation,
+              preparation.presentationID == lifetime.id, preparation.isPresented else { return nil }
+        return preparation
+    }
+
+    /// Called by the preparation content in the existing player cover.
+    func presentHistoryPlayback(_ request: UUID, presentationID: UUID) {
+        guard let preparation = historyPlaybackPreparation, preparation.id == request, resumeRequest == request,
+              preparation.failure == nil, preparation.handoff == nil, resumeTask == nil,
+              retiringHistoryPresentationID == nil, preparation.presentationID == presentationID,
+              let lifetime = playerPresentationLifetime, lifetime.id == presentationID, lifetime.canPresent else { return }
+        Diagnostics.shared.record(.info, "player.startup", "entry=history request=\(request) stage=presentation-visible elapsed=\(Date().timeIntervalSince(preparation.startedAt))")
+        resumeTask = Task { await resolveHistoryResume(preparation.entry, mode: preparation.mode, request: request) }
+    }
+
+    func historyPlaybackPresentationDismissed(_ lifetime: PlayerPresentationLifetime) {
+        let presentationID = lifetime.id
+        // Complete before clearing request state: cancellation must never retire
+        // this already-finished ID and wait for an onDismiss that cannot recur.
+        lifetime.finish()
+        if retiringHistoryPresentationID == presentationID { retiringHistoryPresentationID = nil }
+        if playerPresentationLifetime === lifetime { playerPresentationLifetime = nil }
+        guard let preparation = historyPlaybackPreparation, preparation.presentationID == presentationID else { return }
+        guard resumeRequest == preparation.id, preparation.entry.context.libraryScope == historyScope,
+              historySourceEnabled(preparation.entry.context), let channel = preparation.handoff else {
+            cancelResume(dismissingPresentation: false)
+            return
+        }
+        resumeTask = nil
+        playing = channel
+    }
+
+    private func completeHistoryResume(_ channel: Channel, request: UUID) {
+        guard resumeRequest == request else { return }
+        if let preparation = historyPlaybackPreparation, preparation.id == request, preparation.presentationID != nil,
+           channel.playback?.reading != nil || listeningQueue(for: channel) != nil {
+            historyPlaybackPreparation?.handoff = channel
+            retirePlayerPresentation()
+            return
+        }
+        // The channel observer invalidates old work, but this task has completed
+        // its source resolution and must not cancel itself during handoff.
+        resumeTask = nil
+        playing = channel
+    }
+
+    private func ownsHistoryResume(_ entry: PlaybackHistoryEntry, request: UUID, previousPlayback: Channel?,
+                                   subscriptionOrigin: URL?, selectedScope: String?) -> Bool {
+        !Task.isCancelled && resumeRequest == request && playing == previousPlayback &&
+            subscription?.origin == subscriptionOrigin && historyScope == selectedScope && historySourceEnabled(entry.context)
     }
 
     /// The source a watched title came from. Any enabled subscription can hold it: it is found by its own origin
@@ -1255,25 +1506,44 @@ import TVCore
     }
 
     func resumeHistory(_ entry: PlaybackHistoryEntry, mode: PlaybackResumeMode = .resume) async {
+        guard !Task.isCancelled else { return }
         guard entry.context.libraryScope == historyScope else { error = "订阅已切换，请刷新观看记录"; return }
         guard historySourceEnabled(entry.context) else { error = L10n.text("This history source is no longer in the current subscription. Restore that subscription to continue."); return }
-        let sourceStarted = Date(), startupRequest = UUID()
+        let request = beginHistoryResume(entry)
+        await resolveHistoryResume(entry, mode: mode, request: request)
+    }
+
+    private func resolveHistoryResume(_ entry: PlaybackHistoryEntry, mode: PlaybackResumeMode, request: UUID) async {
+        guard !Task.isCancelled, resumeRequest == request else { return }
+        let sourceStarted = Date(), startupRequest = request
         Diagnostics.shared.record(.info, "player.startup", "entry=history request=\(startupRequest) stage=resolve-begin resume=\(mode == .resume)")
         defer { Diagnostics.shared.record(.info, "player.startup", "entry=history request=\(startupRequest) stage=resolve-end elapsed=\(Date().timeIntervalSince(sourceStarted)) cancelled=\(Task.isCancelled)") }
-        resumingHistoryID = entry.id
-        defer { if resumingHistoryID == entry.id, !Task.isCancelled { resumingHistoryID = nil } }
-        if entry.context.sourceKey == CloudFiles.sourceKey {
-            return resumeFile(PlaybackHistoryEntry(context: entry.context, position: entry.position(for: mode), duration: entry.duration, updatedAt: entry.updatedAt))
+        defer {
+            if resumeRequest == request {
+                resumingHistoryID = nil
+                resumeTask = nil
+                if historyPlaybackPreparation?.failure == nil && historyPlaybackPreparation?.handoff == nil {
+                    historyPlaybackPreparation = nil
+                }
+            }
         }
-        guard var client = historyClient(entry) else {
-            error = L10n.text("This history source is no longer in the current subscription. Restore that subscription to continue.")
+        if entry.context.sourceKey == CloudFiles.sourceKey {
+            resumeTask = nil
+            resumeFile(PlaybackHistoryEntry(context: entry.context, position: entry.position(for: mode), duration: entry.duration, updatedAt: entry.updatedAt))
+            if resumeRequest == request, historyPlaybackPreparation?.id == request, let message = error {
+                error = nil
+                historyPlaybackPreparation?.failure = message
+            }
             return
         }
-        let site = client.site
         let subscriptionOrigin = subscription?.origin
         let selectedScope = historyScope
         let previousPlayback = playing
         do {
+            guard entry.context.libraryScope == historyScope, var client = historyClient(entry) else {
+                throw TVError.unsupported(L10n.text("This history source is no longer in the current subscription. Restore that subscription to continue."))
+            }
+            let site = client.site
             var htmlResolution = false
             #if os(iOS)
             if entry.context.origin == LocalMediaLibrary.origin,
@@ -1287,6 +1557,8 @@ import TVCore
             // Plugin/API sources resolve an episode again. Direct-file APIs must refresh
             // their detail first so an expiring media address never becomes a resume shortcut.
             var video = try await client.detail(entry.context.videoID, cached: site.type == 3 || site.type == 4)
+            guard ownsHistoryResume(entry, request: request, previousPlayback: previousPlayback,
+                                    subscriptionOrigin: subscriptionOrigin, selectedScope: selectedScope) else { return }
             guard var episode = entry.context.episode(in: video.episodes) else {
                 throw TVError.unsupported(L10n.text("The saved episode is no longer available from this source. Choose an episode again."))
             }
@@ -1294,28 +1566,36 @@ import TVCore
             do { channel = try await client.playback(episode) }
             catch {
                 try Task.checkCancellation()
+                guard ownsHistoryResume(entry, request: request, previousPlayback: previousPlayback,
+                                        subscriptionOrigin: subscriptionOrigin, selectedScope: selectedScope) else { return }
                 // The HTML resolver already refetched its original page with
                 // a bounded deadline. Retrying its identical cached catalog
                 // doubles a failed/source-verification wait without new input.
                 if htmlResolution { throw error }
                 video = try await client.detail(entry.context.videoID)
+                guard ownsHistoryResume(entry, request: request, previousPlayback: previousPlayback,
+                                        subscriptionOrigin: subscriptionOrigin, selectedScope: selectedScope) else { return }
                 guard let refreshed = entry.context.episode(in: video.episodes) else { throw error }
                 episode = refreshed
                 channel = try await client.playback(refreshed)
             }
-            guard !Task.isCancelled, playing == previousPlayback, subscription?.origin == subscriptionOrigin, historyScope == selectedScope,
-                  historySourceEnabled(entry.context) else { return }
+            guard ownsHistoryResume(entry, request: request, previousPlayback: previousPlayback,
+                                    subscriptionOrigin: subscriptionOrigin, selectedScope: selectedScope) else { return }
             Diagnostics.shared.record(.info, "player.startup", "entry=history request=\(startupRequest) stage=source-ready elapsed=\(Date().timeIntervalSince(sourceStarted))")
             // A source whose details carry no poster keeps the one saved with the entry.
             // Page progress is separate from video seconds. Nil lets the reader resume its saved
             // page; zero remains the explicit replay command for either kind of media.
             let position: Double? = channel.playback?.reading != nil && mode == .resume && !entry.completed ? nil : entry.position(for: mode)
-            playing = catalogChannel(channel, video: video.keepingPoster(entry.context.poster, headers: entry.context.posterHeaders),
-                                     episode: episode, client: client, resumePosition: position)
+            let resolved = catalogChannel(channel, video: video.keepingPoster(entry.context.poster, headers: entry.context.posterHeaders),
+                                          episode: episode, client: client, resumePosition: position)
+            completeHistoryResume(resolved, request: request)
         } catch {
-            guard !(error is CancellationError), !Task.isCancelled else { return }
+            guard !(error is CancellationError), ownsHistoryResume(entry, request: request, previousPlayback: previousPlayback,
+                                                                  subscriptionOrigin: subscriptionOrigin, selectedScope: selectedScope) else { return }
             Diagnostics.shared.failure("catalog", "resume source=\(entry.context.sourceKey)", error)
-            self.error = L10n.text("Unable to resume playback: %@", error.localizedDescription)
+            let message = L10n.text("Unable to resume playback: %@", error.localizedDescription)
+            if historyPlaybackPreparation?.id == request { historyPlaybackPreparation?.failure = message }
+            else { self.error = message }
         }
     }
 }

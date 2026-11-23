@@ -10,10 +10,13 @@ public enum PosterPresentation {
         return "catalog:" + parts.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
     }
     public static func imageURL(_ candidate: URL?, excluding mediaAddresses: [String] = []) -> URL? {
-        guard let candidate, ["http", "https"].contains(candidate.scheme?.lowercased() ?? ""),
+        guard let candidate, !mediaAddresses.contains(candidate.absoluteString) else { return nil }
+        if candidate.scheme?.lowercased() == "data" {
+            return PosterResource.inlineImageData(for: candidate) == nil ? nil : candidate
+        }
+        guard ["http", "https"].contains(candidate.scheme?.lowercased() ?? ""),
               let host = candidate.host?.lowercased(), !host.isEmpty,
-              candidate.user == nil, candidate.password == nil,
-              !mediaAddresses.contains(candidate.absoluteString) else { return nil }
+              candidate.user == nil, candidate.password == nil else { return nil }
         let path = candidate.path.lowercased()
         let leaf = candidate.lastPathComponent.lowercased()
         guard !["null", "nil", "none", "undefined", "(null)"].contains(leaf),
@@ -56,7 +59,7 @@ public enum PosterPresentation {
         return Video(id: video.id, name: video.name, poster: poster, posterHeaders: imageHeaders(headers), year: video.year,
                      remarks: video.remarks, synopsis: video.synopsis, episodes: video.episodes, category: video.category,
                      action: video.action, folderCategoryID: video.isFolder ? video.folderCategoryID : nil,
-                     folderFilters: video.folderFilters, area: video.area, director: video.director, actor: video.actor)
+                     folderFilters: video.folderFilters, area: video.area, director: video.director, actor: video.actor, panShare: video.panShare)
     }
 }
 

@@ -32,6 +32,10 @@ public struct LocalSourceRecord: Codable, Hashable, Identifiable, Sendable {
 public struct PreparedLocalSources: Sendable {
     public let records: [LocalSourceRecord]
     fileprivate let directory: URL
+    fileprivate var createdDirectories: [URL] = []
+    /// A replacement is committed only while its original record still exists
+    /// unchanged. A deleted or independently updated source cannot be resurrected.
+    fileprivate var replacingRecord: LocalSourceRecord?
     /// Calls the existing embedded Node bundle protocol, or publishes each validated Python entry.
     /// Commit only after all runtime configurations load, so failed refreshes retain their old copy.
     public func subscriptions(http: HTTPClient) async throws -> [Subscription] {
@@ -144,12 +148,28 @@ public actor LocalSourceLibrary {
         try JSONEncoder().encode(next).write(to: directory.appendingPathComponent("library.json"), options: .atomic)
     }
     public func commit(_ prepared: PreparedLocalSources) throws {
+        try Task.checkCancellation()
         var saved = try records()
+        if let original = prepared.replacingRecord {
+            guard saved.first(where: { $0.id == original.id }) == original,
+                  prepared.records.count == 1, prepared.records[0].id == original.id else {
+                throw failure("此来源已移除或更新，请重新选择要更新的来源；保留当前版本")
+            }
+        }
         for value in prepared.records {
             if let at = saved.firstIndex(where: { $0.id == value.id }) { saved[at] = value } else { saved.append(value) }
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(saved).write(to: directory.appendingPathComponent("library.json"), options: .atomic)
+    }
+    /// A failed/cancelled import may discard only directories it actually created.
+    /// Reimports and saved/committed versions are never part of this rollback.
+    public func discard(_ prepared: PreparedLocalSources) throws {
+        guard prepared.directory.standardizedFileURL == directory.standardizedFileURL else { return }
+        let referenced = Set(try records().map { $0.directory(in: directory).standardizedFileURL })
+        for created in prepared.createdDirectories where !referenced.contains(created.standardizedFileURL) {
+            if FileManager.default.fileExists(atPath: created.path) { try FileManager.default.removeItem(at: created) }
+        }
     }
     public func remove(address: String) throws {
         var saved = try records()
@@ -192,6 +212,30 @@ public actor LocalSourceLibrary {
         }
         return try await prepare(inputs, group: record.group, http: http, selectedEntry: record.entry, refreshingID: record.id)
     }
+    /// Files supplies app-owned copies. Validate them under the existing identity
+    /// and keep the old index active until the caller has loaded the new runtime.
+    public func prepareReplacement(_ files: [URL], address: String, http: HTTPClient) async throws -> PreparedLocalSources {
+        try Task.checkCancellation()
+        guard let record = try records().first(where: { $0.address.absoluteString == address }) else {
+            throw failure("此来源已不存在，请重新选择要更新的来源")
+        }
+        guard record.input.isEmpty || record.input.contains(where: \.isFileURL) else {
+            throw failure("此来源使用远程地址，请通过更新检查远程版本")
+        }
+        var prepared = try await prepare(files, group: record.group, http: http, selectedEntry: record.entry,
+                                         refreshingID: record.id, importingCopy: true)
+        do {
+            try Task.checkCancellation()
+            guard prepared.records.count == 1, prepared.records[0].id == record.id else {
+                throw failure("请选择此来源的完整更新文件；保留原有版本")
+            }
+            prepared.replacingRecord = record
+            return prepared
+        } catch {
+            try? discard(prepared)
+            throw error
+        }
+    }
     /// Automatic checks may only follow remote origins. A local copy (including a
     /// restored portable copy) never regains access to its old provider implicitly.
     public func refreshIfChanged(address: String, http: HTTPClient, remoteOnly: Bool = true) async throws -> PreparedLocalSources? {
@@ -205,10 +249,17 @@ public actor LocalSourceLibrary {
     public func prepare(_ selectedInputs: [URL], group: LocalSourceGroup, http: HTTPClient = HTTPClient(), selectedEntry: String? = nil, containingFolder: URL? = nil, refreshingID: String? = nil, name proposedName: String? = nil,
                         importingCopy: Bool = false) async throws -> PreparedLocalSources {
         var inputs = selectedInputs
+        guard !inputs.isEmpty, inputs.count <= 100 else { throw failure("每次可导入 1 至 100 个文件或地址") }
+        let bundleMembers = ["index.js", "index.js.md5", "index.config.js", "index.config.js.md5"]
+        let copiedBundleFiles = importingCopy && inputs.count > 1
         if importingCopy {
-            guard containingFolder == nil, inputs.count == 1, let file = inputs.first, file.isFileURL,
-                  (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-                throw failure("请选择单个文件，不支持导入文件夹；多文件来源请压缩为 ZIP")
+            guard containingFolder == nil, !inputs.isEmpty, inputs.allSatisfy({ file in
+                file.isFileURL && (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+            }) else {
+                throw failure("请选择文件，不支持导入文件夹；多文件来源请压缩为 ZIP")
+            }
+            if copiedBundleFiles, !Set(bundleMembers).isSubset(of: Set(inputs.map(\.lastPathComponent))) {
+                throw failure("请选择一个完整 ZIP，或同时选择 index.js、index.config.js 和各自的 MD5 配套文件")
             }
         }
         if selectedInputs.count == 1, let file = selectedInputs.first, file.isFileURL,
@@ -220,8 +271,6 @@ public actor LocalSourceLibrary {
             }
             inputs = [folder]
         }
-        guard !inputs.isEmpty, inputs.count <= 100 else { throw failure("每次可导入 1 至 100 个文件或地址") }
-        let bundleMembers = ["index.js", "index.js.md5", "index.config.js", "index.config.js.md5"]
         let zipFiles: [String: Data]?
         if inputs.count == 1, let file = inputs.first, file.isFileURL, file.pathExtension.lowercased() == "zip" {
             zipFiles = try LocalSourceZIP.files(readLocal(file, max: 128 << 20)).filter { name, _ in
@@ -230,10 +279,10 @@ public actor LocalSourceLibrary {
             }
         } else { zipFiles = nil }
         let pythonZip = group == .python && zipFiles != nil && !zipFiles!.keys.contains { $0 == "index.js" || $0.hasSuffix("/index.js") }
-        let isBundleInput = !pythonZip && inputs.count == 1 && inputs.contains { input in
+        let isBundleInput = copiedBundleFiles || (!pythonZip && inputs.count == 1 && inputs.contains { input in
             ["zip", "md5"].contains(input.pathExtension.lowercased()) || bundleMembers.contains(input.lastPathComponent.lowercased())
                 || (input.isFileURL && FileManager.default.fileExists(atPath: input.appendingPathComponent("index.js").path))
-        }
+        })
         let isPythonFiles = group == .python && !isBundleInput
         let previous = try records()
         let identityInput = inputs.map { input -> String in
@@ -271,7 +320,7 @@ public actor LocalSourceLibrary {
                             try merge(try localFiles(input, python: true), into: &files)
                         } else {
                             try merge([input.lastPathComponent: try readLocal(input, max: 8 << 20)], into: &files)
-                            if inputs.count == 1 { onlyEntry = input.lastPathComponent }
+                            if inputs.count == 1, onlyEntry == nil { onlyEntry = input.lastPathComponent }
                         }
                     } else if input.pathExtension.lowercased() == "py" {
                         try merge([input.lastPathComponent: try await remote(input, http: http, max: 8 << 20)], into: &files)
@@ -286,8 +335,18 @@ public actor LocalSourceLibrary {
             }
             guard !files.isEmpty, files.count <= 100, files.keys.allSatisfy({ $0.lowercased().hasSuffix(".py") && safePath($0) }) else { throw failure("请选择 Python 文件、包含脚本的 ZIP 或远程脚本 JSON") }
         } else {
-            guard inputs.count == 1, let input = inputs.first else { throw failure("每次请选择一个订阅包") }
-            if input.isFileURL {
+            guard let input = inputs.first, inputs.count == 1 || copiedBundleFiles else { throw failure("每次请选择一个订阅包") }
+            if copiedBundleFiles {
+                // Each selected URL is independently granted and copied by Files.
+                // Never infer or read siblings from a selected checksum's parent.
+                var remainingBytes = 128 << 20
+                for file in inputs {
+                    let limit = file.pathExtension.lowercased() == "md5" ? 4096 : 64 << 20
+                    let data = try readLocal(file, max: min(limit, remainingBytes))
+                    try merge([file.lastPathComponent: data], into: &files)
+                    remainingBytes -= data.count
+                }
+            } else if input.isFileURL {
                 if input.pathExtension.lowercased() == "zip" {
                     files = zipFiles ?? [:]
                     let roots = files.keys.filter { $0 == "index.js" || $0.hasSuffix("/index.js") }
@@ -351,7 +410,12 @@ public actor LocalSourceLibrary {
         if let refreshingID, let baseline = previous.first(where: { $0.id == refreshingID && $0.version == version }),
            storedVersionIsIntact(baseline),
            names.allSatisfy({ (try? Data(contentsOf: baseline.directory(in: directory).appendingPathComponent($0))) == files[$0] }) {
-            return PreparedLocalSources(records: [baseline], directory: directory)
+            let retained = importingCopy && (!baseline.input.isEmpty || baseline.bookmarks != nil)
+                ? LocalSourceRecord(id: baseline.id, group: baseline.group, format: baseline.format, version: baseline.version,
+                    entry: baseline.entry, input: [], bookmarks: nil, name: baseline.name,
+                    importedAt: baseline.importedAt, updatedAt: baseline.updatedAt)
+                : baseline
+            return PreparedLocalSources(records: [retained], directory: directory)
         }
         let staging = directory.appendingPathComponent(".staging-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
@@ -368,6 +432,12 @@ public actor LocalSourceLibrary {
         let manifest: [String: JSONValue] = ["format": .number(format == "python" ? 2 : 1), "engine": .string(format), "version": .string(version), "entries": .array(entries.map(JSONValue.string)), "sha256": .object(files.mapValues { .string(PluginChecksum.sha256($0)) })]
         try JSONEncoder().encode(manifest).write(to: staging.appendingPathComponent("manifest.json"))
         var prepared: [LocalSourceRecord] = []
+        var createdDirectories: [URL] = []
+        var delivered = false
+        defer {
+            // A later entry can fail before a PreparedLocalSources value exists.
+            if !delivered { createdDirectories.forEach { try? FileManager.default.removeItem(at: $0) } }
+        }
         for entry in selected {
             // Picker copy paths change on every selection. Content identity makes
             // identical re-imports stable without replacing a different same-named source.
@@ -402,10 +472,14 @@ public actor LocalSourceLibrary {
             if FileManager.default.fileExists(atPath: target.path) {
                 if storedVersionIsIntact(record), names.allSatisfy({ (try? Data(contentsOf: target.appendingPathComponent($0))) == files[$0] }) { try FileManager.default.removeItem(at: copy) }
                 else { let old = target.appendingPathExtension("damaged"); try? FileManager.default.removeItem(at: old); try FileManager.default.moveItem(at: target, to: old); do { try FileManager.default.moveItem(at: copy, to: target); try? FileManager.default.removeItem(at: old) } catch { try? FileManager.default.moveItem(at: old, to: target); throw error } }
-            } else { try FileManager.default.moveItem(at: copy, to: target) }
+            } else {
+                try FileManager.default.moveItem(at: copy, to: target)
+                createdDirectories.append(target)
+            }
             prepared.append(record)
         }
-        return PreparedLocalSources(records: prepared, directory: directory)
+        delivered = true
+        return PreparedLocalSources(records: prepared, directory: directory, createdDirectories: createdDirectories)
     }
     /// A matching remote MD5 proves only the script contents. Fast paths must also
     /// verify their companion files and the manifest, or a reported-success refresh

@@ -75,7 +75,14 @@ private struct LocalHTMLHomeWebView: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         let bridge = LocalHTMLHomeBridge(source: source, nativeAction: nativeAction)
         context.coordinator.bridge = bridge
-        do { try bridge.configure(configuration) }
+        do {
+            try bridge.configure(configuration)
+            guard let file = Bundle.main.url(forResource: "local-html-home-responsive", withExtension: "js"),
+                  let script = try? String(contentsOf: file, encoding: .utf8) else {
+                throw LocalHTMLHomeError("HTML 首页布局组件缺失，请重新安装完整安装包。")
+            }
+            configuration.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
         catch { DispatchQueue.main.async { failure = error.localizedDescription } }
         configuration.userContentController.add(context.coordinator, name: "localHomeNavigation")
         configuration.userContentController.addUserScript(WKUserScript(source: Self.navigationScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
@@ -86,8 +93,12 @@ private struct LocalHTMLHomeWebView: UIViewRepresentable {
         web.allowsBackForwardNavigationGestures = true
         context.coordinator.observe(web)
         bridge.attach(web)
-        // Read a managed file once per web view, never while scrolling changes dock state.
-        if source.isFile, let html = try? LocalHTMLHomeStore.load().html(for: source) { web.loadHTMLString(html, baseURL: nil) }
+        // A managed file provides WebCrypto's secure context. Restrict WebKit's
+        // read grant to that file; scrolling never reloads the document.
+        if source.isFile {
+            do { try bridge.loadLocalDocument(in: web) }
+            catch { DispatchQueue.main.async { failure = error.localizedDescription } }
+        }
         else if let address = source.address, let url = URL(string: address) { web.load(URLRequest(url: url)) }
         else { DispatchQueue.main.async { failure = "首页文件不可用，请重新导入或返回默认首页。" } }
         return web
@@ -204,10 +215,11 @@ private struct LocalHTMLHomeWebView: UIViewRepresentable {
                 remember(item, isRoot: true)
             } else if finishedDocument {
                 let remote = ["http", "https"].contains(webView.url?.scheme?.lowercased() ?? "")
+                let managedFile = webView.url?.isFileURL == true && bridge?.ownsDocument(webView.url) == true
                 // A Home link/reload legitimately creates another root item. A fresh
                 // about:blank document is not the imported HTML with the same URL.
                 let returnsToImportedItem = item != nil && knownRoot(item) == true
-                remember(item, isRoot: address == rootAddress && (remote || returnsToImportedItem))
+                remember(item, isRoot: address == rootAddress && (remote || managedFile || returnsToImportedItem))
             }
             updateRoot()
         }
@@ -250,7 +262,8 @@ private struct LocalHTMLHomeWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                      decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
             let scheme = action.request.url?.scheme?.lowercased() ?? ""
-            decisionHandler(["https", "http", "about", "data", "blob"].contains(scheme) ? .allow : .cancel)
+            let allowedFile = scheme == "file" && bridge?.ownsDocument(action.request.url) == true
+            decisionHandler(allowedFile || ["https", "http", "about", "data", "blob"].contains(scheme) ? .allow : .cancel)
         }
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
             guard active, action.sourceFrame.isMainFrame else { return nil }

@@ -13,41 +13,61 @@ public enum LocalDockLayout {
     public static var dockHeight: CGFloat { controlHeight + 2 * groupPadding }
 
     public struct Metrics: Equatable, Sendable {
+        public let containerWidth: CGFloat
+        public let mainCount: Int
+        public let accessoryCount: Int
         public let buttonWidth: CGFloat
         public let buttonSpacing: CGFloat
         public let groupSpacing: CGFloat
-    }
+        public let horizontalPadding: CGFloat
+        public let groupHorizontalPadding: CGFloat
+        public let stacked: Bool
 
-    public static func metrics(availableWidth: CGFloat) -> Metrics {
-        let compact = availableWidth < 336
-        let buttonSpacing: CGFloat = compact ? 2 : 4
-        let groupSpacing: CGFloat = compact ? 8 : 12
-        let width = (availableWidth - 16 - buttonSpacing * 4 - groupSpacing) / 6
-        return Metrics(buttonWidth: max(44, min(50, width)), buttonSpacing: buttonSpacing, groupSpacing: groupSpacing)
-    }
+        public var height: CGFloat { stacked ? 2 * dockHeight + groupSpacing : dockHeight }
 
-    public static func inset(showsMusic: Bool) -> CGFloat {
-        topPadding + dockHeight + bottomPadding + (showsMusic ? musicHeight + musicSpacing : 0)
-    }
-
-    /// The dock has fixed control sizes; its touch regions can be resolved in the
-    /// same layout pass. Feeding measured anchors back through @State leaves the
-    /// first music-strip frame empty, and can animate old hit frames after scrolling.
-    public static func touchFrames(containerWidth: CGFloat, showsMusic: Bool) -> [CGRect] {
-        let availableWidth = max(0, containerWidth - 2 * horizontalPadding)
-        let metrics = metrics(availableWidth: availableWidth)
-        let leftWidth = 4 * metrics.buttonWidth + 3 * metrics.buttonSpacing + 2 * groupPadding
-        let rightWidth = 2 * metrics.buttonWidth + metrics.buttonSpacing + 2 * groupPadding
-        let occupied = leftWidth + metrics.groupSpacing + rightWidth
-        let left = horizontalPadding + max(0, (availableWidth - occupied) / 2)
-        let top = topPadding + (showsMusic ? musicHeight + musicSpacing : 0)
-        var frames: [CGRect] = []
-        if showsMusic {
-            frames.append(CGRect(x: horizontalPadding, y: topPadding, width: availableWidth, height: musicHeight))
+        public func inset(showsMusic: Bool) -> CGFloat {
+            topPadding + height + bottomPadding + (showsMusic ? musicHeight + musicSpacing : 0)
         }
-        frames.append(CGRect(x: left, y: top, width: leftWidth, height: dockHeight))
-        frames.append(CGRect(x: left + leftWidth + metrics.groupSpacing, y: top, width: rightWidth, height: dockHeight))
-        return frames
+
+        /// First-frame hit ownership uses the same dimensions as the two rendered groups.
+        public func touchFrames(showsMusic: Bool, rightToLeft: Bool = false) -> [CGRect] {
+            let availableWidth = max(0, containerWidth - 2 * horizontalPadding)
+            func width(_ count: Int) -> CGFloat {
+                CGFloat(count) * buttonWidth + CGFloat(count - 1) * buttonSpacing + 2 * groupHorizontalPadding
+            }
+            let main = width(mainCount), accessory = width(accessoryCount)
+            let top = topPadding + (showsMusic ? musicHeight + musicSpacing : 0)
+            let start = (containerWidth - main - groupSpacing - accessory) / 2
+            let mainX = stacked ? (containerWidth - main) / 2 : (rightToLeft ? start + accessory + groupSpacing : start)
+            let accessoryX = stacked ? (containerWidth - accessory) / 2 : (rightToLeft ? start : start + main + groupSpacing)
+            var frames = [CGRect]()
+            if showsMusic {
+                frames.append(CGRect(x: horizontalPadding, y: topPadding, width: availableWidth, height: musicHeight))
+            }
+            frames.append(CGRect(x: mainX, y: top, width: main, height: dockHeight))
+            frames.append(CGRect(x: accessoryX, y: stacked ? top + dockHeight + groupSpacing : top, width: accessory, height: dockHeight))
+            return frames
+        }
+    }
+
+    public static func metrics(containerWidth: CGFloat, mainCount: Int, accessoryCount: Int) -> Metrics {
+        let count = mainCount + accessoryCount
+        let minimumButtons = CGFloat(count) * 44
+        let gaps = CGFloat(count - 2)
+        let stacked = containerWidth < minimumButtons + 12
+        let regular = stacked || containerWidth >= minimumButtons + 2 * horizontalPadding + 4 * groupPadding + gaps * 4 + 12
+        let compact = !regular && containerWidth >= minimumButtons + 12 + 4 * groupPadding + gaps + 4
+        let outer: CGFloat = regular ? horizontalPadding : compact ? 6 : 2
+        let inner: CGFloat = regular || compact ? groupPadding : 1
+        let buttonSpacing: CGFloat = regular ? 4 : compact ? 1 : 0
+        let groupSpacing: CGFloat = regular ? 12 : 4
+        let rowCount = stacked ? max(mainCount, accessoryCount) : count
+        let overhead = 2 * outer + (stacked ? 2 * inner : 4 * inner + groupSpacing)
+        let rowGaps = stacked ? CGFloat(rowCount - 1) : gaps
+        let buttonWidth = max(0, min(50, (containerWidth - overhead - rowGaps * buttonSpacing) / CGFloat(rowCount)))
+        return Metrics(containerWidth: containerWidth, mainCount: mainCount, accessoryCount: accessoryCount,
+                       buttonWidth: buttonWidth, buttonSpacing: buttonSpacing, groupSpacing: groupSpacing,
+                       horizontalPadding: outer, groupHorizontalPadding: inner, stacked: stacked)
     }
 
     public static func accessoryBottom(containerBottom: CGFloat, safeAreaBottom: CGFloat,

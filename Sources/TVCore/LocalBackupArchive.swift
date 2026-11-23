@@ -2,9 +2,17 @@ import Foundation
 import CryptoKit
 
 public enum LocalBackupCategory: String, CaseIterable, Codable, Identifiable, Sendable {
-    case history, favorites, settings, sources
+    case history, favorites, settings, sources, liveSubscriptions
     public var id: String { rawValue }
-    public var title: String { switch self { case .history: "观看记录"; case .favorites: "收藏"; case .settings: "应用设置"; case .sources: "订阅与 Python 来源文件" } }
+    public var title: String {
+        switch self {
+        case .history: "观看记录"
+        case .favorites: "收藏"
+        case .settings: "应用设置"
+        case .sources: "订阅与 Python 来源文件"
+        case .liveSubscriptions: "直播订阅"
+        }
+    }
 }
 
 public struct LocalBackupSource: Codable, Equatable, Sendable {
@@ -20,9 +28,15 @@ public struct LocalBackupPayload: Codable, Equatable, Sendable {
     public var subscriptions = Data()
     public var sourceGroups = Data()
     public var sources: [LocalBackupSource] = []
+    /// Missing in older backups. An empty list explicitly represents an empty live library.
+    public var liveSubscriptions: [Data]?
     /// Private undo journal only. Portable exports leave this empty.
     public var documents: [String: Data] = [:]
     public init() {}
+
+    public var restoreCategories: [LocalBackupCategory] {
+        LocalBackupCategory.allCases.filter { $0 != .liveSubscriptions || liveSubscriptions != nil }
+    }
 }
 
 public struct LocalBackupArchive: Codable, Sendable {
@@ -67,7 +81,8 @@ public struct LocalBackupArchive: Codable, Sendable {
             && path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
     public static func isAllowedSetting(_ key: String) -> Bool {
-        let names: Set<String> = ["local.appearance", "local.home.defaultDestination", "local.home.continueWatching",
+        let names: Set<String> = [LocalTrailerPreferences.autoplayKey, "local.appearance", "local.home.defaultDestination", "local.home.continueWatching",
+            LocalDockPreferences.history, LocalDockPreferences.live, LocalDockPreferences.music,
             "local.library.historyLayout", "local.library.favoritesLayout", "local.videoCache.enabled", "local.videoCache.sizeGB",
             "local.playback.prefetchNext", "local.hlsAdClean", "autoPlayNextEpisode", "subtitleStyle",
             "danmakuEnabled", "danmakuAutoMatch", "danmakuBuiltinEnabled", "danmakuFontSize", "danmakuOpacity", "danmakuArea",

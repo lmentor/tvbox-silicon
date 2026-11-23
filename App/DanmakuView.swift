@@ -167,6 +167,18 @@ struct DanmakuStylePickers: View {
 #endif
 
 final class DanmakuEngine: @unchecked Sendable {
+    /// SwiftUI's fitted picture can roundtrip through fractional point sizes.
+    /// Only a backing-pixel change needs a new layout or new glyph textures.
+    static func layoutSize(_ size: CGSize, scale: CGFloat) -> CGSize {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return .zero }
+        let pixelScale = scale.isFinite ? max(1, scale) : 1
+        func aligned(_ value: CGFloat) -> CGFloat {
+            // Stabilize arithmetic on an exact half-pixel before rounding it.
+            let pixels = (value * pixelScale * 1_000_000).rounded() / 1_000_000
+            return pixels.rounded() / pixelScale
+        }
+        return CGSize(width: aligned(size.width), height: aligned(size.height))
+    }
     struct Motion: Equatable, Sendable {
         let start: Double, duration: Double
         let from: CGPoint, to: CGPoint
@@ -179,6 +191,14 @@ final class DanmakuEngine: @unchecked Sendable {
         var id: UInt64 = 0
         var motion: Motion?
         var animated = false
+    }
+    /// Authored Bilibili coordinates describe one 16:9 stage. Fit that stage
+    /// uniformly so portrait playback cannot stretch text and vector shapes.
+    static func authoredStage(in size: CGSize) -> CGRect {
+        let scale = min(size.width / 1280, size.height / 720)
+        let fitted = CGSize(width: 1280 * scale, height: 720 * scale)
+        return CGRect(x: (size.width - fitted.width) / 2, y: (size.height - fitted.height) / 2,
+                      width: fitted.width, height: fitted.height)
     }
     private struct Active {
         let id: UInt64
@@ -211,6 +231,8 @@ final class DanmakuEngine: @unchecked Sendable {
     private var area = DanmakuArea.standard
     private var textScale = 1.0
     private var fontSize: CGFloat = 24
+    private var layoutTop: CGFloat = 0
+    private var layoutGap: CGFloat = 0
     private var next = 0
     private var active: [Active] = []
     private var lastTime = -1.0
@@ -383,6 +405,7 @@ final class DanmakuEngine: @unchecked Sendable {
     }
     func frame(time: Double, size: CGSize, scale: CGFloat, area: DanmakuArea = .standard, textScale: Double = 1,
                timelineRevision: Int = 0, drawTicket: UInt64? = nil, preload: Double = 0) -> [Sprite] {
+        let size = Self.layoutSize(size, scale: scale)
         let ticket = drawTicket ?? nextDrawTicket()
         return lock.withLock { frameLocked(time: time, size: size, scale: scale, area: area, textScale: textScale,
                                            timelineRevision: timelineRevision, drawTicket: ticket, preload: preload) }
@@ -439,9 +462,13 @@ final class DanmakuEngine: @unchecked Sendable {
                 let font = fontSize * comment.scale
                 let effect = NativeFancyDanmakuPainter.effect(comment)
                 let width = NativeFancyDanmakuPainter.width(comment, effect: effect, size: font, preferences: preferences.text)
+                let height = effect.map { font * CGFloat(NativeFancyDanmakuPainter.spec($0.variant)?.height ?? 1.7) }
+                    ?? DanmakuText.lineHeight(text: comment.text, size: font, preferences: preferences.text)
+                let rasterHeight = ceil(height * scale) / scale
                 // A queued glyph belongs to its media timestamp, including after a seek. Its
                 // first draw uses its real age rather than restarting at the edge of the picture.
-                guard let placement = layout.place(comment, width: width, at: comment.time),
+                // Measure before reserving rows, but rasterize only a cue that fits.
+                guard let placement = layout.place(comment, width: width, height: rasterHeight + layoutGap, at: comment.time),
                       let image = image(comment, effect: effect, size: font, scale: scale) else { self.layout = layout; continue }
                 self.layout = layout
                 nextSpriteID &+= 1
@@ -451,7 +478,7 @@ final class DanmakuEngine: @unchecked Sendable {
             }
             guard let layout else { return [] }
             let lane = layout.laneHeight
-            let top = size.height * 4 / 720
+            let top = layoutTop
             var sprites: [Sprite] = []
             for index in active.indices {
                 let item = active[index]
@@ -474,7 +501,8 @@ final class DanmakuEngine: @unchecked Sendable {
                     }
                     active[index].animationFrame = animationFrame
                 }
-                let rect = CGRect(x: x, y: y + (lane - item.size.height) / 2, width: item.size.width, height: item.size.height)
+                let rowHeight = lane * Double(placement.rowSpan)
+                let rect = CGRect(x: x, y: y + (rowHeight - item.size.height) / 2, width: item.size.width, height: item.size.height)
                 let duration = layout.duration(placement)
                 let fromX = placement.comment.position == .reverse ? -item.size.width : placement.speed > 0 ? layout.width : x
                 let toX = placement.comment.position == .reverse ? layout.width : placement.speed > 0 ? -item.size.width : x
@@ -483,6 +511,7 @@ final class DanmakuEngine: @unchecked Sendable {
                 sprites.append(Sprite(image: active[index].image, frame: rect, id: item.id, motion: motion, animated: item.animatedEffect != nil))
             }
             // Positioned Bilibili effects use normalized 1280×720 coordinates and their own lifetime.
+            let authoredStage = Self.authoredStage(in: size)
             var pixelBudget = 8_000_000
             let earliest = time - positionedLifetime
             // A monotonic cursor bounds expired advanced events; seeks binary-search the window.
@@ -511,10 +540,10 @@ final class DanmakuEngine: @unchecked Sendable {
                 let elapsed = time - comment.time
                 let progress = min(1, max(0, (elapsed - effect.moveDelay) / max(0.001, effect.moveDuration)))
                 let coordinate = effect.coordinate(progress: progress)
-                let frame = CGRect(x: coordinate.x * size.width / 1280,
-                    y: coordinate.y * size.height / 720,
-                    width: CGFloat(bitmap.width) / scale * size.width / 1280 * max(0.001, abs(cos(effect.rotateY * .pi / 180))),
-                    height: CGFloat(bitmap.height) / scale * size.height / 720)
+                let frame = CGRect(x: authoredStage.minX + coordinate.x * authoredStage.width / 1280,
+                    y: authoredStage.minY + coordinate.y * authoredStage.height / 720,
+                    width: CGFloat(bitmap.width) / scale * authoredStage.width / 1280 * max(0.001, abs(cos(effect.rotateY * .pi / 180))),
+                    height: CGFloat(bitmap.height) / scale * authoredStage.height / 720)
                 sprites.append(Sprite(image: bitmap, frame: frame,
                     opacity: effect.opacity + (effect.endOpacity - effect.opacity) * min(1, elapsed / max(0.1, effect.lifetime)), rotation: effect.rotateZ, id: positionedIDs[index]))
                 if sprites.count >= Self.onScreen { break }
@@ -557,18 +586,31 @@ final class DanmakuEngine: @unchecked Sendable {
     private func restart(at time: Double, size: CGSize, area: DanmakuArea, textScale: Double) {
         reloadedConsumed.removeAll(keepingCapacity: true)
         self.size = size; self.area = area; self.textScale = textScale
-        // MacCat measures on a 1280x720 stage. Keep its font/pitch/area relation
-        // when the iPhone rotates instead of independently inflating its text.
-        let stageScale = min(size.width / 1280, size.height / 720)
-        let verticalScale = size.height / 720
+        // Use the short edge for ordinary text and its spacing together. The
+        // previous landscape-stage font scale and full-height row scale diverged
+        // in portrait: tiny glyphs were placed in widely separated tall rows.
+        let stageScale = min(size.width, size.height) / 720
         fontSize = 22 * textScale * stageScale
         let spacing = max(0, min(32, preferences?.spacing ?? 7))
-        let decorated = comments.contains { $0.effect.map { $0.kind != "positioned" && $0.kind != "bas" } == true }
-        let extraPitch = preferences?.fancyEnabled == true ? 0.7 : decorated ? 0.42 : 0
-        let stagePitch = 22 * textScale * (1 + extraPitch) + spacing
-        // Lua: floor((areaHeight - 8 + lineSpacing) / pitch).
-        let usableHeight = max(1, size.height * areaShare(area) - (8 - spacing) * verticalScale)
-        layout = DanmakuLayout(width: size.width, height: usableHeight, laneHeight: stagePitch * verticalScale, scrollArea: 1,
+        var decorated = preferences?.fancyEnabled == true
+        var largestScale = 1.0
+        for comment in comments where comment.position != .positioned {
+            if comment.scale.isFinite { largestScale = max(largestScale, comment.scale) }
+            if let effect = comment.effect, ["badge", "highlight", "celebrate"].contains(effect.kind) { decorated = true }
+        }
+        let largestFont = fontSize * largestScale
+        let textHeight = DanmakuText.lineHeight(size: largestFont, preferences: preferences?.text ?? .init())
+        let decorationHeight = decorated ? largestFont * (NativeFancyDanmakuPainter.specs.map(\.height).max() ?? 1.7) : 0
+        // Reserve the actual raster height, including CoreText ascenders and
+        // outline padding, before adding the chosen gap. Small fonts and CJK
+        // fallbacks can exceed the nominal point size even in landscape.
+        let pixelScale = max(1, configuredScale)
+        let glyphHeight = ceil(max(textHeight, decorationHeight) * pixelScale) / pixelScale
+        let pitch = ceil((glyphHeight + spacing * stageScale) * pixelScale) / pixelScale
+        layoutTop = 4 * stageScale
+        layoutGap = spacing * stageScale
+        let usableHeight = max(1, size.height * areaShare(area) - layoutTop * 2)
+        layout = DanmakuLayout(width: size.width, height: usableHeight, laneHeight: pitch, scrollArea: 1,
             scrollDuration: 8 / max(0.25, min(3, configuredSpeed)), maxRows: configuredRows)
         active = []
         reconstructionTime = time
@@ -620,6 +662,13 @@ enum DanmakuText {
         CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
     }
     private static let padding: CGFloat = 3
+
+    static func lineHeight(text: String = "国Ag", size: CGFloat, preferences: Preferences) -> CGFloat {
+        let shaped = line(text, [.init(kCTFontAttributeName as String): font(size, preferences: preferences)])
+        var ascent: CGFloat = 0, descent: CGFloat = 0
+        _ = CTLineGetTypographicBounds(shaped, &ascent, &descent, nil)
+        return ascent + descent + padding * 2
+    }
 
     static func width(_ text: String, size: CGFloat, includeOverhang: Bool = false, preferences: Preferences = Preferences()) -> Double {
         let shaped = line(text, [.init(kCTFontAttributeName as String): font(size, preferences: preferences)])

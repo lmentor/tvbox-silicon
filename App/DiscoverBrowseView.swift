@@ -12,6 +12,7 @@ struct DiscoverBrowseView: View {
     let logo: URL?
     /// The genres the page opened with: a genre page's own genre is its subject, not a filter to reset.
     private let openingGenres: Set<Int>
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var items: [TMDBCatalog.Item] = []
     @State private var page = 0
@@ -124,6 +125,7 @@ struct DiscoverBrowseView: View {
             #if !os(macOS)
             .toolbar(.visible, for: .navigationBar)
             .toolbarBackground(.hidden, for: .navigationBar)
+            .toolbarColorScheme(colorScheme, for: .navigationBar)
             #endif
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

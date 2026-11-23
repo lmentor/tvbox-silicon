@@ -41,7 +41,7 @@ struct LocalBackupSettingsView: View {
     @State private var document: LocalBackupDocument?
     @State private var preview: LocalBackupPayload?
     @State private var createdAt: Date?
-    @State private var selected = Set(LocalBackupCategory.allCases)
+    @State private var selected: Set<LocalBackupCategory> = []
     @State private var replacing = false
     @State private var busy = false
     @State private var undo = LocalBackupCoordinator.undoAvailable
@@ -71,9 +71,9 @@ struct LocalBackupSettingsView: View {
                 if !status.isEmpty { Text(status).font(.footnote).foregroundStyle(.secondary) }
             }
             if let value = preview {
-                SettingsGroup(title: "恢复预览", footer: "恢复会停止播放，并保存恢复前的数据以供撤回。未选择的分类保持现状；恢复的来源保持关闭，需手动启用。") {
+                SettingsGroup(title: "恢复预览", footer: "恢复会停止播放，并保存所选分类的数据以供撤回。新恢复的来源需手动启用。直播订阅如需鉴权，请重新授权或导入原清单。") {
                     if let createdAt { Text(createdAt.formatted(date: .abbreviated, time: .shortened)).font(.caption) }
-                    ForEach(LocalBackupCategory.allCases) { category in
+                    ForEach(value.restoreCategories) { category in
                         Toggle(category.title + "（\(count(category, in: value)) 项）", isOn: Binding(get: { selected.contains(category) }, set: {
                             if $0 { selected.insert(category) } else { selected.remove(category) }
                         })).settingsSwitch()
@@ -100,7 +100,7 @@ struct LocalBackupSettingsView: View {
                     defer { selection.release() }
                     let data = try await selection.readData(maxBytes: LocalBackupArchive.maximumBytes)
                     let (archive, payload) = try LocalBackupCoordinator.inspect(data)
-                    preview = payload; createdAt = archive.createdAt; selected = Set(LocalBackupCategory.allCases); status = ""
+                    preview = payload; createdAt = archive.createdAt; selected = Set(payload.restoreCategories); status = ""
                 }
             }
         } cancelled: { status = "已取消文件选择" }
@@ -119,6 +119,7 @@ struct LocalBackupSettingsView: View {
         case .favorites: value.favorites.count
         case .settings: value.settings.count
         case .sources: (try? JSONDecoder().decode([SubscriptionEntry].self, from: value.subscriptions).count) ?? 0
+        case .liveSubscriptions: value.liveSubscriptions?.count ?? 0
         }
     }
 }

@@ -42,11 +42,6 @@ struct MobilePlayerView: View {
     @State private var importsPlayerFile = false
     @State private var playerFileKind = PlayerFileKind.subtitle
     @State private var playerFileSession = ""
-    @State private var importingDanmaku = false
-    @State private var danmakuImportError: String?
-    @State private var danmakuImportWork: Task<Void, Never>?
-    @State private var danmakuImportSession = ""
-    @State private var danmakuImportID = UUID()
     @State private var nowPlaying = VideoNowPlaying()
     @State private var videoAspect = PlayerVideoAspect.load()
     @State private var subtitleStyle = SubtitleStyle.load()
@@ -54,7 +49,7 @@ struct MobilePlayerView: View {
     @AppStorage(DanmakuArea.key) private var danmakuArea = DanmakuArea.standard
     @State private var localPanel: LocalPlayerPanel?
     @State private var playerSize = CGSize.zero
-    @State private var keyboardTop: CGFloat?
+    @State private var keyboardOverlap: CGFloat = 0
     @State private var subtitleTab = "轨道"
     @State private var subtitleTarget = SubtitleTrackSelection.Target.primary
     @State private var danmakuTab = "来源"
@@ -82,6 +77,11 @@ struct MobilePlayerView: View {
     @State private var settleTask: Task<Void, Never>?
     /// Sliding sideways across the picture: where the slide began.
     @State private var swipeStart: Double?
+    @State private var shortDramaSwitch = ShortDramaEpisodeSwitch()
+    @State private var shortDramaOwner = UUID()
+    @State private var episodeSwipe: (context: ShortDramaEpisodeSwitch.Context, moved: CGSize, size: CGSize)?
+    @State private var episodeHint: String?
+    @State private var episodeHintTask: Task<Void, Never>?
     /// Sliding up or down: the brightness on the left, the volume on the right, from where the slide began.
     @AppStorage(PictureLevel.key) private var slidesLevels = true
     @State private var level: (volume: Bool, start: Double, value: Double)?
@@ -110,14 +110,15 @@ struct MobilePlayerView: View {
                 ZStack {
                     playbackPicture
                     playbackInteractionOverlay
+                        .allowsHitTesting(pictureInputEnabled)
                     playbackInformationOverlay
                     controls.opacity(chromeVisible && !locked ? 1 : 0)
-                        .allowsHitTesting(chromeVisible && !locked && !settling)
+                        .allowsHitTesting(chromeVisible && !locked && !settling && pictureInputEnabled)
                     playbackNotices
                     localPopup
-                        .opacity(chromeVisible && !locked ? 1 : 0)
-                        .allowsHitTesting(chromeVisible && !locked && localPanel != nil)
-                    if !inline { lockButton }
+                        .opacity(!locked ? 1 : 0)
+                        .allowsHitTesting(!locked && localPanel != nil)
+                    if !inline { lockButton.allowsHitTesting(pictureInputEnabled) }
                 }
                 // The screen proposes the viewport. A previous landscape control width must
                 // never enlarge the portrait player and become its next measured size.
@@ -146,10 +147,7 @@ struct MobilePlayerView: View {
                         session.pictureInPictureController = pip
                     }
                 if showsDanmaku {
-                    DanmakuOverlay(engine: session.engine, comments: session.danmaku, opacity: session.danmakuOpacity,
-                                   revision: session.danmakuRevision, sourceID: session.danmakuSourceRevision)
-                        // Across the whole width, but below the Dynamic Island and above the home indicator when upright.
-                        .playerBleed(!inline, edges: .horizontal)
+                    playbackDanmaku
                 }
                 let external = session.externalSubtitles.document != nil
                 let primary = PlayerSubtitlePresentation(lines: session.subtitles.lines,
@@ -184,13 +182,37 @@ struct MobilePlayerView: View {
         }
     }
 
+    private var playbackDanmaku: some View {
+        // Measure in the same full picture coordinates as KSPlayerSurface.
+        // In manual portrait a landscape video sits in the middle of the screen;
+        // using the entire screen puts its comments in the upper black margin.
+        GeometryReader { viewport in
+            WithPerceptionTracking {
+                let picture = videoAspect.pictureFrame(in: viewport.size, source: session.engine.presentationSize).intersection(CGRect(origin: .zero, size: viewport.size))
+                let safe = CGRect(x: 0, y: viewport.safeAreaInsets.top, width: viewport.size.width,
+                                  height: max(0, viewport.size.height - viewport.safeAreaInsets.top - viewport.safeAreaInsets.bottom))
+                let visible = picture.intersection(safe)
+                if !visible.isNull, visible.width > 0, visible.height > 0 {
+                    DanmakuOverlay(engine: session.engine, comments: session.danmaku, opacity: session.danmakuOpacity,
+                                   revision: session.danmakuRevision, sourceID: session.danmakuSourceRevision)
+                        .frame(width: visible.width, height: visible.height)
+                        .position(x: visible.midX, y: visible.midY)
+                }
+            }
+        }
+        .playerBleed(!inline)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
     private var playbackInteractionOverlay: some View {
         WithPerceptionTracking {
             ZStack {
                 // A tap on the picture shows or hides the controls; a tap on a control keeps them up (see `rows`).
                 // Two taps on a side skip, touching and holding plays faster, and sliding sideways seeks.
-                PictureGestures(tap: tapped, hold: held, swipe: swiped, levels: slidesLevels && !inline) { wider in
-                    guard !locked else { return }
+                PictureGestures(enabled: pictureInputEnabled, tap: tapped, hold: held, swipe: swiped,
+                                levels: slidesLevels && !inline, episodes: shortDramaPagingEnabled) { wider in
+                    guard !locked, pictureInputEnabled else { return }
                     withAnimation(.easeInOut(duration: 0.25)) { fillsScreen = wider }
                 }
                 .playerBleed(!inline)
@@ -202,6 +224,7 @@ struct MobilePlayerView: View {
                 skippedLabel
                 swipeLabel
                 levelLabel
+                episodeHintLabel
                 if let playingOn {
                     PlayOnPlaceholder(receiver: playingOn) {
                         self.playingOn = nil
@@ -288,7 +311,7 @@ struct MobilePlayerView: View {
                     // Already-ready media will not publish another size change.
                     applyOrientation(orientationSample)
                 }
-                clock.attach(session.engine)
+            clock.attach(session.engine, cacheCoverage: { [weak session] in session?.cachedTimeRanges ?? [] })
                 speed = session.engine.speed
                 session.engine.setSubtitleDelay(UserDefaults.standard.double(forKey: "local.playback.subtitleDelay"))
                 nowPlaying.start(session)
@@ -296,8 +319,10 @@ struct MobilePlayerView: View {
                 tvBrowser.start()
             }
             .onDisappear {
+                endBoost()
                 clock.detach(); nowPlaying.stop(); tvBrowser.stop()
                 if let brightnessBefore { screen?.brightness = brightnessBefore }
+                cancelShortDramaSwitch()
             }
             // Played here again (the Lock Screen, say): the other device no longer has it to itself.
             .appOnChange(of: session.paused) { _, paused in if !paused { playingOn = nil } }
@@ -311,8 +336,14 @@ struct MobilePlayerView: View {
         WithPerceptionTracking {
             playbackLifecycle
             // Pausing ends the faster speed in the session; another episode or quality plays at the chosen one.
-            .appOnChange(of: session.boost == nil) { _, ended in if ended { boost = nil } }
+            .appOnChange(of: session.boost == nil) { _, ended in if ended { boost = nil; holding = false } }
             .appOnChange(of: session.engine.mediaID) { endBoost(); clock.replaceMedia() }
+            .appOnChange(of: scenePhase) { _, phase in if phase != .active { endBoost() } }
+            .appOnChange(of: shortDramaContext, initial: true) { _, context in
+                shortDramaSwitch.synchronize(context)
+                if let swipe = episodeSwipe, swipe.context.scope != context?.scope { episodeSwipe = nil }
+            }
+            .appOnChange(of: shortDramaPagingEnabled) { _, enabled in if !enabled { cancelShortDramaSwitch() } }
             .appOnChange(of: boost) { old, new in
                 guard let new else { return }
                 guard let old else { UIImpactFeedbackGenerator(style: .light).impactOccurred(); return }
@@ -339,14 +370,17 @@ struct MobilePlayerView: View {
             .appOnChange(of: videoAspect) { _, value in value.save() }
             .appOnChange(of: localPanel) { _, panel in
                 hold(panel != nil)
-                if panel == nil { keyboardTop = nil }
+                taps = PictureTaps()
+                settleTask?.cancel(); settling = false
+                if panel != nil {
+                    cancelShortDramaSwitch()
+                    swipeStart = nil; clock.cancelScrub()
+                    levelTask?.cancel(); leveling = false; level = nil; mountsVolume = false
+                    if holding { endBoost() }
+                }
             }
             .appOnChange(of: channel.id) { if localPanel != .episodes { localPanel = nil } }
-            .appOnChange(of: session.mediaEnhancements.sessionID) { _, _ in
-                danmakuImportID = UUID()
-                danmakuImportWork?.cancel(); importingDanmaku = false; importsPlayerFile = false
-            }
-            .onDisappear { danmakuImportID = UUID(); danmakuImportWork?.cancel() }
+            .appOnChange(of: session.mediaEnhancements.sessionID) { _, _ in importsPlayerFile = false }
         }
     }
 
@@ -404,7 +438,99 @@ struct MobilePlayerView: View {
 
     // MARK: Taps and slides
 
+    private var pictureInputEnabled: Bool { localPanel == nil && !importsPlayerFile }
+
+    private var shortDramaContext: ShortDramaEpisodeSwitch.Context? {
+        guard let playing = store.playing, let catalog = store.catalog(for: playing), let context = playing.historyContext else { return nil }
+        let episodes = catalog.playlist.episodes(for: context.episodeFlag)
+        let site = catalog.client.site
+        let scriptName = site.runtime == .python ? (try? site.scriptURL(origin: catalog.client.origin))?.lastPathComponent : nil
+        guard ShortDramaSwipe.eligible(category: catalog.video.category, sourceName: site.name,
+                                      sourceKey: site.sourceKey, sourceRoute: site.raw["catPawOpen"]?.string,
+                                      scriptName: scriptName, episodeCount: episodes.count,
+                                      live: session.isLive || playing.playback?.isLive == true,
+                                      reading: playing.playback?.reading != nil),
+              let current = context.episode(in: episodes) else { return nil }
+        let scope = [context.libraryScope ?? "", context.id, context.episodeFlag]
+            .map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        return .init(scope: scope, episodes: episodes.map(\.id), current: current.id)
+    }
+
+    private var shortDramaPagingEnabled: Bool {
+        !locked && pictureInputEnabled && !pip.active && playingOn == nil && scenePhase == .active && shortDramaContext != nil
+    }
+
+    private func cancelShortDramaSwitch() {
+        episodeSwipe = nil
+        shortDramaSwitch.cancel()
+        episodeHintTask?.cancel(); episodeHintTask = nil; episodeHint = nil
+    }
+
+    private func switchShortDrama(_ direction: ShortDramaSwipe.Direction, in context: ShortDramaEpisodeSwitch.Context) {
+        guard shortDramaPagingEnabled, let current = shortDramaContext, current.scope == context.scope,
+              let playing = store.playing, let history = playing.historyContext, let catalog = store.catalog(for: playing) else { return }
+        let episodes = catalog.playlist.episodes(for: history.episodeFlag)
+        let result = shortDramaSwitch.move(direction, in: current, interrupt: { target in
+            guard let active = store.playing?.historyContext,
+                  active.id == history.id, active.libraryScope == history.libraryScope,
+                  active.episodeFlag == history.episodeFlag else { return [] }
+            let source = store.cancelEpisodeSelection()
+            let episode = target.flatMap { id in episodes.first { $0.id == id } }
+            return (source.map { [$0] } ?? []) + session.suspendEpisodePrefetch(for: episode, context: history, owner: shortDramaOwner)
+        }, select: { id in
+            guard let active = store.playing, let activeContext = active.historyContext,
+                  activeContext.id == history.id, activeContext.libraryScope == history.libraryScope,
+                  activeContext.episodeFlag == history.episodeFlag,
+                  let catalog = store.catalog(for: active), let episode = catalog.video.episodes.first(where: { $0.id == id && $0.flag == history.episodeFlag }) else { return false }
+            if activeContext.episode(in: catalog.video.episodes) == episode { return true }
+            if session.playUpcoming(matching: episode, context: activeContext) { return true }
+            store.selectEpisode(episode, from: active)
+            await store.waitForEpisodeSelection()
+            if let error = store.episodeError, store.playing == active { showEpisodeHint("切集失败：" + error) }
+            return store.playing?.historyContext?.episodeID == episode.id
+        }, settled: {
+            if let interrupted = session.resumeEpisodePrefetch(owner: shortDramaOwner), store.playing == interrupted {
+                if !session.resumeInterruptedEpisodeRecovery(interrupted) {
+                    startCatalogPlayback(session, channel: interrupted, store: store)
+                }
+            }
+        })
+        switch result {
+        case .target(let id):
+            let name = episodes.first { $0.id == id }?.name ?? ""
+            showEpisodeHint(id == current.current ? "继续播放 · " + name : "正在切换 · " + name)
+            UISelectionFeedbackGenerator().selectionChanged()
+        case .first: showEpisodeHint("已经是第一集")
+        case .last: showEpisodeHint("已经是最后一集")
+        case .unavailable: break
+        }
+    }
+
+    private func showEpisodeHint(_ text: String) {
+        episodeHintTask?.cancel()
+        episodeHint = text
+        episodeHintTask = Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            guard !Task.isCancelled else { return }
+            episodeHint = nil
+        }
+    }
+
+    @ViewBuilder private var episodeHintLabel: some View {
+        if let episodeHint {
+            Text(episodeHint)
+                .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                .multilineTextAlignment(.center).lineLimit(3)
+                .padding(.horizontal, 18).padding(.vertical, 12)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+                .padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("player.episodeHint")
+        }
+    }
+
     private func tapped(_ x: CGFloat, _ width: CGFloat) {
+        guard pictureInputEnabled else { return }
         #if DEBUG
         Diagnostics.shared.record(.debug, "player.chrome", "event=picture-tap x=\(x) width=\(width) visible=\(chromeVisible) settling=\(settling) locked=\(locked)")
         #endif
@@ -454,6 +580,7 @@ struct MobilePlayerView: View {
     /// The controls a tap brings up replace the labels a skip or a slide leaves for a moment.
     private func clearLabels() {
         skippedTask?.cancel(); skipped = nil
+        episodeHintTask?.cancel(); episodeHint = nil
         guard !leveling else { return }
         levelTask?.cancel(); level = nil; mountsVolume = false
     }
@@ -467,12 +594,17 @@ struct MobilePlayerView: View {
         if locked, case .began = phase { return }
         switch phase {
         case .began(.seek):
-            guard showsTransport, seekable, clock.duration > 0, playingOn == nil, !pip.active else { return }
+            guard pictureInputEnabled, showsTransport, seekable, clock.duration > 0, playingOn == nil, !pip.active else { return }
             let start = clock.currentPosition
             swipeStart = start
             clock.scrub(to: start)
             hideChrome()
+        case .began(.episode):
+            guard shortDramaPagingEnabled, let context = shortDramaContext else { return }
+            episodeSwipe = (context, .zero, playerSize)
+            hideChrome()
         case .began(let slide):
+            guard pictureInputEnabled else { return }
             let volume = slide == .volume
             guard volume || screen != nil else { return }
             let start = volume ? Double(AVAudioSession.sharedInstance().outputVolume) : Double(screen?.brightness ?? 0)
@@ -483,14 +615,24 @@ struct MobilePlayerView: View {
             leveling = true
             hideChrome()
         case .moved(let moved, let size):
+            guard pictureInputEnabled else { return }
             if let swipeStart {
                 clock.scrub(to: PictureSeek.target(from: swipeStart, moved: moved.width, width: size.width, duration: clock.duration))
+            } else if let swipe = episodeSwipe {
+                episodeSwipe = (swipe.context, moved, size)
             } else if leveling, var level {
                 level.value = PictureLevel.value(from: level.start, moved: moved.height, height: size.height)
                 self.level = level
                 if level.volume { systemVolume.set(level.value) } else { screen?.brightness = CGFloat(level.value) }
             }
         case .ended:
+            if let swipe = episodeSwipe {
+                episodeSwipe = nil
+                if shortDramaPagingEnabled, swipe.context.scope == shortDramaContext?.scope,
+                   let direction = ShortDramaSwipe.direction(horizontal: swipe.moved.width, vertical: swipe.moved.height, height: swipe.size.height) {
+                    switchShortDrama(direction, in: swipe.context)
+                }
+            }
             if swipeStart != nil {
                 swipeStart = nil
                 clock.endScrub()
@@ -504,6 +646,10 @@ struct MobilePlayerView: View {
                     level = nil; mountsVolume = false
                 }
             }
+        case .cancelled:
+            episodeSwipe = nil
+            swipeStart = nil; clock.cancelScrub()
+            levelTask?.cancel(); leveling = false; level = nil; mountsVolume = false
         }
     }
 
@@ -645,7 +791,7 @@ struct MobilePlayerView: View {
     private func held(_ phase: PictureGestures.Hold) {
         switch phase {
         case .began:
-            guard boosts, !locked else { return }
+            guard pictureInputEnabled, boosts, !locked else { return }
             // A new hold replaces a kept speed: it ends with the finger unless slid down again.
             let started = SpeedBoost(rate: holdSpeed)
             boost = started; holding = true
@@ -653,7 +799,7 @@ struct MobilePlayerView: View {
             // The picture to itself, as in YouTube and Douyin.
             hideChrome()
         case .moved(let offset):
-            guard holding, var moved = boost else { return }
+            guard pictureInputEnabled, holding, var moved = boost else { return }
             moved.moved(x: offset.width, y: offset.height)
             guard moved != boost else { return }
             if moved.rate != boost?.rate { session.setBoost(Float(moved.rate)) }
@@ -662,6 +808,8 @@ struct MobilePlayerView: View {
             guard holding else { return }
             holding = false
             if boost?.locked != true { endBoost() }
+        case .cancelled:
+            endBoost()
         }
     }
 
@@ -759,6 +907,11 @@ struct MobilePlayerView: View {
                     Text(channel.historyContext?.videoName ?? channel.name)
                         .font(.system(size: inline ? 13 : 16, weight: .semibold)).lineLimit(1)
                         .accessibilityIdentifier("player.title")
+                    if let choice = session.iptv {
+                        Text(choice.programme.map { "回看 · " + $0.title } ?? choice.line.name)
+                            .font(.system(size: inline ? 10 : 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.8)).lineLimit(1)
+                    }
                     if let episode = channel.historyContext?.episodeName, !episode.isEmpty,
                        episode != channel.historyContext?.videoName {
                         Text(episode).font(.system(size: inline ? 10 : 12, weight: .medium))
@@ -776,6 +929,7 @@ struct MobilePlayerView: View {
                         }
                     }
                 }
+                PlayerBatteryIndicator()
             }.padding(.horizontal, 6)
             HStack(spacing: playerSize.width < 350 ? 2 : 8) {
             Button(action: close) { Image(systemName: "chevron.backward").playerControlTarget() }
@@ -793,6 +947,11 @@ struct MobilePlayerView: View {
             }.buttonStyle(PlayerToolbarButtonStyle(selected: localPanel == .information)).accessibilityLabel("视频信息")
                 .accessibilityIdentifier("player.information")
             Spacer(minLength: 4)
+            Button { togglePanel(.sleepTimer) } label: {
+                Image(systemName: SleepTimer.shared.isOn ? "alarm.fill" : "alarm").playerControlTarget()
+            }.buttonStyle(PlayerToolbarButtonStyle(selected: SleepTimer.shared.isOn || localPanel == .sleepTimer))
+                .accessibilityLabel("定时关闭").accessibilityValue(SleepTimer.shared.status(item: .episode))
+                .accessibilityIdentifier("player.sleepTimer")
             Button { pip.toggle() } label: { Image(systemName: pip.active ? "pip.exit" : "pip.enter").playerControlTarget() }
                 .buttonStyle(PlayerToolbarButtonStyle(selected: pip.active)).disabled(!pip.supported || !pip.possible && !pip.active)
                 .accessibilityLabel("画中画").accessibilityIdentifier("player.pip")
@@ -862,13 +1021,13 @@ struct MobilePlayerView: View {
         if previous != nil || next != nil || episodes || toggleFullScreen != nil {
             HStack(spacing: 10) {
                 if let previous {
-                    Button { previous.go() } label: { Image(systemName: "backward.end.fill").playerControlTarget() }
+                    Button { cancelShortDramaSwitch(); previous.go() } label: { Image(systemName: "backward.end.fill").playerControlTarget() }
                         .buttonStyle(PlayerCircleStyle(size: 44))
                         .disabled(previous.busy)
                         .accessibilityLabel(L10n.text("Previous Episode"))
                 }
                 if let next {
-                    Button { next.go() } label: { Image(systemName: "forward.end.fill").playerControlTarget() }
+                    Button { cancelShortDramaSwitch(); next.go() } label: { Image(systemName: "forward.end.fill").playerControlTarget() }
                         .buttonStyle(PlayerCircleStyle(size: 44))
                         .disabled(next.busy)
                         .accessibilityLabel(L10n.text("Next Episode"))
@@ -942,15 +1101,15 @@ struct MobilePlayerView: View {
         GeometryReader { geometry in
             WithPerceptionTracking {
                 if let panel = localPanel {
-                    let overlap = keyboardTop.map { max(0, geometry.frame(in: .global).maxY - $0) } ?? 0
+                    let overlap = keyboardOverlap
                     let availableHeight = max(0, geometry.size.height - overlap)
                     let panelSize = PlayerPopupLayout.size(viewport: geometry.size, keyboardOverlap: overlap,
-                        preferred: CGSize(width: panel == .speed || panel == .volume || panel == .aspect ? 300 : panel == .information ? 560 : 420,
+                        preferred: CGSize(width: panel == .speed || panel == .aspect ? 300 : panel == .information ? 560 : 420,
                                           height: popupHeight(panel)))
                     ZStack(alignment: .topTrailing) {
                         Color.black.opacity(0.10).contentShape(Rectangle()).onTapGesture { localPanel = nil; poke() }
-                        CompactPlayerPopup(title: panel.title, scrolls: ![.episodes, .danmakuList, .danmakuConfiguration].contains(panel), close: { localPanel = nil; poke() }) {
-                            localPanelContent(panel)
+                        CompactPlayerPopup(title: panel.title, scrolls: ![.episodes, .danmakuList, .danmakuConfiguration, .stations, .guide].contains(panel), close: { localPanel = nil; poke() }) {
+                            WithPerceptionTracking { localPanelContent(panel) }
                         }
                         .accessibilityIdentifier("player.popup." + panel.rawValue)
                         .frame(width: panelSize.width, height: panelSize.height)
@@ -965,10 +1124,7 @@ struct MobilePlayerView: View {
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { notification in
-            keyboardTop = (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)?.minY
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardTop = nil }
+        .background(PlayerPopupKeyboard { keyboardOverlap = $0 }.allowsHitTesting(false))
         .transition(.opacity)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: localPanel)
         .clipped()
@@ -979,7 +1135,7 @@ struct MobilePlayerView: View {
         switch panel {
         case .cast: 430
         case .speed: 260
-        case .volume: 180
+        case .sleepTimer: 420
         case .aspect: 410
         default: 520
         }
@@ -989,21 +1145,23 @@ struct MobilePlayerView: View {
         HStack(spacing: 3) {
             let previous = store.step(back: true, from: channel, session: session)
             let next = store.step(back: false, from: channel, session: session)
-            Button { previous?.go(); poke() } label: { Image(systemName: "backward.end.fill").playerControlTarget() }
-                .disabled(previous == nil || previous?.busy == true).accessibilityLabel("上一集")
+            Button { cancelShortDramaSwitch(); previous?.go(); poke() } label: { Image(systemName: "backward.end.fill").playerControlTarget() }
+                .disabled(previous == nil || previous?.busy == true).accessibilityLabel(session.iptv == nil ? "上一集" : "上一台")
                 .accessibilityIdentifier("player.previous")
             Button { session.togglePlayback(); poke() } label: { Image(systemName: session.paused ? "play.fill" : "pause.fill").playerControlTarget() }
                 .accessibilityLabel(session.paused ? "播放" : "暂停")
                 .accessibilityIdentifier("player.playPause")
-            Button { next?.go(); poke() } label: { Image(systemName: "forward.end.fill").playerControlTarget() }
-                .disabled(next == nil || next?.busy == true).accessibilityLabel("下一集")
+            Button { cancelShortDramaSwitch(); next?.go(); poke() } label: { Image(systemName: "forward.end.fill").playerControlTarget() }
+                .disabled(next == nil || next?.busy == true).accessibilityLabel(session.iptv == nil ? "下一集" : "下一台")
                 .accessibilityIdentifier("player.next")
+            if let choice = session.iptv, choice.programme != nil {
+                Button { session.chooseIPTVLine(choice.lineIndex); poke() } label: {
+                    Label("回到直播", systemImage: "dot.radiowaves.left.and.right").playerControlTarget()
+                }.accessibilityLabel("回到直播")
+            }
             Button { togglePanel(.speed) } label: { Text(Self.speedLabel(speed)).font(.subheadline.weight(.semibold)).playerControlTarget() }
                 .accessibilityLabel("倍速")
                 .accessibilityIdentifier("player.panel.speed").disabled(session.isLive)
-            Button { togglePanel(.volume) } label: {
-                Image(systemName: session.engine.muted ? "speaker.slash.fill" : "speaker.wave.2.fill").playerControlTarget()
-            }.accessibilityLabel("音量").accessibilityIdentifier("player.panel.volume")
         }.buttonStyle(PlayerToolbarButtonStyle())
     }
 
@@ -1011,11 +1169,7 @@ struct MobilePlayerView: View {
         HStack(spacing: 3) {
             ForEach(availablePanels) { panel in
                 Button { togglePanel(panel) } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: panel.symbol).font(.system(size: 16))
-                        if playerSize.width >= 760 { Text(panel.title).font(.system(size: 12)) }
-                    }
-                    .padding(.horizontal, playerSize.width >= 760 ? 7 : 0).playerControlTarget()
+                    Image(systemName: panel.symbol).font(.system(size: 16)).playerControlTarget()
                 }.buttonStyle(PlayerToolbarButtonStyle(selected: localPanel == panel)).accessibilityLabel(panel.title)
                     .accessibilityIdentifier("player.panel." + panel.rawValue)
             }
@@ -1024,6 +1178,11 @@ struct MobilePlayerView: View {
 
     private var availablePanels: [LocalPlayerPanel] {
         var panels: [LocalPlayerPanel] = [.episodes, .quality, .video, .audio, .subtitle, .danmaku]
+        if let choice = session.iptv {
+            panels = [.stations, .lines]
+            if choice.guide != nil { panels.append(.guide) }
+            panels += [.video, .audio, .subtitle, .danmaku]
+        }
         if !session.engine.chapters.isEmpty || !session.discTitles.isEmpty { panels.append(.chapters) }
         if channel.skipScope != nil && !session.isLive { panels.append(.skip) }
         return panels
@@ -1034,9 +1193,18 @@ struct MobilePlayerView: View {
         case .cast: castingPanel
         case .aspect: PlayerAspectPanel(value: $videoAspect) { localPanel = nil; poke() }
         case .speed: speedPanel
-        case .volume: volumePanel
+        case .sleepTimer: SleepTimerPanel(item: .episode, offersEnd: !session.isLive) { localPanel = nil; poke() }
         case .information: CompactPlayerInformationPanel(session: session, channel: channel)
         case .episodes: CompactPlayerQueuePanel(channel: channel)
+        case .stations: iptvStations
+        case .lines: iptvLines
+        case .guide:
+            if let choice = session.iptv, let guide = choice.guide {
+                IPTVGuidePanel(context: guide, station: choice.station, lineIndex: choice.lineIndex, programme: choice.programme) { programme, line in
+                    session.playIPTVProgramme(programme, line: line)
+                    localPanel = nil; poke()
+                }.id(choice.station.id)
+            }
         case .quality: qualityPanel
         case .video: trackChoices(.video)
         case .audio: audioPanel
@@ -1047,6 +1215,33 @@ struct MobilePlayerView: View {
         case .subtitleAddress: CompactSubtitleAddressPanel(subtitles: session.externalSubtitles) { localPanel = .subtitle }
         case .danmakuList: embeddedDanmakuList
         case .danmakuConfiguration: danmakuConfigurationPanel
+        }
+    }
+
+    @ViewBuilder private var iptvStations: some View {
+        if let choice = session.iptv {
+            IPTVStationsPanel(stations: choice.lineup, currentID: choice.station.id,
+                              favorite: store.isFavorite(channel), loading: session.loading,
+                              toggleFavorite: { store.toggleFavorite(channel) }) { station in
+                store.playIPTV(station, lineup: choice.lineup)
+                localPanel = nil; poke()
+            }.id(choice.station.id)
+        }
+    }
+
+    @ViewBuilder private var iptvLines: some View {
+        if let choice = session.iptv {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(choice.station.lines.indices, id: \.self) { index in
+                    WithPerceptionTracking {
+                        selectionRow(choice.station.lines[index].name, selected: choice.lineIndex == index) {
+                            session.chooseIPTVLine(index)
+                            localPanel = nil; poke()
+                        }
+                    }
+                }
+            }
+            decoderChoices
         }
     }
 
@@ -1068,26 +1263,6 @@ struct MobilePlayerView: View {
                 }
             }
         }
-    }
-
-    private var volumePanel: some View {
-        WithPerceptionTracking {
-            VStack(spacing: 12) {
-                HStack {
-                    Button { session.engine.setMuted(!session.engine.muted) } label: {
-                        Image(systemName: session.engine.muted ? "speaker.slash.fill" : "speaker.wave.2.fill").playerControlTarget()
-                    }.buttonStyle(.plain).accessibilityLabel(session.engine.muted ? "取消静音" : "静音")
-                    Spacer()
-                    Text("\(Int(session.engine.volume * 100))%").monospacedDigit()
-                }
-                Slider(value: playbackVolume, in: 0...1).accessibilityLabel("播放音量")
-            }
-        }
-    }
-    private var playbackVolume: Binding<Double> {
-        Binding(get: { Double(session.engine.volume) }, set: { value in
-            session.engine.setVolume(Float(value)); if value > 0 { session.engine.setMuted(false) }
-        })
     }
 
     private var qualityPanel: some View {
@@ -1265,14 +1440,14 @@ struct MobilePlayerView: View {
                     Button("重新加载弹幕") { session.catalogDanmaku.retryAutomatic() }.buttonStyle(.bordered)
                 }
                 LocalDanmakuCatalogPanel(enhancements: session.mediaEnhancements, model: session.catalogDanmaku,
-                                         importFile: beginDanmakuImport, importing: importingDanmaku, importError: danmakuImportError,
+                                         importFile: beginDanmakuImport,
                                          openConfiguration: { localPanel = .danmakuConfiguration })
                 Button("弹幕列表") { localPanel = .danmakuList }.buttonStyle(.bordered)
             }
         }
     }
     private func beginDanmakuImport() {
-        danmakuImportError = nil
+        session.mediaEnhancements.trackSelectionError = nil
         beginPlayerFileImport(.danmaku)
     }
     private enum PlayerFileKind {
@@ -1299,7 +1474,7 @@ struct MobilePlayerView: View {
         }
         if case .failure(let error) = result {
             if playerFileKind == .subtitle { session.externalSubtitles.importFailure = error.localizedDescription }
-            else { danmakuImportError = error.localizedDescription }
+            else { session.mediaEnhancements.trackSelectionError = error.localizedDescription }
             return
         }
         guard case .success(let selection) = result else { return }
@@ -1307,28 +1482,14 @@ struct MobilePlayerView: View {
         case .subtitle:
             session.externalSubtitles.add(selection: selection)
         case .danmaku:
-            danmakuImportSession = playerFileSession
-            receiveDanmakuFile(selection)
-        }
-    }
-    private func receiveDanmakuFile(_ selection: LocalDocumentSelection) {
-        guard danmakuImportSession == session.mediaEnhancements.sessionID else { selection.release(); return }
-        let active = danmakuImportSession
-        let operation = UUID(); danmakuImportID = operation
-        danmakuImportWork?.cancel(); importingDanmaku = true
-        danmakuImportWork = Task {
-            defer { selection.release() }
-            defer { if active == session.mediaEnhancements.sessionID, danmakuImportID == operation { importingDanmaku = false; danmakuImportWork = nil } }
-            do {
+            let enhancements = session.mediaEnhancements
+            let mediaID = playerFileSession
+            enhancements.selectTrack {
+                defer { selection.release() }
                 let data = try await selection.readData(maxBytes: 32 * 1024 * 1024)
                 try Task.checkCancellation()
-                guard active == session.mediaEnhancements.sessionID, danmakuImportID == operation else { return }
-                try await session.mediaEnhancements.importData(data)
-                try Task.checkCancellation()
-                guard active == session.mediaEnhancements.sessionID, danmakuImportID == operation else { return }
-                danmakuTab = "来源"; localPanel = .danmaku
-            } catch {
-                if !Task.isCancelled && active == session.mediaEnhancements.sessionID && danmakuImportID == operation { danmakuImportError = error.localizedDescription }
+                guard enhancements.sessionID == mediaID else { throw CancellationError() }
+                try await enhancements.importData(data)
             }
         }
     }
@@ -1575,7 +1736,7 @@ extension View {
     /// where reaching into the safe area would run the picture under the status bar. Keep one structural
     /// view identity across full-screen changes so KSPlayer's mounted surface and PiP source survive.
     func playerBleed(_ bleeds: Bool, edges: Edge.Set = .all) -> some View {
-        ignoresSafeArea(edges: bleeds ? edges : [])
+        ignoresSafeArea(.container, edges: bleeds ? edges : [])
     }
 }
 
@@ -1625,6 +1786,9 @@ private struct SeekBar<Accessory: View>: View {
         let duration = clock.duration
         let value = min(max(0, position), duration)
         let held = drag != nil
+        // Read observed cache state inside the caller's tracking scope. A
+        // deferred GeometryReader does not inherit iOS 16 Perception tracking.
+        let bufferedRanges = clock.bufferedRanges
         return HStack(spacing: 8) {
             Text(Self.format(value)).frame(minWidth: 40, alignment: .leading).accessibilityHidden(true)
             GeometryReader { viewport in
@@ -1632,7 +1796,12 @@ private struct SeekBar<Accessory: View>: View {
                 let x = duration > 0 ? trackWidth * value / duration : 0
                 ZStack(alignment: .leading) {
                     Capsule().fill(.white.opacity(0.2)).frame(height: held ? 6 : 4)
-                    Capsule().fill(.white.opacity(0.4)).frame(width: duration > 0 ? max(0, min(trackWidth, trackWidth * clock.bufferedPosition / duration)) : 0, height: held ? 6 : 4)
+                    ForEach(Array(bufferedRanges.enumerated()), id: \.offset) { _, range in
+                        let start = duration > 0 ? max(0, min(trackWidth, trackWidth * range.lowerBound / duration)) : 0
+                        let end = duration > 0 ? max(start, min(trackWidth, trackWidth * range.upperBound / duration)) : 0
+                        Capsule().fill(.white.opacity(0.5)).frame(width: end - start, height: held ? 6 : 4)
+                            .offset(x: start)
+                    }
                     Capsule().fill(.white).frame(width: max(0, x), height: held ? 6 : 4)
                     Circle().fill(.white)
                         .frame(width: held ? 24 : 14, height: held ? 24 : 14)
@@ -1845,16 +2014,18 @@ private struct PlayerCircleStyle: ButtonStyle {
 /// The picture's own gestures, in UIKit: taps, a touch and hold followed while the finger moves, slides and a pinch.
 /// SwiftUI's long press ends where a drag would begin, and a tap beside it can fire as the held finger lifts.
 private struct PictureGestures: UIViewRepresentable {
-    enum Hold { case began, moved(CGSize), ended }
-    /// Sideways seeks; up or down sets the brightness on the left half and the volume on the right.
-    enum Slide { case seek, brightness, volume }
-    enum Swipe { case began(Slide), moved(CGSize, in: CGSize), ended }
+    enum Hold { case began, moved(CGSize), ended, cancelled }
+    /// Sideways seeks; short dramas page vertically, other videos retain brightness and volume.
+    enum Slide { case seek, brightness, volume, episode }
+    enum Swipe { case began(Slide), moved(CGSize, in: CGSize), ended, cancelled }
+    var enabled = true
     /// Where the tap landed across the picture, and the picture's width.
     let tap: (CGFloat, CGFloat) -> Void
     let hold: (Hold) -> Void
     let swipe: (Swipe) -> Void
     /// Whether slides up or down set the brightness and the volume.
     var levels = true
+    var episodes = false
     /// Pinched out (true) or in, as in YouTube: fill the screen or fit the picture.
     let pinch: (Bool) -> Void
 
@@ -1872,28 +2043,62 @@ private struct PictureGestures: UIViewRepresentable {
         pan.maximumNumberOfTouches = 1
         pan.delegate = context.coordinator
         let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pinched(_:)))
-        for recognizer in [press, tap, pan, pinch] { view.addGestureRecognizer(recognizer) }
+        for recognizer in [press, tap, pan, pinch] {
+            recognizer.delegate = context.coordinator
+            recognizer.isEnabled = enabled
+            view.addGestureRecognizer(recognizer)
+        }
+        context.coordinator.parent = self
+        view.isUserInteractionEnabled = enabled
         return view
     }
 
-    func updateUIView(_ view: UIView, context: Context) { context.coordinator.parent = self }
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.parent = self
+        if !enabled { context.coordinator.cancelHold() }
+        view.isUserInteractionEnabled = enabled
+        for recognizer in view.gestureRecognizers ?? [] { recognizer.isEnabled = enabled }
+    }
+    static func dismantleUIView(_ view: UIView, coordinator: Coordinator) {
+        coordinator.cancelHold()
+        view.isUserInteractionEnabled = false
+        for recognizer in view.gestureRecognizers ?? [] { recognizer.isEnabled = false }
+        coordinator.parent = nil
+    }
 
     @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: PictureGestures?
         private var start = CGPoint.zero
         private var slide = Slide.seek
+        private var panning = false
+        private var pressing = false
+
+        func cancelHold() {
+            guard pressing else { return }
+            pressing = false
+            parent?.hold(.cancelled)
+        }
 
         @objc func tapped(_ tap: UITapGestureRecognizer) {
-            guard let view = tap.view else { return }
+            guard parent?.enabled == true, tap.state == .ended, let view = tap.view else { return }
             parent?.tap(tap.location(in: view).x, view.bounds.width)
         }
 
         @objc func pressed(_ press: UILongPressGestureRecognizer) {
             let location = press.location(in: press.view)
             switch press.state {
-            case .began: start = location; parent?.hold(.began)
-            case .changed: parent?.hold(.moved(CGSize(width: location.x - start.x, height: location.y - start.y)))
-            case .ended, .cancelled, .failed: parent?.hold(.ended)
+            case .began:
+                guard parent?.enabled == true else { return }
+                pressing = true
+                start = location; parent?.hold(.began)
+            case .changed:
+                guard pressing, parent?.enabled == true else { return }
+                parent?.hold(.moved(CGSize(width: location.x - start.x, height: location.y - start.y)))
+            case .ended:
+                guard pressing else { return }
+                pressing = false
+                parent?.hold(parent?.enabled == true ? .ended : .cancelled)
+            case .cancelled, .failed: cancelHold()
             default: break
             }
         }
@@ -1901,27 +2106,46 @@ private struct PictureGestures: UIViewRepresentable {
         @objc func panned(_ pan: UIPanGestureRecognizer) {
             guard let view = pan.view else { return }
             switch pan.state {
-            case .began: parent?.swipe(.began(slide))
+            case .began:
+                guard parent?.enabled == true else { return }
+                panning = true; parent?.swipe(.began(slide))
             case .changed:
+                guard panning, parent?.enabled == true else { return }
                 let moved = pan.translation(in: view)
                 parent?.swipe(.moved(CGSize(width: moved.x, height: moved.y), in: view.bounds.size))
-            case .ended, .cancelled, .failed: parent?.swipe(.ended)
+            case .ended, .cancelled, .failed:
+                guard panning else { return }
+                panning = false
+                if pan.state == .ended && parent?.enabled == true {
+                    // UIKit can coalesce the final movement into touch-up. Use that location,
+                    // including an out-and-back swipe, before deciding whether to change episode.
+                    let moved = pan.translation(in: view)
+                    parent?.swipe(.moved(CGSize(width: moved.x, height: moved.y), in: view.bounds.size))
+                    parent?.swipe(.ended)
+                } else { parent?.swipe(.cancelled) }
             default: break
             }
         }
 
         @objc func pinched(_ pinch: UIPinchGestureRecognizer) {
-            guard pinch.state == .ended, abs(pinch.scale - 1) > 0.1 else { return }
+            guard parent?.enabled == true, pinch.state == .ended, abs(pinch.scale - 1) > 0.1 else { return }
             parent?.pinch(pinch.scale > 1)
         }
 
         /// Sideways anywhere; up or down only away from the edges that Notification Center, Control Center and the
         /// Home indicator use.
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard parent?.enabled == true else { return false }
             guard let pan = recognizer as? UIPanGestureRecognizer, let view = pan.view else { return true }
             let velocity = pan.velocity(in: view)
             if abs(velocity.x) > abs(velocity.y) { slide = .seek; return true }
             let location = pan.location(in: view)
+            if parent?.episodes == true {
+                guard ShortDramaSwipe.isVertical(horizontal: velocity.x, vertical: velocity.y),
+                      PictureLevel.slides(fromY: location.y - pan.translation(in: view).y, height: view.bounds.height) else { return false }
+                slide = .episode
+                return true
+            }
             guard parent?.levels == true, PictureLevel.slides(fromY: location.y, height: view.bounds.height) else { return false }
             slide = location.x < view.bounds.width / 2 ? .brightness : .volume
             return true
@@ -2030,9 +2254,11 @@ private struct KSPlayerSurface: UIViewRepresentable {
     @PerceptionIgnored private var activeObservation: NSKeyValueObservation?
     @PerceptionIgnored private var attachment = UUID()
     @PerceptionIgnored private var restoreCompletion: ((Bool) -> Void)?
+    @PerceptionIgnored private var startTimeout: Task<Void, Never>?
     func attach(engine: KSPlaybackEngine) {
         self.engine = engine
         guard let next = engine.pipController else {
+            startTimeout?.cancel(); startTimeout = nil
             attachment = UUID(); observation = nil; activeObservation = nil
             controller?.delegate = nil; controller = nil
             possible = false; active = false; starting = false; transition.cancelled()
@@ -2041,6 +2267,7 @@ private struct KSPlayerSurface: UIViewRepresentable {
             return
         }
         guard controller !== next else { return }
+        startTimeout?.cancel(); startTimeout = nil
         let cancelledRestore = restoreCompletion
         restoreCompletion = nil
         starting = false; transition.cancelled()
@@ -2052,7 +2279,7 @@ private struct KSPlayerSurface: UIViewRepresentable {
         active = false
         engine.setPictureInPictureActive(next.isPictureInPictureActive)
         PlaybackSession.sharedLocal.pictureInPictureActive = next.isPictureInPictureActive
-        next.canStartPictureInPictureAutomaticallyFromInline = false
+        next.canStartPictureInPictureAutomaticallyFromInline = true
         // Playback commands stay with the KS sample-buffer delegate; this delegate restores the screen.
         next.delegate = self
         observation = next.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] value, _ in
@@ -2092,11 +2319,35 @@ private struct KSPlayerSurface: UIViewRepresentable {
         }
         else if controller.isPictureInPicturePossible, !starting, !active,
                 !transition.preservesSessionOnDismiss {
-            starting = true
-            transition.prepareToStart()
-            engine?.preparePictureInPicture()
+            prepareStart(controller)
             controller.startPictureInPicture()
         }
+    }
+    private func prepareStart(_ controller: AVPictureInPictureController) {
+        guard self.controller === controller, engine?.pipController === controller,
+              !starting, !active else { return }
+        starting = true
+        transition.prepareToStart()
+        engine?.preparePictureInPicture()
+        let identity = attachment
+        startTimeout?.cancel()
+        startTimeout = Task { @MainActor [weak self, weak controller] in
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            guard let self, let controller, self.attachment == identity,
+                  self.controller === controller, self.starting,
+                  !controller.isPictureInPictureActive else { return }
+            self.cancelStart()
+            Diagnostics.shared.record(.warning, "player.pip", "event=start-timeout")
+        }
+    }
+    private func cancelStart() {
+        startTimeout?.cancel(); startTimeout = nil
+        active = false; starting = false
+        engine?.setPictureInPictureActive(false)
+        transition.cancelled()
+        restoreCompletion?(false); restoreCompletion = nil
+        PlaybackSession.sharedLocal.pictureInPictureActive = false
+        engine?.pictureInPictureStartFailed()
     }
     /// The playback owner outlives the SwiftUI cover. Media replacement must
     /// release presentation ownership before the old AVKit controller vanishes.
@@ -2106,6 +2357,7 @@ private struct KSPlayerSurface: UIViewRepresentable {
         stop()
     }
     func stop() {
+        startTimeout?.cancel(); startTimeout = nil
         let previous = controller
         attachment = UUID(); observation = nil; activeObservation = nil; controller = nil
         previous?.delegate = nil; previous?.stopPictureInPicture()
@@ -2124,11 +2376,18 @@ private struct KSPlayerSurface: UIViewRepresentable {
         completion?(true)
     }
     func coverDismissed() { transition.coverDismissed() }
+    nonisolated func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        // Keep native willStart/didStart ordering on the same main queue.
+        DispatchQueue.main.async { [weak self] in
+            self?.prepareStart(pictureInPictureController)
+        }
+    }
     nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.controller === pictureInPictureController,
                   self.engine?.pipController === pictureInPictureController,
                   pictureInPictureController.isPictureInPictureActive, !self.transition.active else { return }
+            self.startTimeout?.cancel(); self.startTimeout = nil
             self.active = true; self.starting = false
             self.engine?.setPictureInPictureActive(true)
             // AVKit has finished capturing the source for its start animation.
@@ -2173,6 +2432,7 @@ private struct KSPlayerSurface: UIViewRepresentable {
                 return
             }
             self.active = false; self.starting = false; self.transition.stopped()
+            self.startTimeout?.cancel(); self.startTimeout = nil
             self.engine?.setPictureInPictureActive(false)
             PlaybackSession.sharedLocal.pictureInPictureActive = false
         }
@@ -2183,11 +2443,7 @@ private struct KSPlayerSurface: UIViewRepresentable {
         Task { @MainActor [weak self] in
             guard self?.controller === pictureInPictureController,
                   self?.engine?.pipController === pictureInPictureController else { return }
-            self?.active = false; self?.starting = false
-            self?.engine?.setPictureInPictureActive(false)
-            self?.transition.cancelled()
-            self?.restoreCompletion?(false); self?.restoreCompletion = nil
-            PlaybackSession.sharedLocal.pictureInPictureActive = false
+            self?.cancelStart()
             Diagnostics.shared.record(.warning, "player", "Picture in Picture failed: \(detail)")
         }
     }
@@ -2197,17 +2453,25 @@ private struct KSPlayerSurface: UIViewRepresentable {
 @MainActor @Perceptible final class PlayerClock {
     @PerceptionIgnored private var operations = PlaybackOperationScope()
     @PerceptionIgnored private weak var engine: KSPlaybackEngine?
+    @PerceptionIgnored private var cacheCoverage: () -> [ClosedRange<Double>] = { [] }
     private(set) var scrubbing: Double?
     var position: Double { engine?.position ?? 0 }
     var duration: Double { engine?.duration ?? 0 }
     var bufferedPosition: Double { engine?.bufferedPosition ?? 0 }
+    var cachedTimeRanges: [ClosedRange<Double>] { cacheCoverage() }
+    var bufferedRanges: [ClosedRange<Double>] {
+        PlaybackBufferTimeline.ranges(position: position, buffered: bufferedPosition,
+                                      duration: duration, cached: cachedTimeRanges)
+    }
     var presentationSize: CGSize { engine?.presentationSize ?? .zero }
     var currentPosition: Double { engine?.position ?? 0 }
     private(set) var preview: CGImage?
     @PerceptionIgnored private var previewTask: Task<Void, Never>?
     @PerceptionIgnored private var previewScope = UUID()
-    func attach(_ engine: KSPlaybackEngine) { detach(); self.engine = engine }
-    func detach() { replaceMedia(); engine = nil }
+    func attach(_ engine: KSPlaybackEngine, cacheCoverage: @escaping () -> [ClosedRange<Double>] = { [] }) {
+        detach(); self.engine = engine; self.cacheCoverage = cacheCoverage
+    }
+    func detach() { replaceMedia(); engine = nil; cacheCoverage = { [] } }
     func replaceMedia() { operations.replaceMedia(); scrubbing = nil; cancelPreview() }
     func scrub(to seconds: Double) {
         // A previous submitted seek may complete while this draft is still held.
@@ -2259,42 +2523,56 @@ private struct KSPlayerSurface: UIViewRepresentable {
 }
 
 private enum LocalPlayerPanel: String, Identifiable {
-    case cast, aspect, speed, volume, information, episodes, quality, video, audio, subtitle, danmaku, chapters, skip, subtitleAddress, danmakuList, danmakuConfiguration
+    case cast, aspect, speed, sleepTimer, information, episodes, quality, video, audio, subtitle, danmaku, chapters, skip, subtitleAddress, danmakuList, danmakuConfiguration, stations, lines, guide
     var id: String { rawValue }
-    var title: String { switch self { case .cast: "投屏"; case .aspect: "画面比例"; case .speed: "倍速"; case .volume: "音量"; case .information: "视频信息"; case .episodes: "选集"; case .quality: "画质"; case .video: "视轨"; case .audio: "音轨"; case .subtitle: "字幕"; case .danmaku: "弹幕"; case .chapters: "章节"; case .skip: "片头片尾"; case .subtitleAddress: "从网址添加字幕"; case .danmakuList: "弹幕列表"; case .danmakuConfiguration: "配置弹幕来源" } }
-    var symbol: String { switch self { case .cast: "airplayvideo"; case .aspect: "aspectratio"; case .speed: "speedometer"; case .volume: "speaker.wave.2"; case .information: "info.circle"; case .episodes: "rectangle.stack"; case .quality: "slider.horizontal.3"; case .video: "film"; case .audio: "speaker.wave.2"; case .subtitle, .subtitleAddress: "captions.bubble"; case .danmaku, .danmakuList: "text.bubble"; case .chapters: "book"; case .skip: "forward.end"; case .danmakuConfiguration: "globe" } }
+    var title: String { switch self { case .cast: "投屏"; case .aspect: "画面比例"; case .speed: "倍速"; case .sleepTimer: "定时关闭"; case .information: "视频信息"; case .episodes: "选集"; case .quality: "画质"; case .video: "视轨"; case .audio: "音轨"; case .subtitle: "字幕"; case .danmaku: "弹幕"; case .chapters: "章节"; case .skip: "片头片尾"; case .subtitleAddress: "从网址添加字幕"; case .danmakuList: "弹幕列表"; case .danmakuConfiguration: "配置弹幕来源"; case .stations: "频道"; case .lines: "线路"; case .guide: "节目单" } }
+    var symbol: String { switch self { case .cast: "airplayvideo"; case .aspect: "aspectratio"; case .speed: "speedometer"; case .sleepTimer: "alarm"; case .information: "info.circle"; case .episodes: "rectangle.stack"; case .quality: "slider.horizontal.3"; case .video: "film"; case .audio: "speaker.wave.2"; case .subtitle, .subtitleAddress: "captions.bubble"; case .danmaku, .danmakuList: "text.bubble"; case .chapters: "book"; case .skip: "scissors"; case .danmakuConfiguration: "globe"; case .stations: "list.bullet.rectangle"; case .lines: "arrow.triangle.branch"; case .guide: "calendar" } }
 }
 
 /// The video on the Lock Screen, in Control Center and on headphones, with play, pause, skip and scrub: AVKit's
 /// own player published these by itself. Music holds Now Playing only while no video plays (MusicRemoteControl).
 @MainActor final class VideoNowPlaying {
     private var targets: [(MPRemoteCommand, Any)] = []
+    private var commandRevision = UUID()
 
     func start(_ session: PlaybackSession) {
         guard targets.isEmpty else { return }
         let commands = MPRemoteCommandCenter.shared()
-        func on(_ command: MPRemoteCommand, _ action: @escaping @MainActor (PlaybackSession, MPRemoteCommandEvent) -> Void) {
+        func on(_ command: MPRemoteCommand, _ action: Action) {
             command.isEnabled = true
-            let target = command.addTarget { [weak self, weak session] event in
-                MainActor.assumeIsolated {
-                    guard let session else { return .noActionableNowPlayingItem }
-                    action(session, event)
-                    self?.update(title: nil, session: session)
-                    return .success
-                }
-            }
+            let target = command.addTarget(handler: Self.handler(action, owner: self, session: session, run: commandRevision))
             targets.append((command, target))
         }
-        on(commands.playCommand) { session, _ in if session.paused { session.togglePlayback() } }
-        on(commands.pauseCommand) { session, _ in session.engine.pause() }
-        on(commands.togglePlayPauseCommand) { session, _ in session.togglePlayback() }
+        on(commands.playCommand, .play)
+        on(commands.pauseCommand, .pause)
+        on(commands.togglePlayPauseCommand, .toggle)
         commands.skipForwardCommand.preferredIntervals = [10]
         commands.skipBackwardCommand.preferredIntervals = [10]
-        on(commands.skipForwardCommand) { session, _ in session.skip(10) }
-        on(commands.skipBackwardCommand) { session, _ in session.skip(-10) }
-        on(commands.changePlaybackPositionCommand) { session, event in
-            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return }
-            session.engine.seek(to: event.positionTime)
+        on(commands.skipForwardCommand, .forward)
+        on(commands.skipBackwardCommand, .backward)
+        on(commands.changePlaybackPositionCommand, .position)
+    }
+
+    private enum Action: Sendable { case play, pause, toggle, forward, backward, position }
+
+    private nonisolated static func handler(_ action: Action, owner: VideoNowPlaying, session: PlaybackSession, run: UUID) -> (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        { [weak owner, weak session] event in
+            let position = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime
+            if action == .position, position?.isFinite != true { return .commandFailed }
+            Task { @MainActor [weak owner, weak session] in
+                guard let owner, let session, owner.commandRevision == run, !owner.targets.isEmpty else { return }
+                switch action {
+                case .play: if session.paused { session.togglePlayback() }
+                case .pause: session.engine.pause()
+                case .toggle: session.togglePlayback()
+                case .forward: session.skip(10)
+                case .backward: session.skip(-10)
+                case .position:
+                    if session.hasTimeline, !session.isLive, let position { session.engine.seek(to: position) }
+                }
+                owner.update(title: nil, session: session)
+            }
+            return .success
         }
     }
 
@@ -2351,6 +2629,7 @@ private enum LocalPlayerPanel: String, Identifiable {
     }
 
     func stop() {
+        commandRevision = UUID()
         for (command, target) in targets { command.removeTarget(target) }
         targets = []
         artworkTask?.cancel(); artworkTask = nil; artworkSource = nil; artwork = nil

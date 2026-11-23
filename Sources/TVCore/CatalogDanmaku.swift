@@ -135,6 +135,10 @@ public enum CatalogDanmakuMatcher {
 
     public static func episodeNumber(_ name: String) -> Int? {
         guard !LocalDetailEpisodeNumbers.isExtra(name) else { return nil }
+        // A numbered bonus clip has its own sequence alongside the regular episodes.
+        // Keep an unnumbered mention of 彩蛋 in a regular episode's synopsis matchable.
+        if name.range(of: #"彩蛋\s*(?:第\s*)?[\d零〇一二两兩三四五六七八九十百]+(?=$|[\s\p{P}])"#,
+                      options: .regularExpression) != nil { return nil }
         guard let number = LocalDetailEpisodeNumbers.numbers(name).episode, number > 0 else { return nil }
         return number
     }

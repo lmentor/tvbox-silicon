@@ -152,11 +152,11 @@ public enum LiveCatalog {
         let id = url.lastPathComponent
         return id.isEmpty || id == "/" ? nil : (platform, id)
     }
-    public static func isRoom(_ url: URL) -> Bool { room(url) != nil }
+    public static func isRoom(_ url: URL) -> Bool { IPTVRoomAddress(url) != nil || room(url) != nil }
     /// Whether the address has a live platform's shape (`<name>-live://room/<id>`), known to this copy or not:
     /// favorites keep a room by its address even before the platforms load.
     public static func isRoomAddress(_ url: URL) -> Bool {
-        url.host() == "room" && (url.scheme?.lowercased().hasSuffix("-live") ?? false) && url.pathComponents.count == 2
+        IPTVRoomAddress(url) != nil || url.host() == "room" && (url.scheme?.lowercased().hasSuffix("-live") ?? false) && url.pathComponents.count == 2
     }
     /// A live platform's listing address (`<name>-live://rooms`) in a subscription's `lives`.
     static func platformAddress(_ text: String) -> URL? {
@@ -167,6 +167,7 @@ public enum LiveCatalog {
     /// The playable channel for a room channel (at the quality its address asks for, else the best),
     /// with the room's qualities and the one served; any other channel is returned unchanged.
     public static func resolve(_ channel: Channel) async throws -> (channel: Channel, qualities: [StreamQuality], current: Int?) {
+        if let registered = IPTVRoomAddress(channel.url) { return try await IPTVPlatform.resolve(channel, room: registered) }
         guard let (platform, id) = room(channel.url) else { return (channel, [], nil) }
         let asked = URLComponents(url: channel.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "q" }?.value.flatMap(Int.init)
         let reply = try await platform.call(["play": id, "flag": asked.map(String.init) ?? ""])

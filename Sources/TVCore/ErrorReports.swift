@@ -27,6 +27,7 @@ public final class ErrorReports: @unchecked Sendable {
 
     private let defaults: UserDefaults
     private let file: URL
+    private let contextFile: URL
     private let interval: TimeInterval
     private let lock = NSLock()
     // Guarded by `lock`.
@@ -43,16 +44,23 @@ public final class ErrorReports: @unchecked Sendable {
     private var context: QuitContext
     private var sampler: DispatchSourceTimer?
     private var pressure: DispatchSourceMemoryPressure?
-    /// Saves and clears that context in order, outside `lock`: a UserDefaults write can wait on
-    /// SwiftUI, and the main thread waits on `lock` in `onScreen` during a scene update (8BADF00D).
+    /// Saves and clears snapshots in order outside `lock`. Diagnostic samples
+    /// belong in a file: writing shared defaults every 30 seconds notifies
+    /// SwiftUI's preference observers and rebuilds the UI during playback.
     private let contextWriter = DispatchQueue(label: "tvbox.error-reports.context", qos: .utility)
 
     init(defaults: UserDefaults = .standard, directory: URL = Diagnostics.shared.directory, interval: TimeInterval = 6 * 3600) {
         self.defaults = defaults
         self.file = directory.appendingPathComponent("error-reports.json")
+        let contextFile = directory.appendingPathComponent("error-reports-context.json")
+        self.contextFile = contextFile
         self.interval = interval
         self.previousLaunch = defaults.string(forKey: Self.onScreenKey)
-        self.previousContext = defaults.data(forKey: Self.contextKey).flatMap { try? JSONDecoder().decode(QuitContext.self, from: $0) }
+        self.previousContext = (try? Data(contentsOf: contextFile)).flatMap { try? JSONDecoder().decode(QuitContext.self, from: $0) }
+            ?? defaults.data(forKey: Self.contextKey).flatMap { try? JSONDecoder().decode(QuitContext.self, from: $0) }
+        // Read an older build's context before retiring its preference. This
+        // one-time migration precedes the first foreground sampling session.
+        if defaults.object(forKey: Self.contextKey) != nil { defaults.removeObject(forKey: Self.contextKey) }
         let now = Int(Date().timeIntervalSince1970)
         self.context = QuitContext(launch: Self.launch, started: now, saved: now)
     }
@@ -123,7 +131,7 @@ public final class ErrorReports: @unchecked Sendable {
         lock.withLock {
             sampler?.cancel(); sampler = nil
             pressure?.cancel(); pressure = nil
-            contextWriter.async { self.defaults.removeObject(forKey: Self.contextKey) }
+            contextWriter.async { try? FileManager.default.removeItem(at: self.contextFile) }
         }
     }
 
@@ -135,7 +143,12 @@ public final class ErrorReports: @unchecked Sendable {
             guard sampler != nil else { return }
             context.footprint = memory.footprint; context.available = memory.available
             context.saved = Int(Date().timeIntervalSince1970)
-            if let data = try? JSONEncoder().encode(context) { contextWriter.async { self.defaults.set(data, forKey: Self.contextKey) } }
+            if let data = try? JSONEncoder().encode(context) {
+                contextWriter.async {
+                    try? FileManager.default.createDirectory(at: self.contextFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? data.write(to: self.contextFile, options: .atomic)
+                }
+            }
         }
     }
 

@@ -281,8 +281,12 @@ struct CompactPlayerPopup<Content: View>: View {
                     .scrollDismissesKeyboard(.interactively)
             } else { content().frame(maxWidth: .infinity, maxHeight: .infinity) }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .foregroundStyle(.white.opacity(0.96))
         .localPlayerGlassSurface(cornerRadius: 22)
+        // The decorative glass ignores touches. This native sibling catches
+        // empty card space without competing with text selection or sliders.
+        .background(PlayerPopupTouchBarrier())
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .tint(.accentColor)
         .font(.system(size: 14))
@@ -290,6 +294,11 @@ struct CompactPlayerPopup<Content: View>: View {
         .textFieldStyle(LocalGlassTextFieldStyle())
         .accessibilityElement(children: .contain)
     }
+}
+
+private struct PlayerPopupTouchBarrier: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView { UIView() }
+    func updateUIView(_ view: UIView, context: Context) {}
 }
 
 /// Both player rows use the same unplated symbols, hit targets and selected feedback.

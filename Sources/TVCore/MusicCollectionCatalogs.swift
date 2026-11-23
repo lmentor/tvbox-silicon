@@ -26,17 +26,61 @@ extension QQMusicCatalog: MusicCollectionSource {
             }
         case .playlist:
             guard let id = Int(collection.collectionID) else { throw MusicProviderError.invalidResponse("invalid QQ playlist ID") }
-            return try await MusicCollections.loadPages { _, offset in
-                let json = try await call(module: "music.srfDissInfo.aiDissInfo", method: "uniform_get_Dissinfo", param: [
-                    "disstid": id, "userinfo": 1, "tag": 1, "is_pc": 1, "orderlist": 1,
-                    "song_begin": offset, "song_num": 100, "onlysonglist": 0,
-                ])
-                let data = json[path: "req", "data"]
-                return try MusicCollectionPage(rows: data?["songlist"]?.array,
-                                               total: data?["total_song_num"]?.int ?? data?[path: "dirinfo", "songnum"]?.int,
-                                               parse: Self.track)
+            return try await playlistTracks(id)
+        }
+    }
+
+    private func playlistTracks(_ id: Int) async throws -> [MusicTrack] {
+        var tracks: [MusicTrack] = [], offset = 0, knownTotal: Int?
+        var signatures = Set<[String]>()
+        for _ in 0..<MusicCollections.trackLimit {
+            try Task.checkCancellation()
+            let json = try await call(module: "music.srfDissInfo.aiDissInfo", method: "uniform_get_Dissinfo", param: [
+                "disstid": id, "userinfo": 1, "tag": 1, "is_pc": 1, "orderlist": 1,
+                "song_begin": offset, "song_num": 100, "onlysonglist": 0,
+            ])
+            let data = json[path: "req", "data"]
+            let page = try MusicCollectionPage(rows: data?["songlist"]?.array,
+                                              total: data?["total_song_num"]?.int ?? data?[path: "dirinfo", "songnum"]?.int,
+                                              parse: Self.track)
+            let filtered: [JSONValue]
+            if let value = data?["filtered_song"] {
+                guard let rows = value.array else { throw MusicProviderError.invalidResponse("QQ playlist has invalid filtered entries") }
+                filtered = rows
+            } else { filtered = [] }
+            guard let total = page.total, total >= 0, total <= MusicCollections.trackLimit,
+                  filtered.count <= MusicCollections.trackLimit - total else {
+                throw MusicProviderError.invalidResponse("QQ playlist has an invalid total")
+            }
+            // QQ subtracts only this page's filtered entries from total_song_num, while
+            // song_begin still counts those slots. Normalizing both prevents duplicate
+            // page boundaries and false size-change errors on otherwise complete playlists.
+            let slotTotal = total + filtered.count
+            if let knownTotal, knownTotal != slotTotal {
+                throw MusicProviderError.invalidResponse("QQ playlist size changed during loading")
+            }
+            knownTotal = slotTotal
+            let consumed = page.tracks.count + filtered.count
+            guard consumed <= slotTotal - offset else {
+                throw MusicProviderError.invalidResponse("QQ playlist exceeded its advertised total")
+            }
+            if !page.tracks.isEmpty {
+                guard signatures.insert(page.tracks.map(\.id)).inserted else {
+                    throw MusicProviderError.invalidResponse("QQ playlist repeated a track page")
+                }
+            }
+            tracks += page.tracks
+            offset += consumed
+            let hasMore = MusicCatalogData.bool(data?["hasmore"])
+            if offset == slotTotal {
+                guard hasMore != true else { throw MusicProviderError.invalidResponse("QQ playlist returned incomplete pagination") }
+                return tracks
+            }
+            guard consumed > 0, hasMore != false else {
+                throw MusicProviderError.invalidResponse("QQ playlist ended before its advertised total")
             }
         }
+        throw MusicProviderError.invalidResponse("QQ playlist exceeded page limit")
     }
 
     /// One anonymous call to QQ's music gateway; a code other than 0 is a failure.

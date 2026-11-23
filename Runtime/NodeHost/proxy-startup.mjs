@@ -19,9 +19,13 @@ export function proxyStartupOptions(request, options) {
 }
 
 export const supportedProxyStartupBundleHash = '992a3990d0261122727d1c91013cd14f39f86eba290eb738902ef15d12fac067';
-const entry = 'async function Hxa(e,t,r,n,a,i,s=null,o=!1,c=0){';
+const entries = new Map([
+  [supportedProxyStartupBundleHash, 'async function Hxa(e,t,r,n,a,i,s=null,o=!1,c=0){'],
+  ['1ab8021d31a0bbcd42ffee16b739772eb55c14584182e9f4f3f6c191a24b1ce3',
+    'async function Qxa(e,t,r,n,a,i,s=null,o=!1,c=0){'],
+]);
 export function adaptProxyStartupBundle(source) {
-  if (createHash('sha256').update(source).digest('hex') !== supportedProxyStartupBundleHash
-    || source.split(entry).length !== 2) return { source, applied: false };
+  const entry = entries.get(createHash('sha256').update(source).digest('hex'));
+  if (!entry || source.split(entry).length !== 2) return { source, applied: false };
   return { source: source.replace(entry, entry + `i=(${proxyStartupOptions.toString()})(e,i);`), applied: true };
 }

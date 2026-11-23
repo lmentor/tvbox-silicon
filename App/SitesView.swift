@@ -115,8 +115,13 @@ struct SitesView: View {
 
 
     private func sourceList(_ config: Subscription) -> some View {
-        let groups = visibleSourceGroups.filtered(by: query).limited(to: pick == nil ? nil : Set(pickable.map(\.key)))
+        // A dock panel is already supplied its visible, ordered category. Building
+        // all subscription/hidden groups here duplicated that work and then
+        // immediately flattened it back into a single grid.
+        let groups = panelKind == nil ? visibleSourceGroups.filtered(by: query).limited(to: pick == nil ? nil : Set(pickable.map(\.key))) : []
         let sites = panelKind == nil ? store.orderedSites(config) : pickable
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        let panelSites = terms.isEmpty ? sites : sites.filter { site in terms.allSatisfy { site.name.localizedCaseInsensitiveContains($0) } }
         return ScrollViewReader { proxy in
             WithPerceptionTracking {
                 ScrollView {
@@ -125,7 +130,7 @@ struct SitesView: View {
                             if panelKind != nil {
                                 VStack(spacing: Layout.cardSpacing) {
                                     builtinHomeButton
-                                    sourcePickerGrid(groups, sites: sites, config: config)
+                                    sourcePickerGrid(panelSites, config: config)
                                 }
                             } else {
                                 sourceGroups(groups, sites: sites, config: config)
@@ -241,10 +246,9 @@ struct SitesView: View {
         }
     }
 
-    private func sourcePickerGrid(_ groups: [SourceGroup], sites: [Site], config: Subscription) -> some View {
-        let eligible = Set(groups.filter { $0.kind != .hidden }.flatMap(\.sites).map(\.key))
-        return LazyVGrid(columns: sourceColumns, spacing: Layout.cardSpacing) {
-            ForEach(sites.filter { eligible.contains($0.key) }) { site in
+    private func sourcePickerGrid(_ sites: [Site], config: Subscription) -> some View {
+        LazyVGrid(columns: sourceColumns, spacing: Layout.cardSpacing) {
+            ForEach(sites) { site in
                 WithPerceptionTracking {
                     sourceCard(site, dimmed: false, sites: sites, config: config)
                 }
@@ -294,7 +298,6 @@ struct SitesView: View {
             .accessibilityIdentifier("source." + site.key)
             .contextMenu {
                 WithPerceptionTracking {
-                    PinSourceButton(site: site, origin: config.origin)
                     HideSourceButton(site: site, origin: config.origin)
                     if store.sourceOrder.enabled { MoveSourceButtons(site: site, sites: sites) }
                 }
@@ -452,8 +455,6 @@ struct SiteCard: View {
     let site: Site
     /// A source the viewer hid, shown only while hidden sources are revealed.
     var dimmed = false
-    /// The pin badge on the icon; off in Watch Now's Pinned Sources, where every card is pinned.
-    var marksPinned = true
     /// Whether this is the source currently chosen, when picking one (`SitesView.pick`); nil when not picking.
     var chosen: Bool? = nil
     #if os(tvOS)
@@ -467,24 +468,11 @@ struct SiteCard: View {
     var body: some View {
         WithPerceptionTracking {
             let label = SourceLabel(site.name)
-            let pinned = marksPinned && (store.subscription.map { store.pinnedSources.contains(site, origin: $0.origin) } ?? false)
             let runs = site.isBuiltIn || site.canBrowse(jarURL: store.subscription?.spiderURL)
             let detail = runs ? (label.parts.dropFirst() + [engine].compactMap { $0 }).joined(separator: " · ") : site.compatibility
             HStack(spacing: padding) {
                 SourceIcon(site: site, label: label, size: icon)
                     .opacity(runs ? 1 : 0.45)
-                    // A badge on the icon, not another line, so pinned cards keep the grid's height.
-                    .overlay(alignment: .bottomTrailing) {
-                        WithPerceptionTracking {
-                            if pinned {
-                                Image(systemName: "pin.fill").font(.system(size: icon * 0.18, weight: .bold)).foregroundStyle(Brand.onAccent)
-                                    .frame(width: icon * 0.36, height: icon * 0.36).background(Brand.accent, in: Circle())
-                                    .overlay { WithPerceptionTracking { Circle().strokeBorder(.black.opacity(0.35), lineWidth: 1) } }
-                                    .offset(x: icon * 0.1, y: icon * 0.1)
-                                    .accessibilityLabel(L10n.text("Pinned"))
-                            }
-                        }
-                    }
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
                         Text(label.parts[0]).font(.headline).lineLimit(1)
@@ -589,19 +577,7 @@ struct MonogramIcon: View {
     }
 }
 
-struct PinSourceButton: View {
-    @Environment(Store.self) private var store
-    let site: Site
-    let origin: URL
-    var body: some View {
-        WithPerceptionTracking {
-            let pinned = store.pinnedSources.contains(site, origin: origin)
-            Button { store.pinnedSources.toggle(site, origin: origin) } label: {
-                Label(L10n.text(pinned ? "Unpin source" : "Pin source"), systemImage: pinned ? "pin.slash" : "pin")
-            }.accessibilityIdentifier("source.pin." + site.key)
-        }
-    }
-}
+
 
 struct HideSourceButton: View {
     @Environment(Store.self) private var store
@@ -646,14 +622,14 @@ struct SourceOrderCard: View {
         Binding { store.sourceOrder.enabled } set: { on in withAnimation(.appSmooth) { store.setCustomSourceOrder(on) } }
     }
     private var detail: String {
-        L10n.text(store.sourceOrder.enabled ? "Sources at the top are searched first, and their results are listed first."
-                                            : "Yingxia searches quick, reliable sources first.")
+        store.sourceOrder.enabled ? "来源页面按自定义顺序显示；全局搜索按设置中的来源顺序进行。"
+                                  : "来源页面按订阅顺序显示；全局搜索按设置中的来源顺序进行。"
     }
     var body: some View {
         WithPerceptionTracking {
             #if os(tvOS)
             VStack(alignment: .leading, spacing: 8) {
-                TVSettingsToggle(title: L10n.text("Custom Search Order"), detail: detail, isOn: enabled)
+                TVSettingsToggle(title: "自定义来源显示顺序", detail: detail, isOn: enabled)
                     .accessibilityIdentifier("sources.order.toggle")
                 if store.sourceOrder.enabled {
                     Button(action: arrange) {
@@ -668,11 +644,11 @@ struct SourceOrderCard: View {
                 HStack(spacing: 14) {
                     IconTile(symbol: "arrow.up.arrow.down", tint: Brand.indigo, size: 40)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(L10n.text("Custom Search Order")).font(.headline)
+                        Text("自定义来源显示顺序").font(.headline)
                         Text(detail).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 8)
-                    Toggle(L10n.text("Custom Search Order"), isOn: enabled).labelsHidden().toggleStyle(.switch).settingsSwitch()
+                    Toggle("自定义来源显示顺序", isOn: enabled).labelsHidden().toggleStyle(.switch).settingsSwitch()
                         .accessibilityIdentifier("sources.order.toggle")
                 }
                 if store.sourceOrder.enabled {
@@ -825,7 +801,7 @@ struct SourceOrderEditor: View {
                         WithPerceptionTracking {
                             LazyVStack(alignment: .leading, spacing: 4) {
                                 WithPerceptionTracking {
-                                    Text(L10n.text("Choose a source to move it. Sources at the top are searched first, and their results are listed first."))
+                                    Text("选择来源调整显示位置。全局搜索按设置中的来源顺序进行。")
                                         .font(.system(size: 24)).foregroundStyle(.secondary).padding(.bottom, 12)
                                     ForEach(Array(sites.enumerated()), id: \.element.id) { index, site in
                                         WithPerceptionTracking {
@@ -883,7 +859,7 @@ struct SourceOrderEditor: View {
                                 }
                                 .onMove { sites.move(fromOffsets: $0, toOffset: $1) }
                             } footer: {
-                                Text(L10n.text("Drag sources to reorder them. Sources at the top are searched first, and their results are listed first."))
+                                Text("拖动来源调整显示位置。全局搜索按设置中的来源顺序进行。")
                             }
                         }
                     }
@@ -1152,7 +1128,7 @@ struct SiteView: View {
     /// The source's home as another page already has it (Watch Now's recommendations): shown at once, then refreshed.
     var preview: (videos: [Video], categories: [TVCore.Category])? = nil
     private var canLoad: Bool { site.canBrowse(jarURL: jarURL) }
-    private var isIndex: Bool { (site.raw["indexs"]?.int ?? 0) == 1 }
+    private var isIndex: Bool { site.isIndexSource }
     #if os(iOS)
     @State private var browser = CatalogBrowser(usesInitialFilters: false)
     #else
@@ -1168,9 +1144,17 @@ struct SiteView: View {
     @State private var landscapePosters = false
     @State private var showsFilters = false
     @State private var showsSiteActions = false
+    @State private var refreshAfterActions = false
+    @State private var hidesSourceAfterActions = false
+    @State private var returnsToParentAfterSiteActions = false
+    @State private var linkChecks = LocalSiteLinkChecks()
+    @State private var checksEnabled = true
+    @State private var catalogRevision = 0
     @State private var paginationVisible = false
     @State private var paginationVisibleRequest: CatalogBrowser.Request?
     private var posterStyleKey: String { "local.site.landscapePosters." + site.origin(or: origin).absoluteString + "|" + site.sourceKey }
+    private var linkCheckKey: String { "local.site.linkChecks." + PlaybackHistoryContext.sourceIdentity(site.origin(or: origin)).absoluteString + "|" + site.sourceKey }
+    private var linkCheckScope: String { "\(site.key)|\(browser.category)|\(browser.query)|\(browser.filters.sorted { $0.key < $1.key })|\(catalogRevision)" }
     private var currentCategory: TVCore.Category? {
         browser.query.isEmpty ? browser.categories.first { $0.id == browser.category } : nil
     }
@@ -1189,68 +1173,155 @@ struct SiteView: View {
 
     var body: some View {
         WithPerceptionTracking {
+            presentedSiteContent.task(id: pageActive) { await loadWhenActive() }
+        }
+    }
+
+    /// Keep each source lifecycle and presentation layer independently inferred.
+    /// The modifier order is also the cancellation/presentation order on iOS 16.
+    private var lifecycleSiteContent: some View {
+        WithPerceptionTracking {
             siteContent
-            .onDisappear { requestTask?.cancel(); browser.cancel() }
-            #if os(iOS)
-            .appOnChange(of: localPageActive) { _, active in
-                if !active { requestTask?.cancel(); browser.cancel() }
-                else if paginationVisible && paginationVisibleRequest == browser.request && browser.moreError == nil { Task { await loadMore() } }
-            }
-            #endif
-            #if !os(iOS)
-            .toolbar { WithPerceptionTracking {
-
-                    // Handed the store: UIKit can size a bar item before SwiftUI gives it the page's environment, and these
-                    // buttons read Store first thing (a TestFlight crash on iPhone).
-                    Group {
-                        PinSourceButton(site: site, origin: origin)
-                        HideSourceButton(site: site, origin: origin)
-                    }
-                    .environment(store)
-
-             }}
-            #endif
-            .screenBackdrop()
-            .onAppear {
-                guard site.isBilibili, browser.loaded else { return }
-                let login = BilibiliAccount.load().cookie
-                if login != bilibiliLogin { bilibiliLogin = login; query = ""; startRequest { await home(); await browser.loadCategories(client: client) } }
-            }
-            .modifier(LocalSitePageTitle(title: folder?.name ?? site.name))
-            #if os(iOS)
-            .onAppear { landscapePosters = UserDefaults.standard.bool(forKey: posterStyleKey) }
-            .sheet(isPresented: $showsSiteActions) {
-                LocalSiteActionsSheet(site: site, origin: origin) {
-                    startRequest { await browser.load(browser.request, client: client); await browser.loadCategories(client: client) }
-                    showsSiteActions = false
+                .onDisappear(perform: cancelPageRequests)
+                #if os(iOS)
+                .appOnChange(of: localPageActive) { _, active in pageActivityChanged(active) }
+                .appOnChange(of: browser.videos) { _, _ in updateLinkChecks() }
+                .appOnChange(of: checksEnabled) { _, enabled in
+                    UserDefaults.standard.set(enabled, forKey: linkCheckKey)
+                    updateLinkChecks()
                 }
-                .environment(store)
-            }
-            .localGlassDialog(isPresented: $showsFilters, title: "筛选", maxWidth: 540, maxHeight: 640, layout: .centered) {
-                WithPerceptionTracking {
-                    if let category = currentCategory {
-                        LocalSiteFilterSheet(filters: category.filters, choices: browser.filters) { choices in
-                            startRequest { await browser.load(.list(category: category.id, query: "", page: 1, filters: choices), client: client) }
-                        }
+                #else
+                .toolbar {
+                    WithPerceptionTracking {
+                        HideSourceButton(site: site, origin: origin).environment(store)
                     }
                 }
-            }
-            #endif
-            .task(id: pageActive) {
-                guard pageActive else { return }
-                store.searchModel.suspend()
-                if let preview, folder == nil, initialQuery.isEmpty { browser.seed(videos: preview.videos, categories: preview.categories) }
-                if canLoad && !browser.loaded {
-                    if browser.request != .home {
-                        await browser.load(browser.request, client: client)
-                    } else if initialQuery.isEmpty {
-                        await home()
-                    }
-                    else { query = initialQuery; await search(); await browser.loadCategories(client: client) }
+                #endif
+        }
+    }
+
+    private var styledSiteContent: some View {
+        WithPerceptionTracking {
+            lifecycleSiteContent
+                .screenBackdrop()
+                .onAppear(perform: refreshBilibiliLogin)
+                .modifier(LocalSitePageTitle(title: folder?.name ?? site.name, hidesNavigationBar: folder != nil))
+        }
+    }
+
+    @ViewBuilder private var presentedSiteContent: some View {
+        #if os(iOS)
+        mobileFilterDialogContent
+        #else
+        styledSiteContent
+        #endif
+    }
+
+    private func cancelPageRequests() {
+        requestTask?.cancel(); browser.cancel()
+        #if os(iOS)
+        linkChecks.stop()
+        #endif
+    }
+
+    private func refreshBilibiliLogin() {
+        guard site.isBilibili, browser.loaded else { return }
+        let login = BilibiliAccount.load().cookie
+        if login != bilibiliLogin {
+            bilibiliLogin = login; query = ""
+            startRequest { await home(); await browser.loadCategories(client: client) }
+        }
+    }
+
+    private func loadWhenActive() async {
+        guard pageActive else { return }
+        store.searchModel.suspend()
+        if let preview, folder == nil, initialQuery.isEmpty { browser.seed(videos: preview.videos, categories: preview.categories) }
+        if canLoad && !browser.loaded {
+            if browser.request != .home {
+                await browser.load(browser.request, client: client)
+            } else if initialQuery.isEmpty {
+                await home()
+            } else { query = initialQuery; await search(); await browser.loadCategories(client: client) }
+        }
+    }
+
+    #if os(iOS)
+    private func pageActivityChanged(_ active: Bool) {
+        if !active { cancelPageRequests() }
+        else if paginationVisible && paginationVisibleRequest == browser.request && browser.moreError == nil { Task { await loadMore() } }
+        if active { updateLinkChecks() }
+    }
+
+    private var mobileActionsContent: some View {
+        WithPerceptionTracking {
+            styledSiteContent
+                .onAppear {
+                    landscapePosters = UserDefaults.standard.bool(forKey: posterStyleKey)
+                    checksEnabled = UserDefaults.standard.object(forKey: linkCheckKey) as? Bool ?? true
+                    updateLinkChecks()
+                }
+                .localGlassDialog(isPresented: $showsSiteActions, title: SourceLabel(site.name).text, maxWidth: 460,
+                                  onDismiss: completeSiteActions) { siteActionsContent }
+        }
+    }
+
+    private var mobileFilterDialogContent: some View {
+        WithPerceptionTracking {
+            mobileActionsContent
+                .localGlassDialog(isPresented: $showsFilters, title: "筛选", maxWidth: 540, maxHeight: 640,
+                                  layout: .centered) { siteFiltersContent }
+        }
+    }
+
+    private var siteActionsContent: some View {
+        WithPerceptionTracking {
+            LocalSiteActionsSheet(site: site, origin: origin, jarURL: jarURL, refresh: {
+                refreshAfterActions = true
+                showsSiteActions = false
+            }, hide: {
+                hidesSourceAfterActions = true
+                showsSiteActions = false
+            }, checksEnabled: $checksEnabled, returnToParent: parentFolderAction)
+            .environment(store)
+        }
+    }
+
+    private var siteFiltersContent: some View {
+        WithPerceptionTracking {
+            if let category = currentCategory {
+                LocalSiteFilterSheet(filters: category.filters, choices: browser.filters) { choices in
+                    startRequest { await browser.load(.list(category: category.id, query: "", page: 1, filters: choices), client: client) }
                 }
             }
         }
     }
+
+    private var parentFolderAction: (() -> Void)? {
+        guard folder != nil else { return nil }
+        return {
+            returnsToParentAfterSiteActions = true
+            showsSiteActions = false
+        }
+    }
+
+    private func completeSiteActions() {
+        if refreshAfterActions {
+            refreshAfterActions = false
+            catalogRevision += 1; linkChecks.stop()
+            startRequest { await browser.refresh(client: client) }
+        }
+        if hidesSourceAfterActions {
+            hidesSourceAfterActions = false
+            store.hiddenSources.setHidden([site], origin: origin, hidden: true)
+        }
+        if returnsToParentAfterSiteActions {
+            returnsToParentAfterSiteActions = false
+            dismiss()
+        }
+    }
+    #endif
+
     private var pageActive: Bool {
         #if os(iOS)
         localPageActive
@@ -1459,6 +1530,13 @@ struct SiteView: View {
             .padding(.vertical, browser.videos.isEmpty ? 24 : 8)
         }
         if browser.videos.isEmpty && browser.loaded && !browser.busy && browser.error == nil { EmptyResults(symbol: "film", title: L10n.text("No Videos"), message: L10n.text("Try selecting a category or searching.")) }
+        #if os(iOS)
+        if checksEnabled, site.supportsLocalLinkChecks, linkChecks.total > 0 {
+            Text((linkChecks.checking ? "正在检测当前列表链接 \(linkChecks.completed)/\(linkChecks.total)" : "当前列表链接检测完成")
+                 + (linkChecks.hiddenCount > 0 ? " · 已隐藏 \(linkChecks.hiddenCount) 条失效链接" : ""))
+                .font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("site.links.status")
+        }
+        #endif
         videoGrid
         if !browser.videos.isEmpty {
             // A focus section, so moving down from a cover in any column reaches Load More or Try Again.
@@ -1486,11 +1564,11 @@ struct SiteView: View {
     private var videoGrid: some View {
         LazyVGrid(columns: catalogColumns, spacing: Layout.gridRowSpacing) {
             WithPerceptionTracking {
-                ForEach(browser.videos) { video in
+                ForEach(displayedVideos) { video in
                     WithPerceptionTracking {
                         Group {
                             // An index source (a ranking or list site) names titles; other sources play them.
-                            if isIndex {
+                            if opensGlobalSearch {
                                 Button { store.searchVideos(video.name) } label: { catalogPoster(video) }.cardButton()
                             } else {
                                 RouteLink { WithPerceptionTracking { CatalogDestination(video: video, client: client) } } label: { WithPerceptionTracking { catalogPoster(video) } }.cardButton()
@@ -1508,6 +1586,29 @@ struct SiteView: View {
         }
         .opacity(browser.busy && !browser.videos.isEmpty ? 0.55 : 1).animation(.appSmooth, value: browser.busy)
     }
+
+    private var opensGlobalSearch: Bool {
+        #if os(iOS)
+        false
+        #else
+        isIndex
+        #endif
+    }
+
+    private var displayedVideos: [Video] {
+        #if os(iOS)
+        site.supportsLocalLinkChecks && checksEnabled ? linkChecks.visibleVideos : browser.videos
+        #else
+        browser.videos
+        #endif
+    }
+
+    #if os(iOS)
+    private func updateLinkChecks() {
+        guard pageActive else { linkChecks.stop(); return }
+        linkChecks.reconcile(videos: browser.videos, site: site, scope: linkCheckScope, enabled: checksEnabled)
+    }
+    #endif
 
     private var catalogColumns: [GridItem] {
         #if os(iOS)
@@ -1783,6 +1884,9 @@ struct PluginActionPage: View {
             }
             .animation(.easeOut(duration: 0.2), value: notice)
             .navigationTitle(video.name)
+            #if os(iOS)
+            .toolbar(.visible, for: .navigationBar)
+            #endif
             .task { await run() }
             .task(id: phase == .showing) {
                 // Plugins change their windows on their own (a QR code arriving, a sign-in confirmed): look again.
@@ -2324,6 +2428,7 @@ struct VideoDetailView: View {
     @Environment(\.localDockInset) private var localDockInset
     /// The source's config center, open in the app (`ConfigCenterView`).
     @State private var showsConfigCenter = false
+    @State private var quickSearch = LocalQuickSearchModel()
     #endif
     @State private var requestTask: Task<Void, Never>?
     @State private var detail: Video?
@@ -2356,9 +2461,6 @@ struct VideoDetailView: View {
     @State private var showingDetailOverview = false
     @State private var showingDetailCalendar = false
     @State private var detailSectionsPresented = false
-    @State private var mobileEpisodeGroup = 0
-    @State private var mobileEpisodeGroupFlag: String?
-    @State private var mobileEpisodeList = false
     #endif
     /// TMDB's backdrop once its picture has loaded. The source's cover stays until then, and when it never does
     /// (image.tmdb.org is blocked on some networks, #237).
@@ -2427,8 +2529,8 @@ struct VideoDetailView: View {
             #endif
             #if os(iOS)
             .navigationTitle("").navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.hidden, for: .navigationBar)
-            .toolbarColorScheme(mobileDetailDark ? .dark : .light, for: .navigationBar)
+            .modifier(LocalDetailNavigation())
+            .modifier(LocalQuickSearchLifecycle(model: quickSearch, query: video.name, enabled: client.site.isIndexSource))
             #else
             .screenTitle(video.name)
             #endif
@@ -2611,6 +2713,10 @@ struct VideoDetailView: View {
     }
     private func loadDetail() async {
         guard !busy else { return }
+        #if os(iOS)
+        // Index sources recommend titles and do not provide their own playback lines.
+        if client.site.isIndexSource { detail = video; return }
+        #endif
         busy = true; error = nil
         defer { busy = false }
         do {
@@ -2803,7 +2909,7 @@ struct VideoDetailView: View {
         return current
     }
     private func sourceVideo() -> Video {
-        let raw = PosterPresentation.catalogDetail(detail ?? video, listing: video, preferListing: client.site.runtime == .python)
+        let raw = PosterPresentation.catalogDetail((detail ?? video).keepingCategory(video.category), listing: video, preferListing: client.site.runtime == .python)
         let source = raw.poster
         // A home hint was injected before opening this push page. If its TMDB work is rejected,
         // it is no longer a source fallback; use the fixed placeholder until the source is refreshed.
@@ -3042,7 +3148,7 @@ struct VideoDetailView: View {
                 let width = geometry.size.width
                 let height = width < 600 ? width * 1.5 : min(760, width * 0.7)
                 ZStack(alignment: .top) {
-                    (detailArtworkPaint?.color ?? Color.black).ignoresSafeArea()
+                    (detailArtworkPaint?.color ?? DetailArtworkPlaceholder.surface).ignoresSafeArea()
                     LocalCatalogArtworkCarousel(video: currentVideo(), images: mobileDetailArtwork,
                                                 presented: !choosingDetailArtwork && !choosingDetailMatch && !showingDetailOverview && !showingDetailCalendar && !detailSectionsPresented,
                                                 selection: $detailArtworkSelection, paused: $detailArtworkPaused, paint: $detailArtworkPaint)
@@ -3051,7 +3157,11 @@ struct VideoDetailView: View {
                         WithPerceptionTracking {
                             VStack(alignment: .leading, spacing: 24) {
                                 header
-                                if detail != nil {
+                                if client.site.isIndexSource {
+                                    LocalQuickSearchView(model: quickSearch, query: video.name, metadata: tmdb.details,
+                                                         metadataNumbering: tmdb.numbering, metadataOffset: tmdb.offset)
+                                    if detail != nil { tmdbExtras }
+                                } else if detail != nil {
                                     episodePanel
                                     tmdbExtras
                                 } else if let error { errorCard(error).padding(.top, 12) }
@@ -3071,9 +3181,14 @@ struct VideoDetailView: View {
     private var mobileDetailHeader: some View {
         WithPerceptionTracking {
             VStack(alignment: .leading, spacing: 16) {
-                Color.clear.frame(height: containerWidth < 600 ? containerWidth * 0.95 : containerWidth * 0.25)
+                Color.clear.frame(height: mobileDetailArtworkSpace)
+                    .overlay(alignment: .bottom) {
+                        if detailArtworkPaint == nil {
+                            DetailArtworkEmblem(compact: containerWidth >= 600).padding(.bottom, 40)
+                        }
+                    }
                     .overlay(alignment: .top) {
-                        mobileDetailTools.padding(.top, containerWidth < 600 ? 110 : 80)
+                        mobileDetailTools.padding(.top, containerWidth < 600 ? 62 : 30)
                     }
                 if let original = tmdb.details?.originalName, !original.isEmpty, original != tmdb.details?.name {
                     Text(original).font(.system(size: 13)).foregroundStyle(.secondary)
@@ -3087,11 +3202,15 @@ struct VideoDetailView: View {
                 if !mobileDetailOverview.isEmpty {
                     LocalCatalogSynopsisButton(overview: mobileDetailOverview) { showingDetailOverview = true }
                 }
-                playControl
+                if !client.site.isIndexSource { playControl }
                 playbackBanner
                 if tmdb.phase == .ambiguous { tmdbStatus }
             }
         }
+    }
+    private var mobileDetailArtworkSpace: CGFloat {
+        let height = containerWidth < 600 ? containerWidth * 0.95 : containerWidth * 0.25
+        return max(containerWidth < 600 ? 340 : 280, height)
     }
     private var mobileDetailTools: some View {
         HStack(spacing: 4) {
@@ -3185,86 +3304,26 @@ struct VideoDetailView: View {
     }
     #if os(iOS)
     private func mobileEpisodePanel(_ items: [Episode]) -> some View {
-        let metadata = tmdb.episodes(items)
-        let entries = LocalCatalogDetailEpisode.entries(items, metadata: metadata, details: tmdb.details,
-                                                        sourceTitle: currentVideo().name, flag: activeFlag, fileDetails: episodeDetails)
-        let ordered = LocalCatalogDetailRules.ordered(entries.map(\.key))
-        let count = (entries.count + LocalCatalogDetailRules.groupSize - 1) / LocalCatalogDetailRules.groupSize
-        let group = mobileEpisodeGroupFlag == activeFlag ? min(mobileEpisodeGroup, max(0, count - 1)) : 0
-        let visible = LocalCatalogDetailRules.page(ordered, group: group, descending: reversesEpisodes).map { entries[$0.index] }
+        let input = LocalCatalogEpisodeSnapshot.Input(episodes: items, details: tmdb.details, numbering: tmdb.numbering, offset: tmdb.offset,
+                                                      sourceTitle: currentVideo().name, flag: activeFlag, fileDetails: episodeDetails)
         return VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("线路").font(.headline)
                 mobileFlagPicker
             }
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    Text("剧集").font(.headline)
-                    Text("\(items.count) 集").font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
-                    if count > 1 {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 5) {
-                                ForEach(0..<count, id: \.self) { index in
-                                    WithPerceptionTracking {
-                                        let start = index * LocalCatalogDetailRules.groupSize + 1
-                                        let end = min((index + 1) * LocalCatalogDetailRules.groupSize, entries.count)
-                                        Button { mobileEpisodeGroupFlag = activeFlag; mobileEpisodeGroup = index } label: {
-                                            Text(start == end ? "\(start)" : "\(start)-\(end)")
-                                                .font(.system(size: 11)).monospacedDigit().padding(.horizontal, 10).frame(minHeight: 44)
-                                                .foregroundStyle(index == group ? Brand.accent : Color.secondary)
-                                                .background(index == group ? Brand.accent.opacity(0.1) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-                                                .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(index == group ? Brand.accent.opacity(0.45) : Color.primary.opacity(0.12), lineWidth: 0.5) }
-                                        }.buttonStyle(.plain).accessibilityLabel("剧集分段 \(start) 到 \(end)")
-                                            .accessibilityAddTraits(index == group ? .isSelected : [])
-                                            .accessibilityIdentifier("detail.episodeGroup.\(index)")
-                                    }
-                                }
-                            }
-                        }
-                    } else { Spacer(minLength: 0) }
+            LocalCatalogEpisodePanel(input: input, owner: video.id + "|" + activeFlag, loading: loadingEpisode != nil) {
+                if tmdb.phase == .looking {
+                    ProgressView().controlSize(.mini)
+                    Text("正在获取剧集资料…").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                } else if tmdb.phase == .failed {
+                    Button { Task { await tmdb.retry() } } label: {
+                        Label("重试剧集资料", systemImage: "arrow.clockwise").font(.system(size: 11)).frame(minHeight: 44)
+                    }.buttonStyle(.plain).accessibilityIdentifier("detail.episodeMetadata.retry")
                 }
-                HStack(spacing: 4) {
-                    if tmdb.phase == .looking {
-                        ProgressView().controlSize(.mini)
-                        Text("正在获取剧集资料…").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                    } else if tmdb.phase == .failed {
-                        Button { Task { await tmdb.retry() } } label: { Label("重试剧集资料", systemImage: "arrow.clockwise").font(.system(size: 11)).frame(minHeight: 44) }
-                            .buttonStyle(.plain).accessibilityIdentifier("detail.episodeMetadata.retry")
-                    }
-                    Spacer(minLength: 0)
-                    if items.count > 1 {
-                        Button { reversesEpisodes.toggle() } label: {
-                            Label(reversesEpisodes ? "倒序" : "正序", systemImage: reversesEpisodes ? "arrow.up" : "arrow.down")
-                                .font(.system(size: 11)).padding(.horizontal, 8).frame(minHeight: 44)
-                        }.buttonStyle(.plain).accessibilityLabel(reversesEpisodes ? "切换为正序" : "切换为倒序")
-                            .accessibilityIdentifier("episodes.reverse")
-                    }
-                    Button { mobileEpisodeList.toggle() } label: {
-                        Label(mobileEpisodeList ? "缩略图" : "列表", systemImage: mobileEpisodeList ? "rectangle.stack" : "list.bullet")
-                            .font(.system(size: 11)).padding(.horizontal, 8).frame(minHeight: 44)
-                            .foregroundStyle(mobileEpisodeList ? Brand.accent : Color.primary)
-                    }.buttonStyle(.plain).accessibilityLabel(mobileEpisodeList ? "显示剧集缩略图" : "显示默认剧集列表")
-                        .accessibilityIdentifier("detail.episodes.layout")
-                }
-            }
-            if loadingEpisode != nil {
-                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("正在解析播放地址…").font(.system(size: 12)).foregroundStyle(.secondary) }
-                    .accessibilityElement(children: .combine)
-            }
-            if mobileEpisodeList {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10, alignment: .top)], spacing: 10) {
-                    ForEach(visible) { value in WithPerceptionTracking { mobileEpisodeButton(value, list: true) } }
-                }
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 16) {
-                        ForEach(visible) { value in WithPerceptionTracking { mobileEpisodeButton(value, list: false) } }
-                    }.padding(.vertical, 2)
-                }.id("\(activeFlag):\(group):\(reversesEpisodes)")
+            } episode: { value, list in
+                mobileEpisodeButton(value, list: list)
             }
         }
-        .appOnChange(of: activeFlag) { _, flag in mobileEpisodeGroupFlag = flag; mobileEpisodeGroup = 0 }
-        .accessibilityIdentifier("detail.episodes")
     }
 
     private func mobileEpisodeButton(_ value: LocalCatalogDetailEpisode, list: Bool) -> some View {
@@ -3609,7 +3668,7 @@ private struct BundleSignIn: Identifiable {
 }
 
 /// Cloud drives a line plays from, to start a video on a line that can play now.
-private enum CloudDrive {
+enum CloudDrive {
     /// Xunlei's sign-in is only for CatPawOpen bundles, which say when it is missing; other sources play their Xunlei
     /// lines without it, so those lines are never held back for it.
     case quark, uc, xunlei

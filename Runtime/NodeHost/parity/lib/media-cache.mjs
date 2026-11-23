@@ -49,6 +49,10 @@ export function videoCacheSettings(value = {}) {
   return { enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
     sizeGB: [1, 2, 3, 4].includes(value.sizeGB) ? value.sizeGB : 1 };
 }
+function cacheFailure(error) {
+  if (['ENOSPC', 'EDQUOT'].includes(error?.code)) return 'space';
+  return error?.code === 'MEDIA_CACHE_CHANGED' ? 'changed' : 'write';
+}
 function span(range, total) {
   if (!Number.isSafeInteger(total) || total <= 0) return null;
   if (!range) return { start: 0, end: total - 1 };
@@ -145,7 +149,8 @@ export class MediaCache {
     this.requestBudget = new RequestBudget({ perResource: 2 });
     this.owners = new Map(); this.routes = new Map(); this.cleanups = new Set(); this.forwardWaiters = new Set();
     this.tail = Promise.resolve(); this.closed = false;
-    this.ready = this.initialize();
+    this.initializationFailure = null;
+    this.ready = this.initialize().catch(error => { this.initializationFailure = cacheFailure(error); throw error; });
     this.ready.catch(() => {});
   }
   async initialize() {
@@ -165,7 +170,7 @@ export class MediaCache {
     if (!owner) {
       const policy = maxBytes === undefined && this.videoPolicy ? this.videoPolicy : videoCacheSettings(settings);
       if (maxBytes === undefined) this.videoMaxBytes = policy.enabled ? policy.sizeGB * GiB : 0;
-      owner = { id, enabled: policy.enabled, maxBytes: maxBytes ?? policy.sizeGB * GiB, bytes: 0,
+      owner = { id, enabled: policy.enabled, maxBytes: maxBytes ?? (policy.enabled ? policy.sizeGB * GiB : 0), bytes: 0, failure: null,
         blocks: new Map(), resources: new Map(), controller: new AbortController(), closed: false, hits: 0, written: 0, networkBytes: 0, nativeFallback: false, cacheRevision: 0,
         forwardReaders: new Set(), forwardBytes: 0 };
       this.owners.set(id, owner);
@@ -196,14 +201,31 @@ export class MediaCache {
     const policy = videoCacheSettings(settings);
     this.videoPolicy = policy;
     this.videoMaxBytes = policy.enabled ? policy.sizeGB * GiB : 0;
-    for (const owner of this.owners.values()) {
-      if (owner.music || owner.speculative) continue;
-      const enabling = policy.enabled && !owner.enabled;
-      owner.enabled = policy.enabled; owner.maxBytes = policy.enabled ? policy.sizeGB * GiB : 0;
-      if (!policy.enabled) { owner.cacheRevision++; for (const resource of owner.resources.values()) resource.pending.clear(); }
-      if (enabling) for (const reader of owner.forwardReaders) reader.revision = owner.cacheRevision;
+    // Storage recovery is an explicit user action. Ordinary reads/statistics
+    // keep the failed owner in direct playback without repeated disk attempts.
+    if (policy.enabled) {
+      await this.ready.catch(() => {});
+      if (this.videoPolicy !== policy) return;
+      if (this.initializationFailure) {
+        this.initializationFailure = null;
+        this.ready = this.initialize().catch(error => { this.initializationFailure = cacheFailure(error); throw error; });
+        await this.ready.catch(() => {});
+        if (this.videoPolicy !== policy) return;
+      }
     }
     await this.serial(async () => {
+      if (this.videoPolicy !== policy) return;
+      // Complete an earlier write/fallback before applying the explicit choice;
+      // its late failure must not disable a newer retry or revive an old warning.
+      for (const owner of this.owners.values()) {
+        if (owner.music || owner.speculative) continue;
+        const enabled = policy.enabled && !this.initializationFailure;
+        const enabling = enabled && !owner.enabled;
+        owner.enabled = enabled; owner.maxBytes = enabled ? policy.sizeGB * GiB : 0;
+        owner.failure = policy.enabled ? this.initializationFailure : null; owner.checkedSpace = 0;
+        if (!enabled) { owner.cacheRevision++; for (const resource of owner.resources.values()) resource.pending.clear(); }
+        if (enabling) for (const reader of owner.forwardReaders) reader.revision = owner.cacheRevision;
+      }
       for (const owner of this.owners.values()) if (!owner.music && !owner.speculative) await this.trim(owner, 0);
       await this.trimVideos(0);
     });
@@ -277,7 +299,7 @@ export class MediaCache {
           if (pin && existing.digest !== createHash('sha256').update(bytes).digest('hex')) {
             // Keep already pinned readers intact and stream this new response
             // from its own buffers. Never replace its bytes with older data.
-            throw new Error('cached media bytes changed');
+            throw Object.assign(new Error('cached media bytes changed'), { code: 'MEDIA_CACHE_CHANGED' });
           }
           if (pin) existing.pins = (existing.pins || 0) + 1;
           return existing;
@@ -289,20 +311,22 @@ export class MediaCache {
         file = path.join(this.directory, id);
         if (!owner.checkedSpace || Date.now() - owner.checkedSpace > 5000) {
           const disk = await fs.statfs(this.directory); owner.checkedSpace = Date.now();
-          if (disk.bavail * disk.bsize < this.reserveBytes + bytes.length) throw new Error('cache space exhausted');
+          if (disk.bavail * disk.bsize < this.reserveBytes + bytes.length)
+            throw Object.assign(new Error('cache space exhausted'), { code: 'ENOSPC' });
         }
         await fs.writeFile(file, bytes, { mode: 0o600 });
         if (owner.closed || !owner.enabled || revision !== owner.cacheRevision) { await fs.rm(file, { force: true }); return; }
-        const block = { id, file, start, length: bytes.length, resource, used: ++this.useOrder, pins: pin ? 1 : 0,
+        const block = { id, file, start, length: bytes.length, resource, used: ++this.useOrder, pins: pin ? 1 : 0, revision,
           digest: createHash('sha256').update(bytes).digest('hex') };
         owner.blocks.set(id, block); owner.bytes += bytes.length; owner.written += bytes.length;
         const page = Math.floor(start / this.blockBytes);
         if (!resource.pages.has(page)) resource.pages.set(page, new Map());
         resource.pages.get(page).set(id, block);
         return block;
-      } catch {
+      } catch (error) {
         if (file) await fs.rm(file, { force: true }).catch(() => {});
         owner.enabled = false; owner.maxBytes = 0; owner.cacheRevision++;
+        owner.failure = cacheFailure(error);
         for (const entry of owner.resources.values()) entry.pending.clear();
         await this.trim(owner, 0).catch(() => {});
         this.wakeForward();
@@ -410,6 +434,7 @@ export class MediaCache {
   accept(resource, remote) {
     const meta = description(remote);
     if (!meta) return null;
+    resource.unsupported = false;
     const before = resource.meta;
     if (before && (before.total !== meta.total || before.validator !== meta.validator))
       throw new Error('media changed during playback');
@@ -511,7 +536,7 @@ export class MediaCache {
       // a shorter 206; FFmpeg requests its next gap independently. Never splice
       // an unverifiable remote suffix onto those bytes in the same response.
       if (cached && /^bytes=\d+-$/.test(range) && resource.meta?.ranges
-        && !resource.meta.validator && !resource.sampleVerified) {
+        && !resource.resumeOnTruncation && !resource.meta.validator && !resource.sampleVerified) {
         let cursor = cached.start;
         while (cursor <= cached.end) {
           const block = this.find(resource, cursor); if (!block) break;
@@ -578,6 +603,11 @@ export class MediaCache {
         }
         if (manifest) { owner.nativeFallback = true; response.writeHead(307, { Location: upstream.url, 'Cache-Control': 'no-store' }).end(); return; }
         const meta = owner.enabled ? this.accept(resource, remote) : null;
+        // A Python generator may stream successfully without a finite byte
+        // length. Keep it playable and report why the selected disk window
+        // cannot fill; this is distinct from bypassing our network counters.
+        if (owner.enabled && request.method === 'GET' && remote.ok && !manifest)
+          resource.unsupported = !meta;
         response.writeHead(remote.status, outgoing);
         if (request.method === 'HEAD') { response.end(); return; }
         const body = this.playbackBody(resource, upstream, meta, signal, range);
@@ -725,13 +755,51 @@ export class MediaCache {
     this.cleanups.add(cleanup); void cleanup.finally(() => this.cleanups.delete(cleanup)).catch(() => {});
     return cleanup;
   }
+  coverage(owner) {
+    if (!owner.enabled || owner.closed) return [];
+    const resources = new Map();
+    const add = (resource, start, length) => {
+      if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length <= 0
+        || !Number.isSafeInteger(start + length)) return;
+      const ranges = resources.get(resource.token) || [];
+      ranges.push([start, start + length]); resources.set(resource.token, ranges);
+    };
+    for (const block of owner.blocks.values())
+      if (block.revision === owner.cacheRevision) add(block.resource, block.start, block.length);
+    for (const resource of owner.resources.values())
+      for (const block of resource.pending.values()) add(resource, block.start, block.length);
+    for (const reader of owner.forwardReaders) {
+      if (reader.revision !== owner.cacheRevision) continue;
+      for (const node of reader.nodes) add(reader.resource, node.start, node.length);
+    }
+    return [...resources].map(([id, ranges]) => {
+      ranges.sort((a, b) => a[0] - b[0]);
+      const merged = [];
+      for (const range of ranges) {
+        const last = merged.at(-1);
+        if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+        else merged.push(range);
+      }
+      // Discontinuous seek islands are bounded in the RPC payload. Omitting an
+      // extreme fragmented tail is conservative; never bridge an uncached gap.
+      const total = this.routes.get(id)?.meta?.total;
+      return { id, ...(Number.isSafeInteger(total) && total > 0 ? { total } : {}), ranges: merged.slice(0, 256) };
+    });
+  }
   statistics(id) {
     const owner = this.owners.get(id);
-    return owner ? { bytes: owner.bytes, maxBytes: owner.maxBytes, hits: owner.hits, written: owner.written, networkBytes: owner.networkBytes, nativeFallback: owner.nativeFallback } : null;
+    return owner ? { bytes: owner.bytes, maxBytes: owner.maxBytes, enabled: owner.enabled, failure: owner.failure,
+      unsupported: owner.enabled && [...owner.resources.values()].some(resource => resource.unsupported),
+      hits: owner.hits, written: owner.written, networkBytes: owner.networkBytes, nativeFallback: owner.nativeFallback,
+      coverage: this.coverage(owner), summary: this.videoStatistics() } : null;
   }
   videoStatistics() {
     const owners = [...this.owners.values()].filter(owner => !owner.music && !owner.speculative);
+    const failure = this.videoMaxBytes <= 0 ? null : owners.some(owner => owner.failure === 'space') ? 'space'
+      : this.initializationFailure || owners.find(owner => owner.failure)?.failure || null;
     return { bytes: owners.reduce((sum, owner) => sum + owner.bytes, 0), maxBytes: this.videoMaxBytes,
+      enabled: this.videoMaxBytes > 0, failure,
+      unsupported: owners.some(owner => owner.enabled && [...owner.resources.values()].some(resource => resource.unsupported)),
       sessions: owners.length, hits: owners.reduce((sum, owner) => sum + owner.hits, 0),
       written: owners.reduce((sum, owner) => sum + owner.written, 0), networkBytes: owners.reduce((sum, owner) => sum + owner.networkBytes, 0) };
   }

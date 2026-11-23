@@ -4,8 +4,8 @@ import fs from 'node:fs/promises';
 // decoder consumes its bounded disk queue independently, so its small packet
 // buffer does not also limit the application's 1–4 GiB forward cache.
 export class ForwardMediaReader {
-  constructor(cache, resource, upstream, meta, signal) {
-    Object.assign(this, { cache, resource, upstream, meta });
+  constructor(cache, resource, upstream, meta, signal, { background = false } = {}) {
+    Object.assign(this, { cache, resource, upstream, meta, background });
     this.owner = resource.owner;
     this.revision = this.owner.cacheRevision;
     this.controller = new AbortController();
@@ -30,6 +30,9 @@ export class ForwardMediaReader {
 
   async allocate(start) {
     const cache = this.cache, owner = this.owner;
+    if (this.background && (!owner.enabled || owner.closed || this.revision !== owner.cacheRevision))
+      this.controller.abort();
+    this.signal.throwIfAborted();
     const caching = owner.enabled && this.revision === owner.cacheRevision;
     const maximum = caching ? Math.min(owner.maxBytes, cache.videoMaxBytes) : cache.blockBytes;
     const size = Math.max(1, Math.min(cache.blockBytes - start % cache.blockBytes,
@@ -37,7 +40,7 @@ export class ForwardMediaReader {
     // A tail/seek opened by libavformat must get its first bytes even while
     // the previous input pins a full disk window. At most one extra RAM block
     // per active request is needed; put() still enforces the disk limit.
-    await cache.reserveForward(owner, size, this.signal, () => this.nodes.length === 0, this.revision);
+    await cache.reserveForward(owner, size, this.signal, () => !this.background && this.nodes.length === 0, this.revision);
     const node = { start, capacity: size, length: 0, consumed: 0, sealed: false,
       data: Buffer.allocUnsafe(size), revision: this.revision, reserved: true };
     this.nodes.push(node); this.wake(); return node;
@@ -51,6 +54,9 @@ export class ForwardMediaReader {
     // the decoder's current read. A failed write stays a bounded memory queue.
     if (node.block) node.data = null;
     this.wake();
+    // Speculative HLS work has no decoder consuming its memory queue. Stop on
+    // a failed/invalidated write instead of retaining unbounded segment RAM.
+    if (this.background && !node.block) { this.controller.abort(); this.signal.throwIfAborted(); }
   }
 
   async produce() {
@@ -83,11 +89,14 @@ export class ForwardMediaReader {
     } finally {
       // Header/tail probes are frequently interrupted mid-block. Retain their
       // already received bytes for a subsequent seek, just like ordinary reads.
-      if (node?.length) await this.seal(node);
-      else if (node) { this.releaseNode(node); this.nodes = this.nodes.filter(value => value !== node); }
-      this.upstream.controller.abort();
-      await iterator?.return?.().catch(() => {});
-      this.upstream.releaseBudget?.();
+      try {
+        if (node?.length) await this.seal(node);
+        else if (node) { this.releaseNode(node); this.nodes = this.nodes.filter(value => value !== node); }
+      } finally {
+        this.upstream.controller.abort();
+        await iterator?.return?.().catch(() => {});
+        this.upstream.releaseBudget?.();
+      }
     }
   }
 
@@ -103,6 +112,16 @@ export class ForwardMediaReader {
         }).catch(() => {});
     }
     this.cache.wakeForward();
+  }
+
+  close() {
+    if (!this.closing) this.closing = (async () => {
+      this.controller.abort(); this.upstream.controller.abort(); this.wake(); this.cache.wakeForward();
+      await this.finished;
+      for (const node of this.nodes) this.releaseNode(node);
+      this.nodes = []; this.owner.forwardReaders.delete(this);
+    })();
+    return this.closing;
   }
 
   async *body() {
@@ -124,10 +143,7 @@ export class ForwardMediaReader {
         else if (node.consumed >= node.length) await this.wait();
       }
     } finally {
-      this.controller.abort(); this.upstream.controller.abort(); this.wake(); this.cache.wakeForward();
-      await this.finished;
-      for (const node of this.nodes) this.releaseNode(node);
-      this.nodes = []; this.owner.forwardReaders.delete(this);
+      await this.close();
     }
   }
 }

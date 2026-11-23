@@ -73,7 +73,7 @@ public actor EmbeddedPythonHost {
         let started = ContinuousClock.now
         Diagnostics.shared.record(.info, "jar.request", "source=\(site.key) python \(kind) begin")
         let response = try await run(resources: resources, json: json, search: params["wd"] != nil)
-        let envelope = try JSONDecoder().decode([String: JSONValue].self, from: Data(response.utf8))
+        let envelope = try await CatalogResponseParser.decode(Data(response.utf8))
         if let message = PluginFailure.message(envelope) {
             Diagnostics.shared.record(.error, "jar.request", "source=\(site.key) python \(kind) failed duration=\(started.duration(to: .now)) error=\(message)")
             throw TVError.unsupported(message)
@@ -82,7 +82,7 @@ public actor EmbeddedPythonHost {
             throw TVError.unsupported(L10n.text("The plugin returned no content. Try another source."))
         }
         Diagnostics.shared.record(.info, "jar.request", "source=\(site.key) python \(kind) complete duration=\(started.duration(to: .now)) bytes=\(text.utf8.count)")
-        return try JSONDecoder().decode([String: JSONValue].self, from: Data(text.utf8))
+        return try await CatalogResponseParser.decode(Data(text.utf8), maximumBytes: params["wd"] == nil ? BoundedHTTPData.catalogBytes : BoundedHTTPData.searchBytes)
     }
 
     /// Parse syntax and discover entries before replacing a good imported version; no script code executes.
@@ -121,7 +121,7 @@ public actor EmbeddedPythonHost {
     }
 
     private func run(resources: String, json: String, search: Bool) async throws -> String {
-        return try await worker.request(resources: resources, json: json, search: search, waitForExecutionOnCancel: search)
+        return try await worker.request(resources: resources, json: json, search: search, waitForExecutionOnCancel: true)
     }
 
     /// Scripts download again on demand, but profiles hold what spiders cache (sign-ins among it),

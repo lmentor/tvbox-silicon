@@ -13,7 +13,7 @@ struct MusicNowPlayingScreen: View {
     @State private var showsChannels = false
     @State private var showsQueue = false
     @State private var showsMore = false
-    @GestureState private var pullDown: CGFloat = 0
+    @State private var showsSleepTimer = false
 
     var body: some View {
         WithPerceptionTracking {
@@ -46,7 +46,6 @@ struct MusicNowPlayingScreen: View {
                     .frame(maxWidth: wide ? 760 : 620).frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(.horizontal, geometry.size.width < 350 ? 18 : 26)
                     .padding(.top, 4)
-                    .offset(y: pullDown * 0.2)
                 }
             }
             .foregroundStyle(.white).tint(.white)
@@ -58,7 +57,15 @@ struct MusicNowPlayingScreen: View {
             }
             .appOnChange(of: music.track == nil) { _, gone in if gone { dismiss() } }
             .accessibilityAction(.escape) { dismiss() }
-            .musicMoreDialog(isPresented: $showsMore, showChannels: { showsChannels = true })
+            .musicMoreDialog(isPresented: $showsMore, showSleepTimer: { showsSleepTimer = true },
+                             showChannels: { showsChannels = true })
+            .localGlassDialog(isPresented: $showsSleepTimer, title: "定时关闭", maxWidth: 380,
+                              maxHeight: 480, layout: .centered) {
+                ScrollView {
+                    SleepTimerPanel(item: music.track?.source == nil ? .song : .episode) { showsSleepTimer = false }
+                        .padding(18).localDialogContentHeight()
+                }
+            }
             .sheet(isPresented: $showsChannels) { WithPerceptionTracking { MusicChannelsView() } }
             .sheet(isPresented: $showsQueue) {
                 NavigationStack {
@@ -86,24 +93,9 @@ struct MusicNowPlayingScreen: View {
     }
 
     private func topArtwork(_ music: MusicPlaybackSession, size: CGFloat, short: Bool) -> some View {
-        VStack(spacing: short ? 2 : 7) {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.down").font(.system(size: 17, weight: .semibold)).foregroundStyle(.white.opacity(0.7))
-                    .frame(width: 56, height: 44).contentShape(Rectangle())
-            }.buttonStyle(.plain).accessibilityLabel("收起音乐播放器").accessibilityIdentifier("music.nowPlaying.dismiss")
-            MusicVinylArtwork(url: music.track?.artwork, trackID: music.track?.id ?? "", size: size, playing: music.isPlaying)
-                .padding(.bottom, short ? 2 : 6)
-        }
-        .frame(maxWidth: .infinity).contentShape(Rectangle())
-        // Only the handle/record owns this gesture. Scrolling lyrics, queue and either slider never reaches it.
-        .simultaneousGesture(DragGesture(minimumDistance: 16)
-            .updating($pullDown) { value, state, _ in
-                if value.translation.height > abs(value.translation.width) * 1.3 { state = max(0, value.translation.height) }
-            }
-            .onEnded { value in
-                if MusicNowPlayingDismissal.shouldDismiss(x: value.translation.width, y: value.translation.height,
-                                                          predictedY: value.predictedEndTranslation.height) { dismiss() }
-            })
+        MusicNowPlayingArtwork(url: music.track?.artwork, trackID: music.track?.id ?? "",
+                               size: size, short: short, playing: music.isPlaying, dismiss: { dismiss() })
+            .frame(maxWidth: .infinity).frame(height: size + (short ? 48 : 57))
     }
 
     private func header(_ music: MusicPlaybackSession, short: Bool) -> some View {
@@ -174,14 +166,17 @@ struct MusicNowPlayingScreen: View {
 extension View {
     /// The same raised glass actions serve the full player and the compact player card.
     func musicMoreDialog(isPresented: Binding<Bool>, showLyrics: (() -> Void)? = nil,
+                         showSleepTimer: (() -> Void)? = nil,
                          showChannels: @escaping () -> Void) -> some View {
-        modifier(MusicMoreDialog(isPresented: isPresented, showLyrics: showLyrics, showChannels: showChannels))
+        modifier(MusicMoreDialog(isPresented: isPresented, showLyrics: showLyrics,
+                                 showSleepTimer: showSleepTimer, showChannels: showChannels))
     }
 }
 
 private struct MusicMoreDialog: ViewModifier {
     @Binding var isPresented: Bool
     var showLyrics: (() -> Void)?
+    var showSleepTimer: (() -> Void)?
     let showChannels: () -> Void
     @State private var selectedAction: (() -> Void)?
 
@@ -194,7 +189,7 @@ private struct MusicMoreDialog: ViewModifier {
             selectedAction = nil
             action?()
         }) {
-            MusicMoreActions(showLyrics: showLyrics, showChannels: showChannels) { action in
+            MusicMoreActions(showLyrics: showLyrics, showSleepTimer: showSleepTimer, showChannels: showChannels) { action in
                 selectedAction = action
                 isPresented = false
             }
@@ -205,6 +200,7 @@ private struct MusicMoreDialog: ViewModifier {
 private struct MusicMoreActions: View {
     @Environment(Store.self) private var store
     var showLyrics: (() -> Void)?
+    var showSleepTimer: (() -> Void)?
     let showChannels: () -> Void
     let perform: (@escaping () -> Void) -> Void
 
@@ -222,6 +218,7 @@ private struct MusicMoreActions: View {
                         .disabled(!store.favorites.isEnabled)
                     }
                     if let showLyrics { action("Lyrics", symbol: "quote.bubble", work: showLyrics) }
+                    lyricTiming(music)
                     if music.sourceStream != nil {
                         action("Open in Video Player", symbol: "play.rectangle") { music.openInVideoPlayer() }
                     } else {
@@ -242,6 +239,10 @@ private struct MusicMoreActions: View {
                             action("Download", symbol: "arrow.down.circle") { library.download([track]) }
                         }
                     }
+                    if let showSleepTimer {
+                        action(SleepTimer.shared.isOn ? "定时关闭 · " + SleepTimer.shared.status(item: .song) : "定时关闭",
+                               symbol: SleepTimer.shared.isOn ? "alarm.fill" : "alarm", work: showSleepTimer)
+                    }
                     action("Stop", symbol: "xmark", destructive: true) { music.stop() }
                 }
                 .padding(.horizontal, 18).padding(.top, 4).padding(.bottom, 20)
@@ -261,6 +262,43 @@ private struct MusicMoreActions: View {
             }
             .foregroundStyle(destructive ? Brand.rose : Color.primary)
         }.buttonStyle(MusicMoreActionStyle())
+    }
+
+    private func lyricTiming(_ music: MusicPlaybackSession) -> some View {
+        let available = music.track != nil && music.lyrics?.synced == true && music.lyrics?.lines.isEmpty == false
+        let offset = music.lyricsOffset
+        let status = offset == 0 ? "歌词同步" : String(format: offset > 0 ? "已提前 %.1f 秒" : "已延后 %.1f 秒", abs(offset))
+        return VStack(spacing: 10) {
+            HStack {
+                Text(available ? status : music.lyricsLoading ? "歌词加载中…" : "暂无可调整的时间轴歌词")
+                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                Spacer(minLength: 8)
+                if offset != 0 {
+                    Button("重置") { music.resetLyricsOffset() }
+                        .font(.caption.weight(.semibold)).frame(minHeight: 32)
+                        .accessibilityIdentifier("music.lyrics.reset")
+                }
+            }.padding(.horizontal, 4)
+            timingAction("歌词提前", detail: "0.5 秒", symbol: "text.badge.plus", enabled: available && offset < 10) {
+                music.adjustLyrics(by: 0.5)
+            }.accessibilityIdentifier("music.lyrics.earlier")
+            timingAction("歌词延后", detail: "0.5 秒", symbol: "text.badge.minus", enabled: available && offset > -10) {
+                music.adjustLyrics(by: -0.5)
+            }.accessibilityIdentifier("music.lyrics.later")
+        }
+    }
+
+    /// Timing changes apply immediately, leaving this panel open for repeated taps.
+    private func timingAction(_ title: String, detail: String, symbol: String, enabled: Bool,
+                              work: @escaping () -> Void) -> some View {
+        Button(action: work) {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).font(.system(size: 17, weight: .semibold)).frame(width: 24)
+                Text(title).font(.body.weight(.medium))
+                Spacer(minLength: 0)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }.buttonStyle(MusicMoreActionStyle()).disabled(!enabled).opacity(enabled ? 1 : 0.45)
     }
 }
 

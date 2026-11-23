@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { createGunzip, createBrotliDecompress } from 'node:zlib';
 import { createHTTPInflate } from './mobile-deflate.mjs';
 
@@ -29,7 +29,7 @@ export async function mobileFetch(input, options = {}, remaining = 5, retryReuse
       // A source can close its idle loopback connection just as the agent
       // reuses it. Retry only that pre-response GET/HEAD once; source writes,
       // cancelled requests and fresh-connection failures retain their errors.
-      if (retryReusedSocket && request.reusedSocket && !receivedHeaders
+      if (retryReusedSocket && options.retryReusedSocket !== false && request.reusedSocket && !receivedHeaders
         && error.code === 'ECONNRESET' && !options.signal?.aborted
         && ['GET', 'HEAD'].includes(request.method) && body == null) {
         resolve(mobileFetch(url, options, remaining, false)); return;
@@ -39,6 +39,17 @@ export async function mobileFetch(input, options = {}, remaining = 5, retryReuse
     request.once('response', async incoming => {
       receivedHeaders = true;
       const status = incoming.statusCode || 0;
+      // Some live dispatchers return nonstandard errors such as 604. Response
+      // rejects them synchronously; settle this request instead of letting an
+      // async EventEmitter listener terminate the embedded runtime.
+      if (status < 200 || status > 599) {
+        cleanup();
+        incoming.destroy();
+        const error = new Error(`Unsupported HTTP response status ${status}`);
+        error.code = 'HTTP_INVALID_STATUS';
+        error.httpStatus = status;
+        reject(error); return;
+      }
       if ([301, 302, 303, 307, 308].includes(status) && incoming.headers.location && options.redirect !== 'manual') {
         incoming.resume(); cleanup();
         if (options.redirect === 'error' || remaining <= 0) { reject(new Error('HTTP redirect rejected')); return; }
@@ -63,6 +74,20 @@ export async function mobileFetch(input, options = {}, remaining = 5, retryReuse
         incoming.on('error', error => stream.destroy(error));
         // Cancelling a decoded-byte limit must also stop the compressed socket.
         stream.once('close', () => incoming.destroy());
+      }
+      if (Number.isFinite(options.maximumBytes)) {
+        const limit = Math.max(1, options.maximumBytes);
+        const tooLarge = () => Object.assign(new Error('The source response exceeds its search byte limit'), { code: 'ERR_RESPONSE_TOO_LARGE' });
+        if (Number(incoming.headers['content-length']) > limit) { request.destroy(tooLarge()); incoming.destroy(); reject(tooLarge()); return; }
+        const upstream = stream;
+        let received = 0;
+        const bounded = new Transform({ transform(chunk, encoding, callback) {
+          received += chunk.length;
+          callback(received > limit ? tooLarge() : null, received > limit ? undefined : chunk);
+        } });
+        upstream.once('error', error => bounded.destroy(error));
+        bounded.once('close', () => { upstream.destroy(); incoming.destroy(); });
+        stream = upstream.pipe(bounded);
       }
       incoming.once('close', cleanup);
       const responseHeaders = new Headers();

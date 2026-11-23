@@ -4,31 +4,45 @@ import TVCore
 import Perception
 
 @MainActor enum LocalBackupCoordinator {
+    private struct RestoreJournal: Codable {
+        let value: LocalBackupPayload
+        let categories: Set<LocalBackupCategory>
+        let liveSnapshot: Data?
+    }
+
     private static var recoveryInProgress = false
     private static var directory: URL { URL.applicationSupportDirectory.appendingPathComponent("LocalBackups", isDirectory: true) }
     private static var undoFile: URL { directory.appendingPathComponent("undo.json") }
     private static var pendingFile: URL { directory.appendingPathComponent("pending.json") }
     static var undoAvailable: Bool { FileManager.default.fileExists(atPath: undoFile.path) }
 
-    static func snapshot(_ store: Store, portable: Bool) async throws -> LocalBackupPayload {
+    static func snapshot(_ store: Store, portable: Bool,
+                         categories: Set<LocalBackupCategory> = Set(LocalBackupCategory.allCases)) async throws -> LocalBackupPayload {
         var value = LocalBackupPayload()
         func encode<T: Encodable>(_ item: T) throws -> Data {
             let data = try JSONEncoder().encode(item)
             return portable ? try LocalBackupArchive.portable(data) : data
         }
-        value.history = try store.playbackHistory.entries.map { try encode($0) }
-        value.favorites = try store.favorites.items.map { try encode($0) }
-        for (key, item) in store.backupDefaults.dictionaryRepresentation() where LocalBackupArchive.isAllowedSetting(key) {
-            value.settings[key] = try PropertyListSerialization.data(fromPropertyList: ["value": item], format: .binary, options: 0)
+        if categories.contains(.history) { value.history = try store.playbackHistory.entries.map { try encode($0) } }
+        if categories.contains(.favorites) { value.favorites = try store.favorites.items.map { try encode($0) } }
+        if categories.contains(.settings) {
+            for (key, item) in store.backupDefaults.dictionaryRepresentation() where LocalBackupArchive.isAllowedSetting(key) {
+                value.settings[key] = try PropertyListSerialization.data(fromPropertyList: ["value": item], format: .binary, options: 0)
+            }
         }
-        value.subscriptions = try encode(store.subscriptions)
-        let portableEntries = try JSONDecoder().decode([SubscriptionEntry].self, from: value.subscriptions)
-        let groups = Dictionary(zip(store.subscriptions, portableEntries).map { original, saved in
-            (saved.address, store.localSourceGroups[original.address] ?? .subscription)
-        }, uniquingKeysWith: { first, _ in first })
-        value.sourceGroups = try JSONEncoder().encode(groups)
-        value.sources = try await LocalSourceLibrary.shared.backupSources(portable: portable)
-        if !portable { value.documents = try store.documents.mapValues { try JSONEncoder().encode($0) } }
+        if categories.contains(.sources) {
+            value.subscriptions = try encode(store.subscriptions)
+            let portableEntries = try JSONDecoder().decode([SubscriptionEntry].self, from: value.subscriptions)
+            let groups = Dictionary(zip(store.subscriptions, portableEntries).map { original, saved in
+                (saved.address, store.localSourceGroups[original.address] ?? .subscription)
+            }, uniquingKeysWith: { first, _ in first })
+            value.sourceGroups = try JSONEncoder().encode(groups)
+            value.sources = try await LocalSourceLibrary.shared.backupSources(portable: portable)
+            if !portable { value.documents = try store.documents.mapValues { try JSONEncoder().encode($0) } }
+        }
+        if portable && categories.contains(.liveSubscriptions) {
+            value.liveSubscriptions = try IPTVLibrary.shared.portableRecords().map { try JSONEncoder().encode($0) }
+        }
         return value
     }
     static func export(_ store: Store) async throws -> Data {
@@ -41,7 +55,7 @@ import Perception
         try validate(result.1)
         return result
     }
-    static func validate(_ value: LocalBackupPayload) throws {
+    private static func validate(_ value: LocalBackupPayload, categories: Set<LocalBackupCategory> = Set(LocalBackupCategory.allCases)) throws {
         let decoder = JSONDecoder()
         for row in value.history {
             let item = try decoder.decode(PlaybackHistoryEntry.self, from: row)
@@ -49,12 +63,17 @@ import Perception
                   !item.context.sourceKey.isEmpty, !item.context.videoID.isEmpty else { throw LocalBackupArchive.Failure.invalid }
         }
         for row in value.favorites { _ = try decoder.decode(FavoriteItem.self, from: row) }
-        let entries = try decoder.decode([SubscriptionEntry].self, from: value.subscriptions)
-        _ = try decoder.decode([String: LocalSourceGroup].self, from: value.sourceGroups)
-        guard entries.count <= 500, Set(entries.map(\.address)).count == entries.count,
-              entries.allSatisfy({ URL(string: $0.address) != nil }) else { throw LocalBackupArchive.Failure.invalid }
-        _ = try LocalSourceLibrary.validateBackupSources(value.sources)
-        for (_, data) in value.documents { _ = try decoder.decode(Subscription.self, from: data) }
+        if categories.contains(.sources) {
+            let entries = try decoder.decode([SubscriptionEntry].self, from: value.subscriptions)
+            _ = try decoder.decode([String: LocalSourceGroup].self, from: value.sourceGroups)
+            guard entries.count <= 500, Set(entries.map(\.address)).count == entries.count,
+                  entries.allSatisfy({ URL(string: $0.address) != nil }) else { throw LocalBackupArchive.Failure.invalid }
+            _ = try LocalSourceLibrary.validateBackupSources(value.sources)
+            for (_, data) in value.documents { _ = try decoder.decode(Subscription.self, from: data) }
+        }
+        if let records = value.liveSubscriptions {
+            try IPTVLibrary.validatePortable(records.map { try decoder.decode(IPTVRecord.self, from: $0) })
+        }
         for (key, bytes) in value.settings {
             guard LocalBackupArchive.isAllowedSetting(key),
                   let item = try PropertyListSerialization.propertyList(from: bytes, options: [], format: nil) as? [String: Any],
@@ -65,30 +84,30 @@ import Perception
         }
     }
     static func restore(_ incoming: LocalBackupPayload, categories: Set<LocalBackupCategory>, replacing: Bool, store: Store) async throws {
+        let categories = categories.intersection(incoming.restoreCategories)
         guard !categories.isEmpty else { return }
         try validate(incoming)
         try beginRestore(store)
         defer { finishRestore(store) }
         store.stopForBackupRestore()
-        let before = try await snapshot(store, portable: false)
+        let before = try await makeJournal(store, categories: categories)
         try await transaction(before: before, store: store) {
             try await apply(incoming, categories: categories, replacing: replacing, activate: false, store: store)
         }
     }
     static func undo(_ store: Store) async throws {
-        let previous = try JSONDecoder().decode(LocalBackupPayload.self, from: Data(contentsOf: undoFile))
-        try validate(previous)
+        let previous = try readJournal(undoFile)
         try beginRestore(store)
         defer { finishRestore(store) }
         store.stopForBackupRestore()
-        let before = try await snapshot(store, portable: false)
+        let before = try await makeJournal(store, categories: previous.categories)
         try await transaction(before: before, store: store) {
-            try await apply(previous, categories: Set(LocalBackupCategory.allCases), replacing: true, activate: true, store: store)
+            try await applyJournal(previous, store: store)
         }
         try FileManager.default.removeItem(at: undoFile)
     }
     static func recover(_ store: Store) async -> Bool {
-        guard !recoveryInProgress else { return false }
+        guard !recoveryInProgress, !store.restoringBackup || store.backupRecoveryRequired else { return false }
         guard FileManager.default.fileExists(atPath: pendingFile.path) else {
             if store.backupRecoveryRequired { finishRestore(store) }
             return true
@@ -96,11 +115,10 @@ import Perception
         recoveryInProgress = true
         defer { recoveryInProgress = false }
         do {
-            let previous = try JSONDecoder().decode(LocalBackupPayload.self, from: Data(contentsOf: pendingFile))
-            try validate(previous)
+            let previous = try readJournal(pendingFile)
             if !store.restoringBackup { try beginRestore(store) }
             store.cloudSync?.suspendForLocalRestore(true)
-            try await apply(previous, categories: Set(LocalBackupCategory.allCases), replacing: true, activate: true, store: store)
+            try await applyJournal(previous, store: store)
             try synchronizeDefaults(store)
             try FileManager.default.removeItem(at: pendingFile)
             finishRestore(store)
@@ -131,32 +149,72 @@ import Perception
             throw NSError(domain: "LocalBackup", code: 5, userInfo: [NSLocalizedDescriptionKey: "备份设置尚未写入存储，恢复日志已保留。"])
         }
     }
-    private static func transaction(before: LocalBackupPayload, store: Store, operation: () async throws -> Void) async throws {
+    private static func makeJournal(_ store: Store, categories: Set<LocalBackupCategory>) async throws -> RestoreJournal {
+        let value = try await snapshot(store, portable: false, categories: categories)
+        let liveSnapshot = categories.contains(.liveSubscriptions) ? try IPTVLibrary.shared.privateSnapshot() : nil
+        return RestoreJournal(value: value, categories: categories, liveSnapshot: liveSnapshot)
+    }
+    private static func readJournal(_ file: URL) throws -> RestoreJournal {
+        let bytes = try Data(contentsOf: file)
+        let decoder = JSONDecoder()
+        let journal: RestoreJournal
+        if let scoped = try? decoder.decode(RestoreJournal.self, from: bytes) {
+            journal = scoped
+        } else {
+            let legacy = try decoder.decode(LocalBackupPayload.self, from: bytes)
+            journal = RestoreJournal(value: legacy, categories: [.sources, .history, .favorites, .settings], liveSnapshot: nil)
+        }
+        guard !journal.categories.isEmpty, journal.categories.contains(.liveSubscriptions) == (journal.liveSnapshot != nil) else {
+            throw LocalBackupArchive.Failure.invalid
+        }
+        try validate(journal.value, categories: journal.categories)
+        return journal
+    }
+    private static func applyJournal(_ journal: RestoreJournal, store: Store) async throws {
+        try await apply(journal.value, categories: journal.categories, replacing: true, activate: true,
+                        liveSnapshot: journal.liveSnapshot, store: store)
+    }
+    private static func transaction(before: RestoreJournal, store: Store, operation: () async throws -> Void) async throws {
         guard !FileManager.default.fileExists(atPath: pendingFile.path) else {
             throw NSError(domain: "LocalBackup", code: 3, userInfo: [NSLocalizedDescriptionKey: "上次恢复日志尚未处理完成，请重新打开应用后重试。原始数据恢复日志已保留。"])
         }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var journalDirectory = directory
+        try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try journalDirectory.setResourceValues(resourceValues)
         let bytes = try JSONEncoder().encode(before)
-        try bytes.write(to: pendingFile, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pendingFile.path)
+        try writeJournal(bytes, to: pendingFile)
         do {
             try await operation()
             try synchronizeDefaults(store)
-            try bytes.write(to: undoFile, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: undoFile.path)
+            try writeJournal(bytes, to: undoFile)
             try FileManager.default.removeItem(at: pendingFile)
         } catch {
             let original = error
             do {
-                try await apply(before, categories: Set(LocalBackupCategory.allCases), replacing: true, activate: true, store: store)
+                try await applyJournal(before, store: store)
                 try synchronizeDefaults(store)
                 try FileManager.default.removeItem(at: pendingFile)
             } catch { throw error }
             throw original
         }
     }
-    private static func apply(_ value: LocalBackupPayload, categories: Set<LocalBackupCategory>, replacing: Bool, activate: Bool, store: Store) async throws {
+    private static func writeJournal(_ bytes: Data, to file: URL) throws {
+        try bytes.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+    private static func apply(_ value: LocalBackupPayload, categories: Set<LocalBackupCategory>, replacing: Bool,
+                              activate: Bool, liveSnapshot: Data? = nil, store: Store) async throws {
         let decoder = JSONDecoder()
+        if categories.contains(.liveSubscriptions) {
+            if let liveSnapshot {
+                try IPTVLibrary.shared.restorePrivate(liveSnapshot)
+            } else if let records = value.liveSubscriptions {
+                try IPTVLibrary.shared.restorePortable(records.map { try decoder.decode(IPTVRecord.self, from: $0) }, replace: replacing)
+            }
+        }
         if categories.contains(.sources) {
             try await LocalSourceLibrary.shared.restoreBackupSources(value.sources, replacing: replacing)
             try store.applyBackupSubscriptions(decoder.decode([SubscriptionEntry].self, from: value.subscriptions),

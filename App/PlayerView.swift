@@ -23,6 +23,7 @@ struct PlaybackView: View {
     #endif
     @State private var showsChrome = true
     @State private var hideTask: Task<Void, Never>?
+    @State private var chromeHeld = false
     #if os(iOS)
     /// A watch page starts playing by itself, so its controls wait for a tap.
     @State private var quietStart = true
@@ -100,6 +101,9 @@ struct PlaybackView: View {
                 status
             }
             #if os(iOS)
+            // Only the popup avoids the keyboard. Moving the hosting viewport
+            // would also move the native picture and its gesture coordinates.
+            .ignoresSafeArea(.keyboard)
             // Registers the external-display accessory while the player is on screen (iOS 27): the system only
             // offers the display to apps that ask for it, and takes it back when the player closes.
             .background(ExternalDisplaySceneRegistrar().allowsHitTesting(false))
@@ -315,7 +319,7 @@ struct PlaybackView: View {
         #if os(iOS)
         // The controls stay while paused, and while VoiceOver runs, which can't reach controls that have faded out;
         // otherwise they leave about three seconds into playback.
-        guard !session.paused, !UIAccessibility.isVoiceOverRunning else { return }
+        guard !chromeHeld, !session.paused, !UIAccessibility.isVoiceOverRunning else { return }
         let delay = 3.0
         #else
         let delay = 3.5
@@ -365,6 +369,7 @@ struct PlaybackView: View {
         #if DEBUG
         Diagnostics.shared.record(.debug, "player.chrome", "event=hold holding=\(holding) visible=\(chromeVisible)")
         #endif
+        chromeHeld = holding
         if holding { showsChrome = true; hideTask?.cancel() } else { scheduleHide() }
     }
     #endif
@@ -412,6 +417,15 @@ struct PlaybackView: View {
                                 Label(L10n.text("Try Again"), systemImage: "arrow.clockwise")
                             }
                             .controlButton(prominent: true).tint(Brand.accent)
+                            if let choice = session.iptv {
+                                Menu {
+                                    ForEach(choice.station.lines.indices, id: \.self) { index in
+                                        Button(choice.station.lines[index].name) { session.chooseIPTVLine(index) }
+                                    }
+                                } label: {
+                                    Label(choice.programme == nil ? "选择线路" : "回到直播", systemImage: "arrow.triangle.branch")
+                                }.controlButton()
+                            }
                             Button { exit() } label: { Label(L10n.text("Close"), systemImage: "xmark") }.controlButton()
                         }
                     }
@@ -1496,6 +1510,13 @@ struct PlayerStep {
 
 extension Store {
     func step(back: Bool, from channel: Channel, session: PlaybackSession) -> PlayerStep? {
+        #if os(iOS)
+        if let choice = session.iptv, IPTVStationReference.id(for: channel) == choice.station.id {
+            return choice.neighbor(back: back).map { station in
+                PlayerStep(name: station.name, busy: false) { [weak self] in self?.playIPTV(station, lineup: choice.lineup) }
+            }
+        }
+        #endif
         if let episode = back ? previousEpisode(before: channel) : nextEpisode(after: channel) {
             return PlayerStep(name: episode.name, busy: resolvingEpisode != nil) { [weak self] in
                 if back || !session.playUpcoming() { self?.selectEpisode(episode, from: channel) }
@@ -1513,6 +1534,7 @@ extension Store {
 /// Shared setup leaves the native AVKit controls and Bilibili resolution intact.
 @MainActor func startCatalogPlayback(_ session: PlaybackSession, channel: Channel, store: Store) {
     session.history = store.playbackHistory
+    session.mediaEnhancements.history = store.playbackHistory
     session.skipDefaults = store.playbackDefaults
     session.catalogDanmaku.enabled = UserDefaults.standard.object(forKey: DanmakuPreference.key) == nil
         || UserDefaults.standard.bool(forKey: DanmakuPreference.key)
@@ -1548,10 +1570,19 @@ struct PlaybackInfoPanel: View {
 
     private struct Row: Identifiable { let id: String; let text: String }
 
+    private var displayRows: [Row] {
+        var rows = [Row(id: "film", text: info.video ?? ""), Row(id: "waveform", text: info.audio ?? ""),
+                    Row(id: "speedometer", text: info.network() ?? "")]
+        #if os(iOS)
+        if let usage = session.videoCacheUsage { rows.append(Row(id: "internaldrive", text: usage)) }
+        if let status = session.videoCacheStatus { rows.append(Row(id: "info.circle", text: status)) }
+        #endif
+        return rows.filter { !$0.text.isEmpty }
+    }
+
     var body: some View {
         WithPerceptionTracking {
-            let rows = [Row(id: "film", text: info.video ?? ""), Row(id: "waveform", text: info.audio ?? ""),
-                        Row(id: "speedometer", text: info.network() ?? "")].filter { !$0.text.isEmpty }
+            let rows = displayRows
             VStack(alignment: .leading, spacing: Metrics.spacing) {
                 ForEach(rows) { row in
                     WithPerceptionTracking {

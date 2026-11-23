@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CryptoKit
 
 /// WebHome pages may hand over one on-demand Bilibili MPD. The player receives
 /// only its HTTP tracks; arbitrary XML, data documents and local paths are refused.
@@ -11,8 +12,13 @@ public enum HTMLHomePlayback {
         public let workID: String
         public let isLive: Bool
         public let episodes: [EpisodeReference]
-        public init(sourceID: String, workID: String, isLive: Bool, episodes: [EpisodeReference]) {
+        public let historyID: String?
+        /// A homepage is a resolver fallback, never evidence identifying a series.
+        public let fallbackPage: String?
+        public init(sourceID: String, workID: String, isLive: Bool, episodes: [EpisodeReference], historyID: String? = nil,
+                    fallbackPage: String? = nil) {
             self.sourceID = sourceID; self.workID = workID; self.isLive = isLive; self.episodes = episodes
+            self.historyID = historyID; self.fallbackPage = fallbackPage
         }
     }
     public struct EpisodeReference: Codable, Equatable, Sendable {
@@ -24,6 +30,95 @@ public enum HTMLHomePlayback {
             self.id = id; self.name = name; self.pageURL = pageURL; self.resolverURL = resolverURL
         }
         public var payload: [String: String] { ["name": name, "url": resolverURL, "pageUrl": pageURL] }
+    }
+    /// Bounded evidence travels with history/backup records independently of the
+    /// local catalog snapshot. Digests retain no playback addresses or credentials.
+    public struct HistoryProof: Codable, Hashable, Sendable {
+        static let referenceLimit = 128
+        public let sourceID: String
+        public let titleDigest: String
+        public let workDigest: String?
+        public let referenceDigests: [String]
+        /// These fields are immutable. Validate once on construction/decoding,
+        /// rather than rescanning every history row during each progress tick.
+        let isValid: Bool
+        private enum CodingKeys: String, CodingKey { case sourceID, titleDigest, workDigest, referenceDigests }
+        init(sourceID: String, titleDigest: String, workDigest: String?, referenceDigests: [String]) {
+            self.sourceID = sourceID; self.titleDigest = titleDigest; self.workDigest = workDigest; self.referenceDigests = referenceDigests
+            func digest(_ value: String) -> Bool { value.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
+            isValid = !sourceID.isEmpty && sourceID.utf8.count <= 128 && digest(titleDigest)
+                && (workDigest.map(digest) ?? true) && referenceDigests.count <= Self.referenceLimit
+                && (workDigest != nil || !referenceDigests.isEmpty) && referenceDigests.allSatisfy(digest)
+        }
+        public init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(sourceID: try values.decode(String.self, forKey: .sourceID),
+                      titleDigest: try values.decode(String.self, forKey: .titleDigest),
+                      workDigest: try values.decodeIfPresent(String.self, forKey: .workDigest),
+                      referenceDigests: try values.decode([String].self, forKey: .referenceDigests))
+        }
+        func hasSameOwnerAndWork(as other: Self) -> Bool {
+            sourceID == other.sourceID && workDigest == other.workDigest
+                && (workDigest != nil || titleDigest == other.titleDigest)
+        }
+        func including(_ older: Self) -> Self {
+            guard hasSameOwnerAndWork(as: older) else { return self }
+            var seen = Set<String>()
+            let references = (referenceDigests + older.referenceDigests).filter { seen.insert($0).inserted }
+            return Self(sourceID: sourceID, titleDigest: titleDigest, workDigest: workDigest,
+                        referenceDigests: Array(references.prefix(Self.referenceLimit)))
+        }
+    }
+    public static func historyProof(sourceID: String, workID: String, title: String, episodes: [EpisodeReference],
+                                    fallbackPages: [String] = [], selectedEpisodeID: String? = nil) -> HistoryProof? {
+        guard !sourceID.isEmpty, sourceID.utf8.count <= 128, workID.utf8.count <= 32768, episodes.count <= 1000 else { return nil }
+        func digest(_ value: String) -> String { SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() }
+        func addressIdentity(_ value: String) -> String {
+            guard var url = URLComponents(string: value) else { return value }
+            url.fragment = nil
+            url.scheme = url.scheme?.lowercased(); url.host = url.host?.lowercased()
+            return url.string ?? value
+        }
+        let homepages = Set(fallbackPages.map(addressIdentity))
+        let credentialKeys: Set<String> = ["token", "sign", "signature", "expires", "deadline", "wssecret", "auth_key", "authorization",
+            "auth", "access_token", "password", "passwd", "pwd", "credential", "credentials", "secret", "api_key", "apikey", "access_key", "session", "sessionid"]
+        let mediaExtensions: Set<String> = ["mp4", "m4v", "mov", "mkv", "avi", "flv", "webm", "ts", "m2ts", "m3u8", "mpd",
+            "m4s", "mp3", "m4a", "aac", "flac", "wav", "iso", "bdmv", "mpls"]
+        func original(_ value: String) -> Bool {
+            guard !value.isEmpty, !homepages.contains(addressIdentity(value)), resolverIdentity(value, pageURL: "") == value,
+                  let url = URL(string: value), let scheme = url.scheme?.lowercased(), url.host?.lowercased() != "html-home.invalid",
+                  !mediaExtensions.contains(url.pathExtension.lowercased()) else { return false }
+            let keys = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.map { $0.name.lowercased() } ?? []
+            guard !keys.contains(where: credentialKeys.contains) else { return false }
+            return !["http", "https"].contains(scheme) || (!url.path.isEmpty && url.path != "/")
+        }
+        var selected = Set<String>(), all = Set<String>()
+        for episode in episodes {
+            for value in [episode.pageURL, episode.resolverURL] where original(value) {
+                let reference = digest(value); all.insert(reference)
+                if episode.id == selectedEpisodeID { selected.insert(reference) }
+            }
+        }
+        guard !workID.isEmpty || !all.isEmpty else { return nil }
+        let references = selected.sorted() + all.subtracting(selected).sorted()
+        return HistoryProof(sourceID: sourceID, titleDigest: digest(title), workDigest: workID.isEmpty ? nil : digest(workID),
+                            referenceDigests: Array(references.prefix(HistoryProof.referenceLimit)))
+    }
+    /// With no work ID this identifies a catalog snapshot. PlaybackHistory can
+    /// link successive snapshots using their bounded, unambiguous original proof.
+    public static func historyID(sourceID: String, workID: String, title: String, episodes: [EpisodeReference],
+                                 fallbackPage: String? = nil) -> String? {
+        let key: String
+        if !workID.isEmpty { key = sourceID + "\n" + workID }
+        else {
+            guard historyProof(sourceID: sourceID, workID: workID, title: title, episodes: episodes,
+                               fallbackPages: fallbackPage.map { [$0] } ?? []) != nil else { return nil }
+            let references = episodes.map { episode in
+                String(decoding: try! JSONEncoder().encode([episode.name, episode.pageURL, episode.resolverURL]), as: UTF8.self)
+            }
+            key = String(decoding: try! JSONEncoder().encode([sourceID, title] + Set(references).sorted()), as: UTF8.self)
+        }
+        return "html-media-" + SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
     /// Opaque page tokens such as tx://work/episode are data passed back to the
     /// page's resolver. A temporary media address must never become that token.

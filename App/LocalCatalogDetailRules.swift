@@ -7,7 +7,7 @@ import TVCore
 /// The grouping and filename rules follow MacCat's TmdbDetail and episode-numbers.mjs.
 enum LocalCatalogDetailRules {
     static let groupSize = 30
-    struct EpisodeKey {
+    struct EpisodeKey: Sendable {
         let index: Int
         let season: Int
         let number: Int?

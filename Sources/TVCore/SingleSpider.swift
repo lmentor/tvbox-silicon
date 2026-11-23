@@ -67,6 +67,17 @@ public enum ImportedFiles {
         return address(name)
     }
 
+    /// Legacy single-file subscriptions retain their original address and filename
+    /// when the user selects a differently named, already validated replacement.
+    public static func replace(_ data: Data, at address: String) throws {
+        guard let url = URL(string: address), let destination = file(for: url),
+              destination.lastPathComponent != ".missing", data.count <= 20_000_000 else {
+            throw TVError.invalidConfiguration
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try data.write(to: destination, options: .atomic)
+    }
+
     /// Deletes the copy behind an address on the reserved host; any other address is left alone.
     public static func remove(_ address: String) {
         guard let url = URL(string: address), let file = file(for: url) else { return }

@@ -14,7 +14,7 @@ import time
 root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--check', action='store_true', help='Check prepared dependencies and print the build command.')
-parser.add_argument('--build-number', type=int, help='Override the default latest build number plus one.')
+parser.add_argument('--build-number', type=int, help='Override the project build number or latest build number plus one.')
 parser.add_argument('--jobs', type=int, help='Parallel build operations (default: physical cores, capped by available RAM and 8).')
 args = parser.parse_args()
 if args.jobs is not None and not 1 <= args.jobs <= 32:
@@ -35,8 +35,10 @@ if host_arch not in ('arm64', 'x86_64'):
     parser.error('Unsupported Xcode host architecture: ' + host_arch)
 excluded_host_arch = 'arm64' if host_arch == 'x86_64' else 'x86_64'
 latest = root / 'artifacts/latest/ipa-delivery.json'
-previous = json.loads(latest.read_text()) if latest.exists() else {'build': '0'}
-number = args.build_number if args.build_number is not None else int(previous['build']) + 1
+previous = json.loads(latest.read_text()) if latest.exists() else None
+project = json.loads((root / 'project.yml').read_text())
+default_number = int(previous['build']) + 1 if previous else int(project['settings']['base']['CURRENT_PROJECT_VERSION'])
+number = args.build_number if args.build_number is not None else default_number
 if number < 1:
     parser.error('--build-number must be positive')
 required = [

@@ -144,16 +144,27 @@ struct NativeDanmakuSurface: UIViewRepresentable {
             geometry.removeAll(keepingCapacity: true)
             CATransaction.commit()
         }
+        let scaleChanged = configuration?.scale != next.scale
         configuration = next; generation &+= 1; needsFrame = true
+        if scaleChanged { updateViewport() }
         updateDisplaySchedule()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        guard viewport != bounds.size else { return }
-        viewport = bounds.size; generation &+= 1; needsFrame = true
+        updateViewport()
+    }
+    private func updateViewport() {
+        let size = DanmakuEngine.layoutSize(bounds.size, scale: configuration?.scale ?? 1)
+        guard viewport != size else { return }
+        viewport = size; generation &+= 1; needsFrame = true
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        scene.frame = bounds
+        // Old layer motions carry their previous viewport's coordinates. Drop
+        // them before the asynchronous renderer prepares the rotated geometry.
+        for tile in tiles.values { tile.layer.removeFromSuperlayer() }
+        tiles.removeAll(keepingCapacity: true)
+        geometry.removeAll(keepingCapacity: true)
+        scene.frame = CGRect(origin: bounds.origin, size: size)
         CATransaction.commit()
         updateDisplaySchedule()
     }

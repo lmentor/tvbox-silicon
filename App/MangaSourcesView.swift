@@ -158,9 +158,10 @@ struct MangaSourcesView: View {
     }
 }
 
-/// The sources one list offers, each with Install, Update or Installed.
+/// Subscription refresh prepares the sources; their usable state is visible here.
 struct MangaRepositoryView: View {
     let url: URL
+    @Environment(Store.self) private var appStore
     @State private var store = MangaStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var entries: [MangaRepositoryEntry]?
@@ -168,6 +169,9 @@ struct MangaRepositoryView: View {
     @State private var busy: Set<String> = []
     @State private var errors: [String: String] = [:]
     @State private var filter = ""
+    @State private var refreshing = false
+    @State private var loadID: UUID?
+    @State private var refreshRevision = 0
 
     private var shown: [MangaRepositoryEntry] {
         let all = entries ?? []
@@ -235,9 +239,25 @@ struct MangaRepositoryView: View {
             if let entries, !entries.isEmpty {
                 List {
                     WithPerceptionTracking {
+                        #if os(iOS)
+                        Section {
+                            HStack {
+                                Text("\(entries.count) 个漫画站点").font(.subheadline)
+                                Spacer()
+                                if refreshing { ProgressView() }
+                                Button("更新订阅") { refreshRevision += 1 }.disabled(refreshing)
+                            }
+                            if let failure { Text(failure).font(.footnote).foregroundStyle(.secondary) }
+                        } footer: {
+                            Text("订阅中的站点自动准备，可从首页漫画列表直接打开。需要账号的站点，在站点首页右上角菜单中选择“登录账号”。")
+                        }
+                        #endif
                         ForEach(shown) { entry in WithPerceptionTracking { row(entry) } }
                         Section {
-                            Button(L10n.text("Remove Source List"), role: .destructive) { store.removeRepository(url); dismiss() }
+                            Button(L10n.text("Remove Source List"), role: .destructive) {
+                                do { try store.deleteRepository(url); dismiss() }
+                                catch { failure = error.mangaMessage }
+                            }.disabled(!busy.isEmpty || refreshing)
                         }
                     }
                 }
@@ -248,12 +268,12 @@ struct MangaRepositoryView: View {
                 EmptyResults(symbol: "tray", title: L10n.text("This list has no sources."))
             } else if let failure {
                 EmptyResults(symbol: "exclamationmark.triangle", title: L10n.text("Unable to Load"), message: failure, action: L10n.text("Try Again")) {
-                    Task { await load() }
+                    refreshRevision += 1
                 }
             } else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
         }
         .screenTitle(MangaSources.title(of: url))
-        .task { if entries == nil { await load() } }
+        .task(id: refreshRevision) { await load() }
     }
 
     private func row(_ entry: MangaRepositoryEntry) -> some View {
@@ -266,9 +286,29 @@ struct MangaRepositoryView: View {
                     if !entry.version.isEmpty { Text(entry.version).font(.caption).foregroundStyle(.secondary) }
                 }
                 if !entry.description.isEmpty { Text(entry.description).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
-                if let error = errors[entry.id] { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
+                if let error = store.repositoryErrors[url.absoluteString]?[entry.id] {
+                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(3)
+                }
             }
             Spacer(minLength: 8)
+            #if os(iOS)
+            if let installed {
+                let site = LocalSearchManga.site(installed)
+                let hidden = appStore.hiddenSources.contains(site, origin: LocalSearchManga.origin)
+                Button {
+                    appStore.hiddenSources.setHidden([site], origin: LocalSearchManga.origin, hidden: !hidden)
+                    store.applyHiddenSources(appStore.hiddenSources)
+                } label: {
+                    Image(systemName: hidden ? "eye.slash" : "eye").frame(width: 44, height: 44)
+                }.buttonStyle(.borderless).accessibilityLabel((hidden ? "显示" : "隐藏") + entry.name)
+            }
+            if refreshing && installed == nil {
+                ProgressView()
+            } else {
+                Label(installed == nil ? "暂不可用" : "可用", systemImage: installed == nil ? "exclamationmark.circle" : "checkmark")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            #else
             if busy.contains(entry.id) {
                 ProgressView()
             } else if installed != nil, !update {
@@ -281,6 +321,7 @@ struct MangaRepositoryView: View {
                     .buttonStyle(.borderedProminent).controlSize(.small)
                     #endif
             }
+            #endif
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
@@ -290,21 +331,34 @@ struct MangaRepositoryView: View {
         busy.insert(entry.id); errors[entry.id] = nil
         Task {
             defer { busy.remove(entry.id) }
-            do { try await store.install(entry.address) }
+            do { try await store.install(entry) }
             catch { errors[entry.id] = error.mangaMessage }
         }
     }
 
     private func load() async {
+        let id = UUID()
+        loadID = id; refreshing = true
+        defer { if loadID == id { refreshing = false; loadID = nil } }
         failure = nil
-        do { entries = try await MangaSources.shared.entries(of: url) }
-        catch { failure = error.mangaMessage }
+        if entries == nil {
+            let cached = MangaSources.shared.cachedEntries(of: url)
+            if !cached.isEmpty { entries = cached }
+        }
+        do {
+            try await store.refreshRepository(url)
+            guard !Task.isCancelled, loadID == id else { return }
+            entries = store.repositoryEntries[url.absoluteString] ?? []
+        } catch {
+            if !Task.isCancelled, loadID == id { failure = error.mangaMessage }
+        }
     }
 }
 
 /// One source: its settings, its account, and removing it.
 struct MangaSourceSettingsView: View {
     let key: String
+    var opensWebLogin = false
     @State private var store = MangaStore.shared
     @State private var info: MangaSourceInfo?
     @State private var failure: String?
@@ -315,6 +369,10 @@ struct MangaSourceSettingsView: View {
     @State private var working = false
     @State private var message: String?
     @State private var revision = 0
+    #if os(iOS)
+    @State private var showsWebLogin = false
+    @State private var openedWebLogin = false
+    #endif
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -350,6 +408,7 @@ struct MangaSourceSettingsView: View {
             }
         }
         .task(id: revision) { await loadInfo() }
+
     }
 
     @ViewBuilder private func tvSettingRow(_ setting: MangaSourceInfo.Setting, info: MangaSourceInfo) -> some View {
@@ -430,7 +489,7 @@ struct MangaSourceSettingsView: View {
                             ForEach(info.settings, id: \.key) { setting in WithPerceptionTracking { settingRow(setting, info: info) } }
                         }
                     }
-                    if info.canSignIn || !info.cookieFields.isEmpty { accountSection(info) }
+                    if info.canSignIn || !info.cookieFields.isEmpty || info.signInPage != nil { accountSection(info) }
                 } else if let failure {
                     Section { Text(failure).foregroundStyle(.secondary) }
                 } else {
@@ -450,6 +509,22 @@ struct MangaSourceSettingsView: View {
         }
         .screenTitle(store.name(of: key))
         .task(id: revision) { await loadInfo() }
+        #if os(iOS)
+        .sheet(isPresented: $showsWebLogin) {
+            if let page = info?.signInPage, let url = URL(string: page) {
+                MangaWebLoginView(source: key, url: url) {
+                    signedIn = MangaSourceData.shared.isSignedIn(key)
+                    revision += 1
+                    message = signedIn ? L10n.text("Signed in.") : nil
+                }
+            }
+        }
+        .appOnChange(of: info?.signInPage) { _, page in
+            if opensWebLogin, !openedWebLogin, page != nil {
+                openedWebLogin = true; showsWebLogin = true
+            }
+        }
+        #endif
     }
 
     private func loadInfo() async {
@@ -535,7 +610,12 @@ struct MangaSourceSettingsView: View {
                 }
                 #if !os(tvOS)
                 if let page = info.signInPage, let url = URL(string: page) {
+                    #if os(iOS)
+                    Button("打开登录网页", systemImage: "safari") { showsWebLogin = true }
+                        .accessibilityIdentifier("manga.account.web")
+                    #else
                     Link(destination: url) { Label(L10n.text("Open the Website to Sign Up"), systemImage: "safari") }
+                    #endif
                 }
                 #endif
             }

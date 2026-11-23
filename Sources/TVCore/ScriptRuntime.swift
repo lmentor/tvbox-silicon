@@ -10,7 +10,29 @@ public actor ScriptRuntime {
     public static var available: Bool { ScriptAssets.root != nil }
     private var sessions: [String: ScriptSession] = [:]
     private var recent: [String] = []
+    private var importedFilesBySession: [String: [String]] = [:]
+    private var importedFileGenerations: [String: UUID] = [:]
     private static let maximumSessions = 10
+
+    /// Legacy imports keep a stable address across file replacements. Retire
+    /// only dependent VMs; their preferences remain in the same profile folder.
+    public func invalidateImportedFile(_ address: String) {
+        guard let file = Self.importedFileIdentity(address) else { return }
+        importedFileGenerations[file] = UUID()
+        let affected = importedFilesBySession.compactMap { $0.value.contains(file) ? $0.key : nil }
+        for key in affected {
+            sessions.removeValue(forKey: key)?.close()
+            importedFilesBySession[key] = nil
+            recent.removeAll { $0 == key }
+        }
+    }
+
+    private static func importedFileIdentity(_ address: String) -> String? {
+        guard ImportedFiles.isImported(address), let url = URL(string: address) else { return nil }
+        // ImportedFiles resolves a single decoded filename and ignores URL
+        // query/fragment. Dependency identity must follow that same file.
+        return url.path
+    }
 
     public func request(site: Site, scriptURL: URL, params: [String: String], http: HTTPClient, origin: URL) async throws -> [String: JSONValue] {
         let started = ContinuousClock.now
@@ -25,7 +47,7 @@ public actor ScriptRuntime {
             throw TVError.unsupported(L10n.text("The plugin returned no content. Try another source."))
         }
         Diagnostics.shared.record(.info, "script.request", "source=\(site.key) completed duration=\(started.duration(to: .now)) bytes=\(text.utf8.count)")
-        return try JSONDecoder().decode([String: JSONValue].self, from: Data(text.utf8))
+        return try await CatalogResponseParser.decode(Data(text.utf8), maximumBytes: params["wd"] == nil ? BoundedHTTPData.catalogBytes : BoundedHTTPData.searchBytes)
     }
 
     private func session(site: Site, scriptURL: URL, origin: URL, http: HTTPClient) async throws -> ScriptSession {
@@ -37,19 +59,43 @@ public actor ScriptRuntime {
         // its JAR spider's configuration (possibly encrypted text), so it reaches the port unchanged.
         if !ext.isEmpty, !ext.hasPrefix("{"), site.liteScript == nil { ext = (try? WebAddress.resolve(ext, relativeTo: origin).absoluteString) ?? ext }
         let key = PluginChecksum.sha256(Data((scriptURL.absoluteString + "\n" + site.key + "\n" + ext).utf8))
-        if let existing = sessions[key] {
-            recent.removeAll { $0 == key }; recent.append(key)
-            return existing
-        }
+        let dependencies = Set([scriptURL.absoluteString, ext].compactMap(Self.importedFileIdentity)).sorted()
         let profile = ScriptAssets.profiles.appendingPathComponent(PluginChecksum.sha256(Data((site.key + "\n" + origin.absoluteString).utf8)), isDirectory: true)
-        let session = try await ScriptSession.start(api: scriptURL.absoluteString, key: site.sourceKey, ext: ext, profile: profile, label: site.key)
-        sessions[key] = session
-        recent.append(key)
-        while recent.count > Self.maximumSessions {
-            let evicted = recent.removeFirst()
-            sessions.removeValue(forKey: evicted)?.close()
+        while true {
+            try Task.checkCancellation()
+            if let existing = sessions[key] {
+                recent.removeAll { $0 == key }; recent.append(key)
+                return existing
+            }
+            let generations = dependencies.map { importedFileGenerations[$0] }
+            let session: ScriptSession
+            do {
+                session = try await ScriptSession.start(api: scriptURL.absoluteString, key: site.sourceKey, ext: ext, profile: profile, label: site.key)
+            } catch {
+                // A replaced script can fail late during its old initialization.
+                // Retry the now-current file instead of publishing that old error.
+                if !Task.isCancelled, generations != dependencies.map({ importedFileGenerations[$0] }) { continue }
+                throw error
+            }
+            guard generations == dependencies.map({ importedFileGenerations[$0] }) else {
+                session.close()
+                continue
+            }
+            if let existing = sessions[key] {
+                session.close()
+                recent.removeAll { $0 == key }; recent.append(key)
+                return existing
+            }
+            sessions[key] = session
+            importedFilesBySession[key] = dependencies
+            recent.append(key)
+            while recent.count > Self.maximumSessions {
+                let evicted = recent.removeFirst()
+                sessions.removeValue(forKey: evicted)?.close()
+                importedFilesBySession[evicted] = nil
+            }
+            return session
         }
-        return session
     }
 }
 
@@ -96,18 +142,19 @@ final class ScriptSession: @unchecked Sendable {
 
     /// `source`, when given, is served for `api` instead of downloading it.
     static func start(api: String, key: String, ext: String, profile: URL, label: String, source: String? = nil) async throws -> ScriptSession {
+        try Task.checkCancellation()
         let session = ScriptSession(thread: ScriptThread(label: label), bridge: ScriptBridge(profile: profile, label: label, supplied: source.map { [api: $0] } ?? [:]))
         session.thread.start()
         let bootFailure: String? = await session.thread.run(stopped: Optional("The script runtime stopped")) { session.boot() }
         if let bootFailure {
-            session.close()
+            await session.closeAndWait()
             throw TVError.unsupported(L10n.text("Plugin error: %@", String(bootFailure.prefix(300))))
         }
         let input = (try? String(decoding: JSONSerialization.data(withJSONObject: ["api": api, "key": key, "ext": ext]), as: UTF8.self)) ?? "{}"
         let envelope = await session.evaluate("__tvbox.init(\(input))", within: 60, cancellable: true)
-        if Task.isCancelled { session.close(); throw CancellationError() }
+        if Task.isCancelled { await session.closeAndWait(); throw CancellationError() }
         if envelope["value"]?.object?["ready"] == nil {
-            session.close()
+            await session.closeAndWait()
             let failure = envelope["value"]?.object?["error"]?.string ?? envelope["error"]?.string ?? "The script did not start"
             throw TVError.unsupported(L10n.text("Plugin error: %@", String(failure.prefix(300))))
         }
@@ -117,6 +164,7 @@ final class ScriptSession: @unchecked Sendable {
     /// A runtime for a script that is not a TVBox spider: the prelude, then the bundled `module`, which
     /// reads the script and anything else it needs from `supplied` (`__host('module', key)`).
     static func start(module: String, supplied: [String: String], profile: URL, label: String, extension handler: ScriptHostExtension? = nil) async throws -> ScriptSession {
+        try Task.checkCancellation()
         let session = ScriptSession(thread: ScriptThread(label: label), bridge: ScriptBridge(profile: profile, label: label, supplied: supplied, extension: handler))
         session.thread.start()
         let failure: String? = await session.thread.run(stopped: Optional("The script runtime stopped")) {
@@ -125,27 +173,36 @@ final class ScriptSession: @unchecked Sendable {
             if let error = tv_script_module(script, module, source, 30) { defer { free(error) }; return String(cString: error) }
             return nil
         }
+        if Task.isCancelled { await session.closeAndWait(); throw CancellationError() }
         if let failure {
-            session.close()
+            await session.closeAndWait()
             throw TVError.unsupported(L10n.text("Plugin error: %@", String(failure.prefix(300))))
         }
         return session
     }
 
     /// Evaluates a global expression, waiting up to `seconds` for a promise: {"value": ...} or {"error": ...}.
-    func evaluate(_ expression: String, within seconds: Double, cancellable: Bool = false) async -> [String: JSONValue] {
+    func evaluate(_ expression: String, within seconds: Double, cancellable: Bool = false, search: Bool = false) async -> [String: JSONValue] {
         let stopped: [String: JSONValue] = ["error": .string("The script runtime stopped")]
         if !cancellable { return await thread.run(stopped: stopped) { self.evaluate(expression, seconds: seconds) ?? stopped } }
         let token = ScriptCancellation(), deadline = Date().addingTimeInterval(seconds)
+        let requests = ScriptRequestScope(deadline: deadline, search: search)
         return await withTaskCancellationHandler {
             if Task.isCancelled { token.cancel() }
             return await thread.run(stopped: stopped) {
                 guard let script = self.script else { return ["error": .string("The script runtime stopped")] }
                 let remaining = deadline.timeIntervalSinceNow
                 guard remaining > 0, !token.cancelled else { return ["error": .string("interrupted: the operation was cancelled or timed out")] }
+                self.bridge.beginRequest(requests)
+                defer { self.bridge.endRequest(requests) }
                 guard let output = tv_script_call_cancellable(script, expression, remaining, token.pointer) else { return ["error": .string("The script runtime stopped")] }
                 defer { free(output) }
-                let envelope = (try? JSONDecoder().decode([String: JSONValue].self, from: Data(String(cString: output).utf8))) ?? ["error": .string("unreadable script result")]
+                let text = String(cString: output), data = Data(text.utf8)
+                let envelope: [String: JSONValue]
+                do {
+                    try CatalogResponseParser.validate(data)
+                    envelope = try JSONDecoder().decode([String: JSONValue].self, from: data)
+                } catch { return ["error": .string(error.localizedDescription)] }
                 if token.cancelled || envelope["error"]?.string?.contains("interrupted") == true {
                     self.bridge.cancelPending()
                     // Clear JS callback polling while still on this session's thread, before
@@ -154,7 +211,7 @@ final class ScriptSession: @unchecked Sendable {
                 }
                 return envelope
             }
-        } onCancel: { token.cancel() }
+        } onCancel: { token.cancel(); requests.cancel() }
     }
 
     /// Runs on the session thread: QuickJS with the TVBox prelude loaded.
@@ -171,7 +228,8 @@ final class ScriptSession: @unchecked Sendable {
     func call(_ params: [String: String]) async throws -> [String: JSONValue] {
         try Task.checkCancellation()
         let json = (try? String(decoding: JSONSerialization.data(withJSONObject: params), as: UTF8.self)) ?? "{}"
-        let envelope = await evaluate("__tvbox.call(\(json))", within: params["wd"] == nil ? 60 : 25, cancellable: true)
+        let envelope = await evaluate("__tvbox.call(\(json))", within: params["wd"] == nil ? 60 : 25,
+                                      cancellable: true, search: params["wd"] != nil)
         try Task.checkCancellation()
         if let value = envelope["value"]?.object { return value }
         return ["error": .string(envelope["error"]?.string ?? "The script failed"), "errorCode": .string("script_error")]
@@ -190,6 +248,15 @@ final class ScriptSession: @unchecked Sendable {
         thread.run {
             if let script = self.script { tv_script_free(script); self.script = nil }
         } then: { self.thread.cancel() }
+    }
+
+    /// Transient manga/search VMs return their admission permit after native teardown.
+    func closeAndWait() async {
+        await thread.run(stopped: ()) {
+            self.bridge.cancelPending()
+            if let script = self.script { tv_script_free(script); self.script = nil }
+            self.thread.cancel()
+        }
     }
 }
 
@@ -265,9 +332,20 @@ final class ScriptBridge: @unchecked Sendable {
     private var preferencesFile: URL { profile.appendingPathComponent("preferences.json") }
     private let pending = PendingRequests()
     private let handler: ScriptHostExtension?
+    private var request: ScriptRequestScope?
 
     deinit { pending.cancelAll() }
-    func cancelPending() { pending.cancelAll() }
+    func cancelPending() { request?.cancel(); pending.cancelAllAndWait(); handler?.cancelPending() }
+    func beginRequest(_ request: ScriptRequestScope) { self.request = request; handler?.beginRequest(request) }
+    func endRequest(_ request: ScriptRequestScope) {
+        if request.search || request.cancelled {
+            request.cancelAndWait()
+            pending.cancelAllAndWait()
+            handler?.cancelPending()
+        }
+        handler?.endRequest(request)
+        self.request = nil
+    }
 
     init(profile: URL, label: String, supplied: [String: String] = [:], extension handler: ScriptHostExtension? = nil) {
         self.handler = handler
@@ -288,12 +366,14 @@ final class ScriptBridge: @unchecked Sendable {
             guard parts.count == 2, let resolved = ScriptAssets.resolve(parts[1], from: parts[0]) else { throw ScriptHostError("invalid module specifier") }
             return resolved
         case "module": return try module(argument)
-        case "http": return try ScriptHTTP.perform(argument)
+        case "http": return try ScriptHTTP.perform(argument, scope: request)
         // Requests that don't block the script: start one, then poll for its answer from a timer.
         case "httpStart":
             let id = pending.add()
-            let cancel = try ScriptHTTP.start(argument) { [pending] answer in pending.finish(id, answer) }
-            pending.setCancel(id, cancel)
+            do {
+                let cancel = try ScriptHTTP.start(argument, scope: request) { [pending] answer in pending.finish(id, answer) }
+                pending.setCancel(id, cancel)
+            } catch { pending.finish(id, ""); throw error }
             return String(id)
         case "httpPoll": return pending.take(Int(argument) ?? -1)
         case "httpCancel": pending.cancel(Int(argument) ?? -1); return nil
@@ -336,7 +416,7 @@ final class ScriptBridge: @unchecked Sendable {
         let file = folder.appendingPathComponent(PluginChecksum.sha256(Data(address.utf8)) + ".js")
         let age = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate).map { Date().timeIntervalSince($0) }
         if let age, age < 300, let cached = try? String(contentsOf: file, encoding: .utf8) { return cached }
-        let answer = try JSONDecoder().decode([String: JSONValue].self, from: Data(try ScriptHTTP.perform(String(decoding: JSONSerialization.data(withJSONObject: ["url": address, "timeout": 20000]), as: UTF8.self)).utf8))
+        let answer = try JSONDecoder().decode([String: JSONValue].self, from: Data(try ScriptHTTP.perform(String(decoding: JSONSerialization.data(withJSONObject: ["url": address, "timeout": 20000]), as: UTF8.self), scope: request).utf8))
         if let code = answer["code"]?.int, (200..<300).contains(code), let source = answer["content"]?.string, !source.isEmpty {
             try? Data(source.utf8).write(to: file, options: .atomic)
             return source
@@ -350,32 +430,109 @@ final class ScriptBridge: @unchecked Sendable {
 /// the operation isn't one of its own.
 protocol ScriptHostExtension: AnyObject, Sendable {
     func answer(_ operation: String, _ argument: String) throws -> String??
+    func cancelPending()
+    func beginRequest(_ request: ScriptRequestScope)
+    func endRequest(_ request: ScriptRequestScope)
+}
+extension ScriptHostExtension {
+    func cancelPending() {}
+    func beginRequest(_ request: ScriptRequestScope) {}
+    func endRequest(_ request: ScriptRequestScope) {}
 }
 
 /// Requests started with `httpStart`, until their answers are taken.
 final class PendingRequests: @unchecked Sendable {
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var next = 1
     private var answers: [Int: String] = [:]
     private var cancels: [Int: () -> Void] = [:]
+    private var active = Set<Int>()
+    private var discarded = Set<Int>()
 
-    func add() -> Int { lock.withLock { defer { next += 1 }; return next } }
+    func add() -> Int { lock.withLock { defer { next += 1 }; active.insert(next); return next } }
     func setCancel(_ id: Int, _ cancel: @escaping () -> Void) {
-        lock.withLock { if answers[id] == nil { cancels[id] = cancel } }
+        let stop = lock.withLock {
+            guard active.contains(id) else { return false }
+            if discarded.contains(id) { return true }
+            cancels[id] = cancel
+            return false
+        }
+        if stop { cancel() }
     }
-    func finish(_ id: Int, _ answer: String) { lock.withLock { cancels[id] = nil; answers[id] = answer } }
+    func finish(_ id: Int, _ answer: String) {
+        lock.withLock {
+            cancels[id] = nil; active.remove(id)
+            if discarded.remove(id) == nil { answers[id] = answer }
+            lock.broadcast()
+        }
+    }
     func take(_ id: Int) -> String? { lock.withLock { answers.removeValue(forKey: id) } }
     func cancel(_ id: Int) {
-        let cancel = lock.withLock { answers[id] = nil; return cancels.removeValue(forKey: id) }
+        let cancel = lock.withLock {
+            answers[id] = nil
+            if active.contains(id) { discarded.insert(id) }
+            return cancels.removeValue(forKey: id)
+        }
         cancel?()
     }
     func cancelAll() {
-        let all = lock.withLock { defer { cancels = [:]; answers = [:] }; return Array(cancels.values) }
+        let all = lock.withLock {
+            defer { cancels = [:]; answers = [:] }
+            discarded.formUnion(active)
+            return Array(cancels.values)
+        }
         all.forEach { $0() }
+    }
+    func cancelAllAndWait() {
+        cancelAll()
+        lock.lock()
+        while !active.isEmpty { lock.wait() }
+        lock.unlock()
     }
 }
 
 struct ScriptHostError: Error { let message: String; init(_ message: String) { self.message = message } }
+
+/// A VM call may synchronously enter HTTP, where the bytecode interrupt cannot run.
+/// Keep that transport cancellable and retain the execution fence through its callback.
+final class ScriptRequestScope: @unchecked Sendable {
+    let deadline: Date
+    let search: Bool
+    private let condition = NSCondition()
+    private var stopped = false
+    private var next = 0
+    private var active: [Int: (() -> Void)?] = [:]
+    init(deadline: Date, search: Bool) { self.deadline = deadline; self.search = search }
+    var cancelled: Bool { condition.withLock { stopped } }
+    func begin() throws -> Int {
+        try condition.withLock {
+            guard !stopped, deadline.timeIntervalSinceNow > 0 else { throw CancellationError() }
+            guard !search || active.count < 4 else { throw ScriptHostError("The source has too many pending HTTP requests") }
+            defer { next += 1 }
+            active[next] = .some(nil)
+            return next
+        }
+    }
+    func attach(_ id: Int, cancel: @escaping () -> Void) {
+        let stop = condition.withLock {
+            guard active.keys.contains(id) else { return false }
+            active[id] = cancel
+            return stopped
+        }
+        if stop { cancel() }
+    }
+    func finish(_ id: Int) { condition.withLock { active.removeValue(forKey: id); condition.broadcast() } }
+    func cancel() {
+        let cancels = condition.withLock { stopped = true; return active.values.compactMap { $0 } }
+        cancels.forEach { $0() }
+    }
+    func cancelAndWait() {
+        cancel()
+        condition.lock()
+        while !active.isEmpty { condition.wait() }
+        condition.unlock()
+    }
+}
 
 /// The C callback behind `__host`; errors become JavaScript exceptions.
 private let scriptHost: TVScriptHost = { opaque, operation, argument in
@@ -430,24 +587,51 @@ enum ScriptHTTP {
         return state.lock.withLock { state.winner ?? state.last ?? (nil, nil, URLError(.unknown)) }
     }
 
-    static func perform(_ json: String) throws -> String {
+    static func perform(_ json: String, scope: ScriptRequestScope? = nil) throws -> String {
         let options = try JSONDecoder().decode([String: JSONValue].self, from: Data(json.utf8))
-        let (request, stopsRedirects) = try prepare(options)
+        let (prepared, stopsRedirects) = try prepare(options)
+        let request: URLRequest = {
+            var request = prepared
+            if let scope { request.timeoutInterval = min(request.timeoutInterval, max(0.05, scope.deadline.timeIntervalSinceNow)) }
+            return request
+        }()
         if let result = try localReply(request) { return try answer(result, request: request, options: options) }
-        let racers = min(4, max(1, options["racers"]?.int ?? 1))
+        let racers = scope?.search == true ? 1 : min(4, max(1, options["racers"]?.int ?? 1))
         let result: Reply
         if racers > 1 {
             let hedge = Double(options["hedge"]?.int ?? 0) / 1000
             result = race(racers: racers, hedge: hedge > 0 ? hedge : 2.5) { finish in
                 // Each try gets its own connection: a stalled HTTP/2 connection must not carry the next one.
                 let session = URLSession(configuration: .ephemeral, delegate: stopsRedirects ? Redirects() : nil, delegateQueue: nil)
-                session.dataTask(with: request) { data, response, error in finish((data, response, error)) }.resume()
-                return { session.invalidateAndCancel() }
+                let id: Int?
+                do { id = try scope?.begin() }
+                catch { finish((nil, nil, error)); return {} }
+                let transfer = Task {
+                    defer { if let id { scope?.finish(id) } }
+                    do {
+                        let value = try await BoundedHTTPData.load(request, session: session,
+                            maximumBytes: BoundedHTTPData.catalogBytes, followsRedirects: !stopsRedirects)
+                        finish((value.0, value.1, nil))
+                    } catch { finish((nil, nil, error)) }
+                }
+                if let id { scope?.attach(id, cancel: { transfer.cancel() }) }
+                return { transfer.cancel(); session.invalidateAndCancel() }
             }
         } else {
             let semaphore = DispatchSemaphore(value: 0)
             nonisolated(unsafe) var reply: Reply = (nil, nil, nil)
-            (stopsRedirects ? stopping : following).dataTask(with: request) { data, response, error in reply = (data, response, error); semaphore.signal() }.resume()
+            let id = try scope?.begin()
+            let transfer = Task {
+                do {
+                    let value = try await BoundedHTTPData.load(request, session: stopsRedirects ? stopping : following,
+                        maximumBytes: scope?.search == true ? BoundedHTTPData.searchBytes : BoundedHTTPData.catalogBytes,
+                        followsRedirects: !stopsRedirects)
+                    reply = (value.0, value.1, nil)
+                } catch { reply = (nil, nil, error) }
+                if let id { scope?.finish(id) }
+                semaphore.signal()
+            }
+            if let id { scope?.attach(id, cancel: { transfer.cancel() }) }
             semaphore.wait()
             result = reply
         }
@@ -456,17 +640,32 @@ enum ScriptHTTP {
 
     /// Starts a request without waiting for it (`httpStart`): `finish` gets the same answer `perform` returns.
     /// Returns how to cancel it.
-    static func start(_ json: String, finish: @escaping @Sendable (String) -> Void) throws -> () -> Void {
+    static func start(_ json: String, scope: ScriptRequestScope? = nil,
+                      finish: @escaping @Sendable (String) -> Void) throws -> () -> Void {
         let options = try JSONDecoder().decode([String: JSONValue].self, from: Data(json.utf8))
-        let (request, stopsRedirects) = try prepare(options)
+        let (prepared, stopsRedirects) = try prepare(options)
+        let request: URLRequest = {
+            var request = prepared
+            if let scope { request.timeoutInterval = min(request.timeoutInterval, max(0.05, scope.deadline.timeIntervalSinceNow)) }
+            return request
+        }()
         if let result = try localReply(request) {
             finish(try answer(result, request: request, options: options))
             return {}
         }
-        let task = (stopsRedirects ? stopping : following).dataTask(with: request) { data, response, error in
-            finish((try? answer((data, response, error), request: request, options: options)) ?? #"{"code":0,"content":"","failed":"Network request failed"}"#)
+        let id = try scope?.begin()
+        let task = Task {
+            let reply: Reply
+            do {
+                let value = try await BoundedHTTPData.load(request, session: stopsRedirects ? stopping : following,
+                    maximumBytes: scope?.search == true ? BoundedHTTPData.searchBytes : BoundedHTTPData.catalogBytes,
+                    followsRedirects: !stopsRedirects)
+                reply = (value.0, value.1, nil)
+            } catch { reply = (nil, nil, error) }
+            finish((try? answer(reply, request: request, options: options)) ?? #"{"code":0,"content":"","failed":"Network request failed"}"#)
+            if let id { scope?.finish(id) }
         }
-        task.resume()
+        if let id { scope?.attach(id, cancel: { task.cancel() }) }
         return { task.cancel() }
     }
 

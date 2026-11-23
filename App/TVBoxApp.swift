@@ -160,6 +160,10 @@ import TVCore
 
 #if os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    func applicationProtectedDataWillBecomeUnavailable(_ application: UIApplication) {
+        PlaybackSession.current?.pauseForDeviceLock()
+    }
+
     /// The player's rotate button narrows this to landscape (see PlayerOrientation).
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         MainActor.assumeIsolated { PlayerOrientation.mask }

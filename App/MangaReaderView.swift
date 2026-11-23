@@ -19,6 +19,7 @@ import TVCore
     /// Where to scroll or page to; the views clear it once there.
     var target: Position?
     private(set) var pageRequest: Position?
+    private(set) var requestedPosition: Position?
     private(set) var pageRequestID = UUID()
     private(set) var failure: String?
     private(set) var nextFailure: String?
@@ -30,14 +31,24 @@ import TVCore
     var rotation: ReaderPageRotation = .upright
     var mode: MangaReaderMode {
         didSet {
+            if mode.paged {
+                preferredPagedMode = mode
+                readerDefaults.set(mode.rawValue, forKey: "reader.pageDirection")
+            }
             if let catalog { catalog.setMode(mode) }
             else { MangaStore.shared.setMode(mode, for: comic) }
         }
     }
+    private(set) var columns: ReaderColumns
+    private var preferredPagedMode: MangaReaderMode = .leftToRight
+    private let readerDefaults: UserDefaults
+    /// Only a presented group advances the read-through page. A pending second image must
+    /// not mark a pair as read or replace the existing saved progress when the reader closes.
+    private var readThrough: Int?
     /// Page shapes (width / height) once known, so the column doesn't jump as pages load.
     var aspects: [Position: CGFloat] = [:]
     private let bitmaps = ReaderBitmapCache()
-    private var preparedBitmap: (key: ReaderBitmapKey, image: CGImage)?
+    private var preparedBitmaps: [ReaderBitmapKey: CGImage] = [:]
     private var decodeWidth: CGFloat = 0
     private var imagePrefetch: [ReaderBitmapKey: (id: UUID, task: Task<Void, Never>)] = [:]
     private var chapterPrefetch: (id: UUID, task: Task<Void, Never>)?
@@ -47,12 +58,17 @@ import TVCore
     private var requestID = UUID()
     private var chapterCrossesPages = false
 
-    init(_ reading: MangaReading, catalog: LocalReadingSession? = nil) {
+    init(_ reading: MangaReading, catalog: LocalReadingSession? = nil, preferences: UserDefaults = .standard) {
         self.catalog = catalog
+        readerDefaults = preferences
+        columns = ReaderColumns.load(from: preferences)
         comic = reading.comic
         chapters = reading.chapters
         position = Position(chapter: reading.chapter, page: reading.page)
         mode = catalog?.defaultMode ?? MangaStore.shared.mode(for: reading.comic)
+        let savedDirection = preferences.string(forKey: "reader.pageDirection").flatMap(MangaReaderMode.init(rawValue:))
+        if mode.paged { preferredPagedMode = mode }
+        else if let savedDirection, savedDirection.paged { preferredPagedMode = savedDirection }
     }
 
     var single: Bool { chapters.isEmpty }
@@ -61,10 +77,48 @@ import TVCore
     func title(_ chapter: Int) -> String { chapters.indices.contains(chapter) ? chapters[chapter].title : "" }
     var hasNext: Bool { position.chapter + 1 < chapters.count }
     var hasPrevious: Bool { position.chapter > 0 }
+    var pageLayout: ReaderPageLayout { ReaderPageLayout(pageCount: currentPages.count, columns: columns) }
+    var pagedDirection: MangaReaderMode { preferredPagedMode }
+
+    func changePresentation(paged: Bool) { changeMode(paged ? preferredPagedMode : .vertical) }
+
+    func changeDirection(_ value: MangaReaderMode) {
+        guard value.paged else { return }
+        preferredPagedMode = value
+        readerDefaults.set(value.rawValue, forKey: "reader.pageDirection")
+        if mode.paged { changeMode(value) }
+    }
+
+    func changeMode(_ value: MangaReaderMode) {
+        guard value != mode else { return }
+        let isInitialLoad = loaded.isEmpty && opening
+        if !isInitialLoad { cancelOpening() }
+        chapterPrefetch?.task.cancel(); chapterPrefetch = nil
+        mode = value
+        pageRequest = nil
+        requestedPosition = nil
+        if !isInitialLoad { target = position }
+        prefetch()
+    }
+
+    func changeColumns(_ value: ReaderColumns) {
+        guard value != columns else { return }
+        let isInitialLoad = loaded.isEmpty && opening
+        if !isInitialLoad { cancelOpening() }
+        columns = value
+        value.save(to: readerDefaults)
+        pageRequest = nil
+        requestedPosition = nil
+        // Retain the exact page anchor. Both layouts display its containing row/spread.
+        if !isInitialLoad { target = position }
+        prefetch()
+    }
 
     /// Opens `chapter` alone, at `page` (negative counts from the end).
     func open(_ chapter: Int, page: Int = 0) async {
-        await open(ReaderPageIntent(chapter: chapter, page: page, fromEnd: page < 0), crossingPages: false)
+        let stride = columns.rawValue
+        let requested = page < 0 ? page * stride : page
+        await open(ReaderPageIntent(chapter: chapter, page: requested, fromEnd: page < 0, pageStride: stride), crossingPages: false)
     }
 
     /// Page gestures carry overflow across even a one-page chapter instead of clamping away
@@ -79,6 +133,7 @@ import TVCore
         chapterRequest = intent
         target = nil
         pageRequest = nil
+        requestedPosition = nil
         chapterCrossesPages = true
         chapterFailure = nil
         nextFailure = nil
@@ -101,7 +156,33 @@ import TVCore
         cancelOpening()
         target = nil
         pageRequest = position
+        requestedPosition = position
         pageRequestID = UUID()
+    }
+
+    func requesting(_ position: Position) {
+        // A direct swipe can overtake a queued footer/slider delivery in the same frame.
+        pageRequest = nil
+        target = nil
+        requestedPosition = position
+    }
+
+    /// Buttons and swipes advance the same logical target, even before a slow image commits.
+    func pageTurnIntent(_ step: Int) -> ReaderPageIntent {
+        if let pending = chapterRequest { return pending.stepped(step).normalizedBoundary() }
+        let anchor = requestedPosition ?? position
+        let start = pageLayout.pages(containing: anchor.page).lowerBound
+        return ReaderPageIntent(chapter: anchor.chapter, page: start, pageStride: columns.rawValue).stepped(step)
+    }
+
+    func canTurnPage(_ step: Int) -> Bool {
+        guard !currentPages.isEmpty else { return false }
+        let intent = pageTurnIntent(step)
+        guard intent.chapter == position.chapter else { return chapters.indices.contains(intent.chapter) }
+        switch intent.resolve(pageCount: currentPages.count) {
+        case .page: return true
+        case .chapter(let destination): return chapters.indices.contains(destination.chapter)
+        }
     }
 
     func consumePageRequest(_ id: UUID) -> Position? {
@@ -115,6 +196,7 @@ import TVCore
         chapterRequest = intent
         target = nil
         pageRequest = nil
+        requestedPosition = nil
         chapterCrossesPages = crossingPages
         chapterFailure = nil
         chapterPrefetch?.task.cancel(); chapterPrefetch = nil
@@ -137,7 +219,11 @@ import TVCore
                     destination = next
                     continue
                 }
-                start = destination.clampedPage(pageCount: pages.count)
+                // Explicit history/slider anchors retain their exact page inside a spread;
+                // turns and end-relative requests navigate by complete spread boundaries.
+                if !crossingPages, !destination.fromEnd {
+                    start = min(max(0, destination.page), max(0, pages.count - 1))
+                } else { start = destination.clampedPage(pageCount: pages.count) }
                 break
             }
             let chapter = destination.chapter
@@ -145,15 +231,20 @@ import TVCore
             guard request == requestID else { return }
             // Keep the existing chapter and progress on screen until its replacement can be
             // presented. A chapter's URL list resolving does not mean its first image is ready.
+            var prepared: [ReaderBitmapKey: CGImage] = [:]
             if decodeWidth > 0, !loaded.isEmpty, pages.indices.contains(start) {
                 let width = decodeWidth
-                let image = try await bitmap(chapter: chapter, page: start, url: pages[start], pixelWidth: width)
+                let visible = ReaderPageLayout(pageCount: pages.count, columns: columns).pages(containing: start)
+                let keys = visible.map { bitmapKey(chapter: chapter, page: $0, url: pages[$0], pixelWidth: width) }
+                let images = try await bitmapSpread(keys)
                 try Task.checkCancellation()
                 guard request == requestID, !closed else { return }
-                preparedBitmap = (bitmapKey(chapter: chapter, page: start, url: pages[start], pixelWidth: width), image)
+                prepared = Dictionary(uniqueKeysWithValues: zip(keys, images))
             }
+            preparedBitmaps = prepared
             loaded = [Chapter(index: chapter, pages: pages)]
             position = Position(chapter: chapter, page: start)
+            readThrough = prepared.keys.map(\.page).max() ?? start
             target = position
             chapterRequest = nil
             chapterFailure = nil
@@ -213,9 +304,26 @@ import TVCore
     }
 
     func cachedBitmap(_ key: ReaderBitmapKey) -> CGImage? {
-        if let preparedBitmap, preparedBitmap.key.chapter == key.chapter,
-           preparedBitmap.key.page == key.page, preparedBitmap.key.url == key.url { return preparedBitmap.image }
+        if let prepared = preparedBitmaps.first(where: { $0.key.chapter == key.chapter && $0.key.page == key.page && $0.key.url == key.url }) {
+            return prepared.value
+        }
         return bitmaps.cached(key)
+    }
+
+    func cachedSpread(_ keys: [ReaderBitmapKey]) -> [CGImage]? {
+        let images = keys.compactMap { cachedBitmap($0) }
+        return !keys.isEmpty && images.count == keys.count ? images : nil
+    }
+
+    /// A spread is at most two pages. Keep the old presentation until every image succeeds;
+    /// each page still goes through its original chapter-specific headers and unscrambler.
+    func bitmapSpread(_ keys: [ReaderBitmapKey]) async throws -> [CGImage] {
+        var images: [CGImage] = []
+        for key in keys {
+            try Task.checkCancellation()
+            images.append(try await bitmap(chapter: key.chapter, page: key.page, url: key.url, pixelWidth: CGFloat(key.pixelWidth)))
+        }
+        return images
     }
 
     func bitmap(chapter: Int, page: Int, url: String, pixelWidth: CGFloat) async throws -> CGImage {
@@ -234,9 +342,15 @@ import TVCore
     }
 
     func seen(_ position: Position) {
-        guard !closed, position != self.position, pages(position.chapter).indices.contains(position.page) else { return }
-        preparedBitmap = nil
+        guard !closed, pages(position.chapter).indices.contains(position.page) else { return }
+        let layout = ReaderPageLayout(pageCount: pages(position.chapter).count, columns: columns)
+        let last = layout.pages(containing: position.page).upperBound - 1
+        if let requestedPosition, requestedPosition.chapter == position.chapter,
+           layout.pages(containing: requestedPosition.page).contains(position.page) { self.requestedPosition = nil }
+        guard position != self.position || readThrough != last else { return }
+        preparedBitmaps.removeAll()
         self.position = position
+        readThrough = last
         save(force: false)
         prefetch()
     }
@@ -245,7 +359,7 @@ import TVCore
     func prefetch() {
         guard !closed else { return }
         let pages = currentPages, chapter = position.chapter
-        let indices = [position.page + 1, position.page - 1, position.page + 2]
+        let indices = pageLayout.prefetchPages(containing: position.page)
         let nearby = decodeWidth > 0 ? indices.compactMap { index -> ReaderBitmapKey? in
             guard pages.indices.contains(index) else { return nil }
             return bitmapKey(chapter: chapter, page: index, url: pages[index], pixelWidth: decodeWidth)
@@ -274,24 +388,24 @@ import TVCore
         guard force || Date().timeIntervalSince(saved) > 1.5 else { return }
         saved = Date()
         if let catalog {
-            catalog.record(chapter: position.chapter, page: position.page, totalPages: currentPages.count)
+            catalog.record(chapter: position.chapter, page: readThrough ?? position.page, totalPages: currentPages.count)
             return
         }
         MangaStore.shared.record(MangaLibrary.Progress(comic: comic, chapterID: chapters.indices.contains(position.chapter) ? chapters[position.chapter].id : nil,
                                                        chapterTitle: title(position.chapter), chapterIndex: position.chapter,
-                                                       chapterCount: chapters.count, page: position.page, pageCount: currentPages.count))
+                                                       chapterCount: chapters.count, page: readThrough ?? position.page, pageCount: currentPages.count))
     }
 
     func chapterID(_ chapter: Int) -> String? { chapters.indices.contains(chapter) ? chapters[chapter].id : nil }
     func close() {
         closed = true
         requestID = UUID(); opening = false; loadingNext = false
-        chapterRequest = nil; chapterFailure = nil; pageRequest = nil
+        chapterRequest = nil; chapterFailure = nil; pageRequest = nil; requestedPosition = nil
         for request in imagePrefetch.values { request.task.cancel() }
         imagePrefetch.removeAll()
         chapterPrefetch?.task.cancel(); chapterPrefetch = nil
         bitmaps.close()
-        preparedBitmap = nil
+        preparedBitmaps.removeAll()
         catalog?.close()
     }
 }
@@ -350,8 +464,8 @@ struct MangaReaderView: View {
             #if os(iOS)
             .statusBarHidden(!chrome)
             .persistentSystemOverlays(chrome ? .automatic : .hidden)
-            .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
-            .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+            // Static pages follow the user's system Auto-Lock setting. The
+            // reader never takes or releases another media owner's idle timer.
             #endif
             #if os(macOS)
             .toolbar(.hidden, for: .windowToolbar)
@@ -382,7 +496,7 @@ struct MangaReaderView: View {
 
     @ViewBuilder private var pages: some View {
         switch model.mode {
-        case .vertical: MangaVerticalReader(model: model)
+        case .vertical: MangaVerticalReader(model: model).id(model.columns)
         case .leftToRight, .rightToLeft: MangaPagedReader(model: model)
         }
     }
@@ -518,11 +632,20 @@ struct MangaVerticalReader: View {
     @State private var pinch: CGFloat = 1
     @State private var rotationAnchor: MangaReaderModel.Position?
     @State private var rotationRelease: Task<Void, Never>?
+    @State private var scrollAnchor = ReaderVerticalAnchor<MangaReaderModel.Position>()
     #if os(iOS)
     @State private var zoomer = MangaZoomController()
     #endif
     @Environment(\.displayScale) private var scale
     @Environment(\.mangaToggleChrome) private var toggleChrome
+
+    private func rowPosition(_ position: MangaReaderModel.Position) -> MangaReaderModel.Position {
+        .init(chapter: position.chapter, page: position.page / model.columns.rawValue * model.columns.rawValue)
+    }
+
+    private func pageWidth(_ size: CGSize) -> CGFloat {
+        max(1, (size.width - (model.columns == .double ? 8 : 0)) / CGFloat(model.columns.rawValue))
+    }
 
     var body: some View {
         WithPerceptionTracking {
@@ -569,42 +692,84 @@ struct MangaVerticalReader: View {
                 ScrollView(axes, showsIndicators: false) {
                     WithPerceptionTracking {
                         chapterColumn(size, top: top).frame(width: width)
+                            .background {
+                                GeometryReader { proxy in
+                                    Color.clear.preference(key: ReaderPageFrames.self,
+                                        value: .init(contentTop: proxy.frame(in: .named("reader.vertical.viewport")).minY))
+                                }
+                            }
                     }
                 }
                 .coordinateSpace(name: "reader.vertical.viewport")
-                .onPreferenceChange(ReaderPageFrames.self) { frames in
-                    guard rotationAnchor == nil,
-                          let position = ReaderVerticalViewport.visiblePage(frames: frames, height: size.height, current: model.position) else { return }
-                    model.seen(position)
+                .onPreferenceChange(ReaderPageFrames.self) { metrics in
+                    guard !model.opening else { return }
+                    let frames = metrics.pages
+                    #if os(iOS)
+                    if let top = metrics.contentTop {
+                        let offset = -top
+                        let correction = scrollAnchor.correction(frames: frames, scrollOffset: offset)
+                        if abs(correction) > 1, let anchor = scrollAnchor.anchoredPage, let frame = frames[anchor] {
+                            zoomer.adjustReadingOffset(by: correction)
+                            scrollAnchor.remember(page: anchor, frame: frame, scrollOffset: offset)
+                            return
+                        }
+                    }
+                    #endif
+                    if let anchor = rotationAnchor {
+                        #if os(iOS)
+                        if let frame = frames[anchor], let top = metrics.contentTop {
+                            scrollAnchor.remember(page: anchor, frame: frame, scrollOffset: -top)
+                        }
+                        #endif
+                        return
+                    }
+                    let current = rowPosition(model.position)
+                    guard let position = ReaderVerticalViewport.visiblePage(frames: frames, height: size.height, current: current) else { return }
+                    // Changing column count keeps an exact odd/even page inside its row.
+                    model.seen(position == current ? model.position : position)
+                    #if os(iOS)
+                    if let frame = frames[position], let top = metrics.contentTop {
+                        scrollAnchor.remember(page: position, frame: frame, scrollOffset: -top)
+                    }
+                    #endif
                 }
                 .appOnChange(of: model.target) { _, target in
                     guard let target, model.target == target, model.chapterRequest == nil else { return }
-                    reader.scrollTo(target, anchor: .top)
+                    restore(target, using: reader)
                     model.target = nil
                 }
                 .appOnChange(of: model.pageRequestID) { _, requestID in
                     guard let target = model.consumePageRequest(requestID) else { return }
-                    reader.scrollTo(target, anchor: .top)
+                    restore(target, using: reader)
                 }
                 .appOnChange(of: model.rotation) { _, _ in
-                    let anchor = model.position
-                    rotationAnchor = anchor
-                    rotationRelease?.cancel()
                     zoom = 1; pinch = 1
-                    reader.scrollTo(anchor, anchor: .top)
-                    rotationRelease = Task { @MainActor in
-                        await Task.yield()
-                        guard !Task.isCancelled else { return }
-                        reader.scrollTo(anchor, anchor: .top)
-                        try? await Task.sleep(for: .milliseconds(150))
-                        if !Task.isCancelled { rotationAnchor = nil }
-                    }
+                    restore(model.position, using: reader)
                 }
-                .task(id: Int(size.width * scale)) { model.setDecodeWidth(min(size.width * scale * 1.5, 2400)) }
+                .task(id: Int(pageWidth(size) * scale)) { model.setDecodeWidth(min(pageWidth(size) * scale * 1.5, 2400)) }
                 .onAppear {
-                    if let target = model.target { reader.scrollTo(target, anchor: .top); model.target = nil }
+                    restore(model.target ?? model.position, using: reader)
+                    model.target = nil
                 }
                 .onDisappear { rotationRelease?.cancel() }
+            }
+        }
+    }
+
+    private func restore(_ position: MangaReaderModel.Position, using reader: ScrollViewProxy) {
+        let anchor = rowPosition(position)
+        rotationAnchor = anchor
+        scrollAnchor = ReaderVerticalAnchor()
+        rotationRelease?.cancel()
+        reader.scrollTo(anchor, anchor: .top)
+        rotationRelease = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            reader.scrollTo(anchor, anchor: .top)
+            try? await Task.sleep(for: .milliseconds(150))
+            if !Task.isCancelled {
+                rotationAnchor = nil
+                if scrollAnchor.anchoredPage == anchor { model.seen(position) }
             }
         }
     }
@@ -627,16 +792,27 @@ struct MangaVerticalReader: View {
     }
 
     private func chapterPages(_ chapter: MangaReaderModel.Chapter, size: CGSize) -> some View {
-        Group {
-            ForEach(Array(chapter.pages.enumerated()), id: \.offset) { index, url in
+        let layout = ReaderPageLayout(pageCount: chapter.pages.count, columns: model.columns)
+        return Group {
+            ForEach(layout.starts, id: \.self) { start in
                 WithPerceptionTracking {
-                    MangaPageImage(model: model, chapter: chapter.index, index: index, url: url,
-                                   pixelWidth: min(size.width * scale * 1.5, 2400))
-                        .id(MangaReaderModel.Position(chapter: chapter.index, page: index))
+                    HStack(alignment: .top, spacing: model.columns == .double ? 8 : 0) {
+                        ForEach(Array(layout.pages(containing: start)), id: \.self) { index in
+                            WithPerceptionTracking {
+                                MangaPageImage(model: model, chapter: chapter.index, index: index, url: chapter.pages[index],
+                                               pixelWidth: min(pageWidth(size) * scale * 1.5, 2400))
+                                    .frame(width: pageWidth(size))
+                            }
+                        }
+                        if model.columns == .double, layout.pages(containing: start).count == 1 { Spacer(minLength: 0) }
+                    }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.bottom, model.columns == .double ? 8 : 0)
+                        .id(MangaReaderModel.Position(chapter: chapter.index, page: start))
                         .background {
                             GeometryReader { proxy in
                                 Color.clear.preference(key: ReaderPageFrames.self,
-                                    value: [.init(chapter: chapter.index, page: index): proxy.frame(in: .named("reader.vertical.viewport"))])
+                                    value: .init(pages: [.init(chapter: chapter.index, page: start): proxy.frame(in: .named("reader.vertical.viewport"))]))
                             }
                         }
                         #if os(tvOS)
@@ -650,9 +826,15 @@ struct MangaVerticalReader: View {
 }
 
 private struct ReaderPageFrames: PreferenceKey {
-    static let defaultValue: [MangaReaderModel.Position: CGRect] = [:]
-    static func reduce(value: inout [MangaReaderModel.Position: CGRect], nextValue: () -> [MangaReaderModel.Position: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    struct Value: Equatable {
+        var pages: [MangaReaderModel.Position: CGRect] = [:]
+        var contentTop: CGFloat?
+    }
+    static let defaultValue = Value()
+    static func reduce(value: inout Value, nextValue: () -> Value) {
+        let next = nextValue()
+        value.pages.merge(next.pages, uniquingKeysWith: { _, new in new })
+        if let top = next.contentTop { value.contentTop = top }
     }
 }
 
@@ -702,7 +884,7 @@ struct MangaPagedReader: View {
         WithPerceptionTracking {
             GeometryReader { proxy in
                 WithPerceptionTracking {
-                    let pixelWidth = min(max(proxy.size.width, proxy.size.height) * scale, 3000)
+                    let pixelWidth = min(proxy.size.width / CGFloat(model.columns.rawValue) * scale * 1.5, 3000)
                     Group {
                         #if os(iOS)
                         MangaAtomicPagedReader(model: model, pixelWidth: pixelWidth)
@@ -815,70 +997,65 @@ private struct MangaPagedEnd: View {
 }
 
 #if os(iOS)
-/// One persistent presentation owns the currently visible bitmap. Navigation requests may
-/// overtake each other, but only the latest completed image advances the visible page/history.
+/// One persistent presentation owns the currently visible spread. Navigation requests may
+/// overtake each other, but only a complete latest spread advances the visible page/history.
 private struct MangaAtomicPagedReader: View {
     let model: MangaReaderModel
     let pixelWidth: CGFloat
     @Environment(\.mangaToggleChrome) private var toggleChrome
-    @State private var handoff = ReaderPageHandoff<ReaderBitmapKey, CGImage>()
+    @State private var handoff = ReaderPageHandoff<[ReaderBitmapKey], [CGImage]>()
     @State private var loading: Task<Void, Never>?
     @State private var showingEnd = false
 
     private var rtl: Bool { model.mode == .rightToLeft }
-    private var visibleKey: ReaderBitmapKey {
-        let index = model.position.page
-        let url = model.currentPages.indices.contains(index) ? model.currentPages[index] : ""
-        return model.bitmapKey(chapter: model.position.chapter, page: index, url: url, pixelWidth: pixelWidth)
+    private var visibleKeys: [ReaderBitmapKey] { keys(containing: model.position.page) }
+
+    private func keys(containing page: Int) -> [ReaderBitmapKey] {
+        model.pageLayout.pages(containing: page).map { index in
+            model.bitmapKey(chapter: model.position.chapter, page: index, url: model.currentPages[index], pixelWidth: pixelWidth)
+        }
     }
-    private var visibleImage: CGImage? {
+    private var visibleImages: [CGImage] {
         // A chapter jump predecodes the replacement before changing position. Show that exact
-        // bitmap immediately, so its already-committed title/page cannot accompany the old chapter.
-        if let image = model.cachedBitmap(visibleKey) { return image }
-        return handoff.displayed?.value
+        // spread immediately, so its already-committed title/page cannot accompany the old chapter.
+        model.cachedSpread(visibleKeys) ?? handoff.displayed?.value ?? []
     }
     private var requestedPage: Int {
-        guard let request = handoff.requested, request.page.chapter == model.position.chapter else { return model.position.page }
-        return request.page.page
+        // Bitmap keys describe a whole spread, whose first page may differ from an exact
+        // history/slider anchor. Resampling and retry must retain the shared logical intent.
+        guard let requested = model.requestedPosition, requested.chapter == model.position.chapter else { return model.position.page }
+        return requested.page
     }
 
     var body: some View {
         WithPerceptionTracking {
-            ZStack {
-                if showingEnd {
-                    MangaPagedEnd(model: model)
-                        .contentShape(Rectangle())
-                        .onTapGesture(coordinateSpace: CoordinateSpace.local) { _ in showingEnd = false }
-                        .gesture(DragGesture(minimumDistance: 35).onEnded { _ in showingEnd = false })
-                } else {
-                    MangaZoomablePage(pageID: "\(visibleKey.chapter)#\(visibleKey.page)#\(visibleKey.url)", rotation: model.rotation,
-                                      tapped: tapped, swiped: { physicalStep in turn(rtl ? -physicalStep : physicalStep) }) {
-                        WithPerceptionTracking {
-                            ZStack {
-                                Color.black
-                                if let image = visibleImage { ReaderBitmapImage(image: image, rotation: model.rotation, fitsScreen: true) }
-                            }
-                        }
-                    }
+            observedContent
+                .accessibilityAction(named: "上一页") { turn(-1) }
+                .accessibilityAction(named: "下一页") { turn(1) }
+                .accessibilityAction(named: "显示阅读控制") { toggleChrome?() }
+                .onDisappear {
+                    if model.chapterRequest == nil { loading?.cancel() }
+                    handoff.cancel()
                 }
-                if model.chapterRequest == nil, handoff.isLoading || handoff.failure != nil {
-                    VStack(spacing: 10) {
-                        if let failure = handoff.failure {
-                            Text("第 \(requestedPage + 1) 页加载失败").font(.callout.weight(.semibold))
-                            Text(failure).font(.caption).multilineTextAlignment(.center).lineLimit(3)
-                            Button(L10n.text("Try Again")) { requestPage(requestedPage) }.controlButton()
-                        } else {
-                            ProgressView().tint(.white)
-                            Text("正在加载第 \(requestedPage + 1) 页…").font(.callout)
-                        }
-                    }
-                    .foregroundStyle(.white).padding(18)
-                    .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 16))
-                    .padding(24)
-                    .allowsHitTesting(handoff.failure != nil)
-                }
+        }
+    }
+
+    private var observedContent: some View {
+        positionedContent
+            .appOnChange(of: model.chapterRequest) { _, request in
+                if request != nil, request == model.chapterRequest { handoff.cancel() }
             }
-            .background(Color.black)
+            .appOnChange(of: pixelWidth) { _, width in
+                model.setDecodeWidth(width)
+                if model.chapterRequest == nil { requestPage(requestedPage) }
+            }
+            .appOnChange(of: model.columns) { _, _ in
+                if model.chapterRequest == nil { requestPage(requestedPage) }
+            }
+    }
+
+    private var positionedContent: some View {
+        pageContent
             .onAppear {
                 model.setDecodeWidth(pixelWidth)
                 if model.chapterRequest == nil {
@@ -896,18 +1073,61 @@ private struct MangaAtomicPagedReader: View {
                 guard let target = model.consumePageRequest(requestID) else { return }
                 requestPage(target.page)
             }
-            .appOnChange(of: model.chapterRequest) { _, request in
-                if request != nil, request == model.chapterRequest { handoff.cancel() }
+    }
+
+    private var pageContent: some View {
+        ZStack {
+            if showingEnd {
+                MangaPagedEnd(model: model)
+                    .contentShape(Rectangle())
+                    .onTapGesture { showingEnd = false }
+                    .gesture(DragGesture(minimumDistance: 35).onEnded { _ in showingEnd = false })
+            } else {
+                MangaZoomablePage(pageID: visibleKeys.map { "\($0.chapter)#\($0.page)#\($0.url)" }.joined(separator: "|"), rotation: model.rotation,
+                                  tapped: tapped, swiped: { physicalStep in turn(rtl ? -physicalStep : physicalStep) }) {
+                    WithPerceptionTracking { spreadContent }
+                }
             }
-            .appOnChange(of: pixelWidth) { _, width in
-                model.setDecodeWidth(width)
-                if model.chapterRequest == nil { requestPage(requestedPage) }
-            }
-            .onDisappear {
-                if model.chapterRequest == nil { loading?.cancel() }
-                handoff.cancel()
+            if model.chapterRequest == nil, handoff.isLoading || handoff.failure != nil { loadingStatus }
+        }
+        .background(Color.black)
+    }
+
+    private var spreadContent: some View {
+        let images = visibleImages
+        return ZStack {
+            Color.black
+            HStack(spacing: images.count > 1 ? 8 : 0) {
+                ForEach(Array(images.indices), id: \.self) { index in
+                    WithPerceptionTracking {
+                        ReaderBitmapImage(image: images[rtl ? images.count - 1 - index : index], rotation: model.rotation, fitsScreen: true)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
             }
         }
+    }
+
+    private var loadingStatus: some View {
+        VStack(spacing: 10) {
+            if let failure = handoff.failure {
+                Text("第 \(requestedRange) 页加载失败").font(.callout.weight(.semibold))
+                Text(failure).font(.caption).multilineTextAlignment(.center).lineLimit(3)
+                Button(L10n.text("Try Again")) { requestPage(requestedPage) }.controlButton()
+            } else {
+                ProgressView().tint(.white)
+                Text("正在加载第 \(requestedRange) 页…").font(.callout)
+            }
+        }
+        .foregroundStyle(.white).padding(18)
+        .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 16))
+        .padding(24)
+        .allowsHitTesting(handoff.failure != nil)
+    }
+
+    private var requestedRange: String {
+        let range = model.pageLayout.pages(containing: requestedPage)
+        return range.count > 1 ? "\(range.lowerBound + 1)–\(range.upperBound)" : "\(range.lowerBound + 1)"
     }
 
     private func requestPage(_ index: Int) {
@@ -915,19 +1135,22 @@ private struct MangaAtomicPagedReader: View {
         showingEnd = false
         loading?.cancel()
         model.cancelOpening()
-        let chapter = model.position.chapter, url = model.currentPages[index]
-        let key = model.bitmapKey(chapter: chapter, page: index, url: url, pixelWidth: pixelWidth)
-        let request = handoff.begin(key)
-        if let image = model.cachedBitmap(key) {
-            handoff.finish(request, value: image)
+        let chapter = model.position.chapter
+        model.requesting(.init(chapter: chapter, page: index))
+        let columns = model.columns
+        let keys = keys(containing: index)
+        let request = handoff.begin(keys)
+        if let images = model.cachedSpread(keys) {
+            handoff.finish(request, value: images)
             model.seen(.init(chapter: chapter, page: index))
             return
         }
         loading = Task {
             do {
-                let image = try await model.bitmap(chapter: chapter, page: index, url: url, pixelWidth: pixelWidth)
+                let images = try await model.bitmapSpread(keys)
                 try Task.checkCancellation()
-                guard model.chapterRequest == nil, chapter == model.position.chapter, handoff.finish(request, value: image) else { return }
+                guard model.chapterRequest == nil, model.mode.paged, model.columns == columns,
+                      chapter == model.position.chapter, handoff.finish(request, value: images) else { return }
                 model.seen(.init(chapter: chapter, page: index))
             } catch is CancellationError {
             } catch {
@@ -937,13 +1160,7 @@ private struct MangaAtomicPagedReader: View {
     }
 
     private func turn(_ step: Int) {
-        if let pending = model.chapterRequest {
-            // A forward chapter starts at page zero; stepping back crosses into the preceding
-            // chapter's last page. End-relative previous requests cross forward at offset zero.
-            navigate(pending.stepped(step).normalizedBoundary())
-            return
-        }
-        navigate(ReaderPageIntent(chapter: model.position.chapter, page: requestedPage + step))
+        navigate(model.pageTurnIntent(step))
     }
 
     private func navigate(_ intent: ReaderPageIntent) {
@@ -1105,6 +1322,7 @@ final class MangaPageScrollView: UIScrollView {
 /// Lets SwiftUI taps reach the vertical reader's zoom.
 @MainActor final class MangaZoomController {
     fileprivate weak var view: MangaZoomView?
+    func adjustReadingOffset(by delta: CGFloat) { view?.adjustReadingOffset(by: delta) }
     /// Double tap: zooms in around `point` (in the column's own, unzoomed space), or back out.
     func toggle(at point: CGPoint) {
         guard let view else { return }
@@ -1161,6 +1379,13 @@ final class MangaZoomView: UIView, UIGestureRecognizerDelegate {
     private let pinch = UIPinchGestureRecognizer()
     private let pan = UIPanGestureRecognizer()
     private weak var foundScroll: UIScrollView?
+
+    func adjustReadingOffset(by delta: CGFloat) {
+        guard let scroll, delta.isFinite else { return }
+        let top = -scroll.adjustedContentInset.top
+        let bottom = max(top, scroll.contentSize.height + scroll.adjustedContentInset.bottom - scroll.bounds.height)
+        scroll.contentOffset.y = min(bottom, max(top, scroll.contentOffset.y + delta))
+    }
     var rotation: ReaderPageRotation = .upright {
         didSet {
             guard rotation != oldValue else { return }
@@ -1327,6 +1552,7 @@ private struct MangaReaderChrome: View {
             }
             .opacity(visible ? 1 : 0)
             .allowsHitTesting(visible)
+            .accessibilityHidden(!visible)
             .animation(.appSmooth(duration: 0.2), value: visible)
             #if os(macOS)
             .ignoresSafeArea(.container, edges: .top)
@@ -1336,6 +1562,30 @@ private struct MangaReaderChrome: View {
     }
 
     private var top: some View {
+        VStack(spacing: 8) {
+            topActions
+            #if !os(tvOS)
+            HStack(spacing: 12) {
+                Picker("阅读方式", selection: Binding(get: { model.mode.paged }, set: { model.changePresentation(paged: $0) })) {
+                    Text("滑动").tag(false)
+                    Text("翻页").tag(true)
+                }
+                .accessibilityIdentifier("reader.presentation")
+                Picker("阅读列数", selection: Binding(get: { model.columns }, set: { model.changeColumns($0) })) {
+                    ForEach(ReaderColumns.allCases) { columns in Text(columns.title).tag(columns) }
+                }
+                .accessibilityIdentifier("reader.columns")
+            }
+            .pickerStyle(.segmented)
+            .frame(minHeight: 44)
+            .frame(maxWidth: 440)
+            .padding(.horizontal, 16).padding(.bottom, 8)
+            #endif
+        }
+        .background(LinearGradient(colors: [.black.opacity(0.75), .clear], startPoint: .top, endPoint: .bottom).ignoresSafeArea())
+    }
+
+    private var topActions: some View {
         HStack(spacing: 14) {
             #if !os(tvOS)
             Button(action: close) { Image(systemName: "xmark").font(.headline).frame(width: 36, height: 36).iosTouchTarget() }
@@ -1370,17 +1620,15 @@ private struct MangaReaderChrome: View {
             }
             Menu {
                 WithPerceptionTracking {
-                    Picker(L10n.text("Reading Mode"), selection: Binding(get: { model.mode }, set: { mode in
-                        let position = model.position
-                        model.mode = mode
-                        model.target = position
-                    })) {
-                        ForEach(MangaReaderMode.allCases) { perceptionArgument0 in WithPerceptionTracking { Label(perceptionArgument0.title, systemImage: perceptionArgument0.symbol).tag(perceptionArgument0) } }
+                    Picker("翻页方向", selection: Binding(get: { model.pagedDirection }, set: { model.changeDirection($0) })) {
+                        ForEach([MangaReaderMode.leftToRight, .rightToLeft]) { direction in
+                            Label(direction.title, systemImage: direction.symbol).tag(direction)
+                        }
                     }
                 }
-            } label: { WithPerceptionTracking { Image(systemName: model.mode.symbol).font(.headline).frame(width: 36, height: 36).iosTouchTarget() } }
+            } label: { WithPerceptionTracking { Image(systemName: model.pagedDirection.symbol).font(.headline).frame(width: 36, height: 36).iosTouchTarget() } }
             .menuStyle(.button).buttonStyle(.plain).glassSurface(MangaReaderChrome.glass, in: Circle())
-            .accessibilityLabel(L10n.text("Reading Mode"))
+            .accessibilityLabel("翻页方向")
             if !model.single {
                 Button { showsChapters = true } label: { Image(systemName: "list.bullet").font(.headline).frame(width: 36, height: 36).iosTouchTarget() }
                     .buttonStyle(.plain).glassSurface(MangaReaderChrome.glass, in: Circle())
@@ -1395,7 +1643,6 @@ private struct MangaReaderChrome: View {
         #else
         .padding(.horizontal, 16).padding(.vertical, 10)
         #endif
-        .background(LinearGradient(colors: [.black.opacity(0.75), .clear], startPoint: .top, endPoint: .bottom).ignoresSafeArea())
     }
 
     #if os(tvOS)
@@ -1427,31 +1674,61 @@ private struct MangaReaderChrome: View {
     #else
     private var bottom: some View {
         let count = model.currentPages.count
-        return HStack(spacing: 12) {
+        let range = model.pageLayout.pages(containing: model.position.page)
+        return VStack(spacing: 4) {
+            HStack {
+                Button { turn(-1) } label: { Label("上一页", systemImage: "chevron.left").frame(minHeight: 44) }
+                    .disabled(!model.canTurnPage(-1))
+                Spacer()
+                Text(range.count > 1 ? "\(range.lowerBound + 1)–\(range.upperBound) / \(max(count, 1))" : "\(range.lowerBound + 1) / \(max(count, 1))")
+                    .font(.callout.monospacedDigit())
+                Spacer()
+                Button { turn(1) } label: { Label("下一页", systemImage: "chevron.right").frame(minHeight: 44) }
+                    .disabled(!model.canTurnPage(1))
+            }
+            .font(.callout).buttonStyle(.plain)
+            HStack(spacing: 12) {
             #if !os(tvOS)
             Button { Task { await model.open(model.position.chapter - 1) } } label: { Image(systemName: "backward.end.fill").frame(width: 32, height: 32).iosTouchTarget() }
                 .buttonStyle(.plain).disabled(!model.hasPrevious).opacity(model.hasPrevious ? 1 : 0.35)
                 .accessibilityLabel(L10n.text("Previous Chapter"))
             if count > 1 {
-                Slider(value: Binding(get: { Double(min(model.position.page, count - 1)) },
-                                      set: { value in model.requestPage(.init(chapter: model.position.chapter, page: Int(value.rounded()))) }),
-                       in: 0...Double(count - 1), step: 1)
+                let groups = (count - 1) / model.columns.rawValue
+                if groups > 0 {
+                    Slider(value: Binding(get: { Double(range.lowerBound / model.columns.rawValue) },
+                                          set: { value in model.requestPage(.init(chapter: model.position.chapter, page: Int(value.rounded()) * model.columns.rawValue)) }),
+                           in: 0...Double(groups), step: 1)
                     .tint(.white)
                     .environment(\.layoutDirection, model.mode == .rightToLeft ? .rightToLeft : .leftToRight)
+                    .accessibilityLabel("页码")
+                } else { Spacer() }
             } else { Spacer() }
             #else
             Spacer()
             #endif
-            Text("\(min(model.position.page + 1, max(count, 1))) / \(max(count, 1))").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
             #if !os(tvOS)
             Button { Task { await model.open(model.position.chapter + 1) } } label: { Image(systemName: "forward.end.fill").frame(width: 32, height: 32).iosTouchTarget() }
                 .buttonStyle(.plain).disabled(!model.hasNext).opacity(model.hasNext ? 1 : 0.35)
                 .accessibilityLabel(L10n.text("Next Chapter"))
             #endif
+            }
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
-        .glassSurface(MangaReaderChrome.glass, in: Capsule())
+        .glassSurface(MangaReaderChrome.glass, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .padding(.horizontal, 16).padding(.bottom, 12)
+    }
+
+    private func turn(_ step: Int) {
+        let intent = model.pageTurnIntent(step)
+        if intent.chapter != model.position.chapter {
+            if model.chapters.indices.contains(intent.chapter) { _ = model.beginPageOpening(intent) }
+            return
+        }
+        switch intent.resolve(pageCount: model.currentPages.count) {
+        case .page(let page): model.requestPage(.init(chapter: model.position.chapter, page: page))
+        case .chapter(let destination):
+            if model.chapters.indices.contains(destination.chapter) { _ = model.beginPageOpening(destination) }
+        }
     }
     #endif
 }

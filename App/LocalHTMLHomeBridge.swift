@@ -21,6 +21,7 @@ import TVCore
     var nativeAction: @MainActor (String, [String: Any]) async throws -> Any
     private let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     private let origin: String
+    private var localDocumentURL: URL?
     private weak var web: WKWebView?
     private var stopped = false
     private var documentGeneration = 0
@@ -51,6 +52,7 @@ import TVCore
     func configure(_ configuration: WKWebViewConfiguration) throws {
         guard let file = Bundle.main.url(forResource: "local-html-home-sdk", withExtension: "js"),
               let sdk = try? String(contentsOf: file, encoding: .utf8) else { throw LocalHTMLHomeError("HTML 首页组件缺失，请重新安装完整安装包。") }
+        if source.isFile { localDocumentURL = try LocalHTMLHomeStore.load().fileURL(for: source) }
         configuration.websiteDataStore = dataStore
         configuration.allowsInlineMediaPlayback = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
@@ -60,7 +62,8 @@ import TVCore
             return (parts[1], value)
         })
         let config: [String: Any] = ["sourceID": source.id, "origin": origin, "token": token,
-            "localFile": source.isFile, "cache": localSnapshot, "resourceBase": "yingxia-home://resource/" + token]
+            "localFile": source.isFile, "documentURL": localDocumentURL?.absoluteString ?? "",
+            "cache": localSnapshot, "resourceBase": "yingxia-home://resource/" + token]
         let literal = String(decoding: try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]), as: UTF8.self)
         let script = "window.__yingxiaHTMLHome=" + literal + ";\n" + sdk
         configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "localHTMLHome")
@@ -105,7 +108,10 @@ import TVCore
     private var ownsCurrentDocument: Bool {
         !stopped && LocalHTMLHomeStore.load().sources.contains(source)
             && (historyOnly || LocalHTMLHomeStore.load().activeID == source.id)
-            && LocalHTMLHomePolicy.ownsDocument(web?.url, origin: origin, localFile: source.isFile)
+            && ownsDocument(web?.url)
+    }
+    func ownsDocument(_ url: URL?) -> Bool {
+        LocalHTMLHomePolicy.ownsDocument(url, origin: origin, localFile: source.isFile, fileURL: localDocumentURL)
     }
     private var requestAccess: Bool { active || historyOnly || !historyRequests.isEmpty }
     /// A retained inactive page may answer only the network/cache requests
@@ -162,7 +168,7 @@ import TVCore
           var adapter = ADAPTERS[id];
           return new URL(adapter.siteDefault || adapter.site).hostname === page.hostname && adapter.isVideoUrl(original);
         });
-        if (found.length !== 1) throw new Error('旧观看记录无法确认HTML 来源中的原站点');
+        if (found.length !== 1) throw new Error('旧观看记录无法确认 HTML 来源中的原站点');
         key = found[0];
       }
       var adapter = Object.assign({}, ADAPTERS[key]);
@@ -264,7 +270,7 @@ import TVCore
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) async -> (Any?, String?) {
         guard ownsCurrentDocument, message.webView === web, message.frameInfo.isMainFrame,
-              LocalHTMLHomePolicy.ownsDocument(message.frameInfo.request.url, origin: origin, localFile: source.isFile),
+              ownsDocument(message.frameInfo.request.url),
               let body = message.body as? [String: Any], body["token"] as? String == token,
               let method = body["method"] as? String, let payload = body["payload"] as? [String: Any] else {
             return (nil, "当前页面没有此首页的调用权限。")
@@ -290,12 +296,14 @@ import TVCore
             // Jasna's supplied handler awaits browser.open and leaves its button
             // disabled on success. Other HTML sources own their retry logic.
             let jasnaActive = (try? await web?.evaluateJavaScript("Boolean(window.__ltxMacCat?.active)")) as? Bool == true
-            let reloadsVerifiedPage = jasnaActive && LocalHTMLHomePolicy.origin(url) == "https://ltx.libray.workers.dev"
+            let verificationOrigin = LocalHTMLHomePolicy.origin(url)
+            let legacyJasna = jasnaActive && verificationOrigin == "https://ltx.libray.workers.dev"
+            let encryptedJasna = jasnaActive && verificationOrigin == "https://ltxlib.dpdns.org"
             guard ownsCurrentDocument, generation == documentGeneration else { throw CancellationError() }
             try await verify(url, userAgent: requestAgents[LocalHTMLHomePolicy.origin(url)] ?? browserAgent)
             try Task.checkCancellation()
             guard ownsCurrentDocument, generation == documentGeneration else { throw CancellationError() }
-            if reloadsVerifiedPage {
+            if legacyJasna {
                 // Done records the user's intent, not the server's acceptance.
                 // Reuse this home's WebKit cookies and matched browser identity;
                 // a remaining gate must reject browser.open so Jasna restores its
@@ -310,8 +318,12 @@ import TVCore
                       catalogue["items"] is [Any] else {
                     throw LocalHTMLHomeError("网站验证尚未完成，请重新打开网站验证，等待资源列表出现后再点“完成并重试”。")
                 }
-                reloadCurrentDocument()
             }
+            // The current site requires the page's ECDH session even for the
+            // catalogue check. A plaintext native GET always returns 428.
+            // Restart the original encrypted bootstrap after browser dismissal;
+            // if the site still requires verification, it renders a fresh retry.
+            if legacyJasna || encryptedJasna { reloadCurrentDocument() }
             return [String: String]()
         case "site.info": return ["key": source.id, "name": source.name, "homePage": source.address ?? "", "type": 0]
         case "device.info": return ["platform": "ios", "name": "Yingxia", "type": 1]
@@ -357,8 +369,13 @@ import TVCore
         return [String: String]()
     }
     private func reloadCurrentDocument() {
-        if source.isFile, let html = try? LocalHTMLHomeStore.load().html(for: source) { web?.loadHTMLString(html, baseURL: nil) }
+        if source.isFile, let web { try? loadLocalDocument(in: web) }
         else { web?.reload() }
+    }
+    func loadLocalDocument(in web: WKWebView) throws {
+        let file = try LocalHTMLHomeStore.load().fileURL(for: source)
+        guard file == localDocumentURL else { throw LocalHTMLHomeError("首页文件已改变，请重新打开对应首页。") }
+        web.loadFileURL(file, allowingReadAccessTo: file)
     }
     private func verify(_ url: URL, userAgent: String? = nil) async throws {
         guard ownsCurrentDocument else { throw CancellationError() }
@@ -561,7 +578,7 @@ import TVCore
                 }
                 do {
                     if let preparedHTML { web.loadHTMLString(preparedHTML, baseURL: preparedBaseURL) }
-                    else if source.isFile { web.loadHTMLString(try LocalHTMLHomeStore.load().html(for: source), baseURL: nil) }
+                    else if source.isFile { try bridge.loadLocalDocument(in: web) }
                     else if let address = source.address { web.load(URLRequest(url: try LocalHTMLHomePolicy.address(address))) }
                     else { throw LocalHTMLHomeError("HTML 首页文件不可用，请重新导入对应来源") }
                 } catch { finish(.failure(error)) }
@@ -597,7 +614,8 @@ import TVCore
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
         let scheme = action.request.url?.scheme?.lowercased() ?? ""
-        decisionHandler(["http", "https", "about", "data", "blob"].contains(scheme) ? .allow : .cancel)
+        let allowedFile = scheme == "file" && bridge.ownsDocument(action.request.url)
+        decisionHandler(allowedFile || ["http", "https", "about", "data", "blob"].contains(scheme) ? .allow : .cancel)
     }
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {}
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool { false }

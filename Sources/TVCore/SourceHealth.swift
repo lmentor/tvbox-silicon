@@ -70,9 +70,18 @@ import Perception
         (records[Self.key(site, origin: origin)]?.failures ?? 0) >= 2
     }
 
+    /// A new automatic search probes a recently failing source with a shorter budget.
+    /// Success clears this immediately; old failures never shorten future searches forever.
+    func failedRecently(_ site: Site, origin: URL, now: Date = Date()) -> Bool {
+        guard let record = records[Self.key(site, origin: origin)], record.failures > 0,
+              let failure = record.lastFailure else { return false }
+        return (0...300).contains(now.timeIntervalSince(failure))
+    }
+
     /// Records one answer from a source: `error` nil for success. Cancellations, and failures that
     /// are this device's rather than the source's, change nothing.
     public func record(_ site: Site, origin: URL, seconds: Double, error: Error?, now: Date = Date()) {
+        guard !Task.isCancelled else { return }
         let key = Self.key(site, origin: origin)
         guard let error else {
             update(key) { record in

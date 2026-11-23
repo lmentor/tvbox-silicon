@@ -4,6 +4,12 @@ import TVCore
 
 /// Catalog browsing is independent of the subscription; opening a title can search the viewer's sources.
 @MainActor @Perceptible private final class DiscoverModel {
+    @MainActor @Perceptible fileprivate final class Shelf {
+        var page: TMDBCatalog.Page?
+    }
+    // A late offscreen feed must not invalidate every visible rail that reads
+    // a different key of one observable dictionary. Keep each shelf observable.
+    private let shelves = Dictionary(uniqueKeysWithValues: feeds.map { ($0, Shelf()) })
     private(set) var pages: [TMDBCatalog.Feed: TMDBCatalog.Page] = [:]
     private(set) var failures = Set<TMDBCatalog.Feed>()
     private(set) var collections: TMDBCatalog.Collections?
@@ -23,11 +29,13 @@ import TVCore
     /// This week's airing calendars (the Airing Today shelves). One that fails is just left out.
     private(set) var calendar: [TMDBCalendar.Kind: TMDBCalendar.Week] = [:]
     static let feeds: [TMDBCatalog.Feed] = [.featured, .trending, .nowPlaying, .onTheAir, .variety, .chinese, .animation, .topMovies, .topTelevision, .family, .kids, .netflix, .disney, .appleTV, .hbo, .warner, .universal, .paramount, .sony]
-    func items(_ feed: TMDBCatalog.Feed) -> [TMDBCatalog.Item] { pages[feed]?.items ?? [] }
+    func page(_ feed: TMDBCatalog.Feed) -> TMDBCatalog.Page? { shelves[feed]?.page }
+    func items(_ feed: TMDBCatalog.Feed) -> [TMDBCatalog.Item] { page(feed)?.items ?? [] }
 
     init() {
         if let page = TMDBCatalog.cachedFeatured() {
             pages[.featured] = page
+            shelves[.featured]?.page = page
             featured = Array(page.items.filter { $0.poster != nil }.prefix(10))
             featuredSource = .featured
             refreshedAt[.featured] = page.fetchedAt
@@ -41,6 +49,7 @@ import TVCore
         if identity != serviceIdentity {
             serviceIdentity = identity
             pages = [:]; collections = nil; calendar = [:]; failures = []
+            for shelf in shelves.values { shelf.page = nil }
             featured = []; featuredSource = nil; refreshedAt = [:]
         }
         // Coalesce only while the carousel itself is pending. A slow shelf or calendar
@@ -78,8 +87,10 @@ import TVCore
                         // identical page needlessly invalidates the entire Home view.
                         if pages[feed]?.items != page.items || pages[feed]?.page != page.page || pages[feed]?.totalPages != page.totalPages {
                             pages[feed] = page
+                            shelves[feed]?.page = page
                         }
-                        received[feed] = page; refreshedAt[feed] = page.fetchedAt ?? now; failures.remove(feed)
+                        received[feed] = page; refreshedAt[feed] = page.fetchedAt ?? now
+                        if failures.contains(feed) { failures.remove(feed) }
                         if feed == .featured {
                             let items = page.items.filter { $0.poster != nil }
                             if !items.isEmpty {
@@ -89,7 +100,7 @@ import TVCore
                             }
                         }
                     }
-                    else if feed != .featured { failures.insert(feed) }
+                    else if feed != .featured, !failures.contains(feed) { failures.insert(feed) }
                     if answered.contains(.featured), received[.featured]?.items.contains(where: { $0.poster != nil }) != true,
                        !pending.contains(.trending) || answered.contains(.trending),
                        featured.isEmpty || featuredSource == .trending {
@@ -669,7 +680,7 @@ struct DiscoverView: View {
             WithPerceptionTracking {
                 ForEach([TMDBCatalog.Feed.topTelevision, .topMovies], id: \.self) { feed in
                     WithPerceptionTracking {
-                        RouteLink { WithPerceptionTracking { DiscoverListView(feed: feed, initial: model.pages[feed]) } } label: {
+                        RouteLink { WithPerceptionTracking { DiscoverListView(feed: feed, initial: model.page(feed)) } } label: {
                             WithPerceptionTracking {
                                 DiscoverTVRankingCard(title: feed.title, items: Array(model.items(feed).filter { $0.poster != nil }.prefix(18)))
                             }
@@ -683,7 +694,7 @@ struct DiscoverView: View {
             HStack(spacing: 13) {
                 ForEach([TMDBCatalog.Feed.topTelevision, .topMovies], id: \.self) { feed in
                     WithPerceptionTracking {
-                        RouteLink { WithPerceptionTracking { DiscoverListView(feed: feed, initial: model.pages[feed]) } } label: {
+                        RouteLink { WithPerceptionTracking { DiscoverListView(feed: feed, initial: model.page(feed)) } } label: {
                             WithPerceptionTracking {
                                 DiscoverRankingCard(feed: feed, items: Array(model.items(feed).prefix(15)), width: min(width - 33, 520))
                             }
@@ -751,7 +762,7 @@ struct DiscoverView: View {
                 #if os(tvOS)
                 sectionHeading(feed.title)
                 #else
-                RouteLink { WithPerceptionTracking { DiscoverListView(feed: feed, initial: model.pages[feed]) } } label: {
+                RouteLink { WithPerceptionTracking { DiscoverListView(feed: feed, initial: model.page(feed)) } } label: {
                     WithPerceptionTracking {
                         HStack {
                             Text(feed.title).font(.system(size: DiscoverLayout.heading, weight: .semibold))
@@ -764,7 +775,7 @@ struct DiscoverView: View {
                 .accessibilityIdentifier("discover.more.\(feed.rawValue)")
                 #endif
                 #if os(tvOS)
-                DiscoverTVShelf(feed: feed, items: items, initial: model.pages[feed], landscape: landscape)
+                DiscoverTVShelf(feed: feed, items: items, initial: model.page(feed), landscape: landscape)
                 #else
                 DiscoverRail(arrowCenter: landscape ? 50 : 87) {
                     LazyHStack(alignment: .top, spacing: DiscoverLayout.spacing) {
@@ -1863,9 +1874,8 @@ private struct DiscoverListView: View {
                     }
                 }
             }
-            .background { WithPerceptionTracking { DiscoverCanvas(poster: items.first?.poster) } }
-            .foregroundStyle(.white).preferredColorScheme(.dark)
             .navigationTitle(feed.title)
+            .discoverListAppearance(poster: items.first?.poster)
             .task {
                 if items.isEmpty { await loadMore() }
             }
@@ -2097,8 +2107,7 @@ private struct DoubanListView: View {
             #else
             .navigationTitle(feed.title)
             #endif
-            .background { WithPerceptionTracking { DiscoverCanvas(poster: items.first?.cover) } }
-            .foregroundStyle(.white).preferredColorScheme(.dark)
+            .discoverListAppearance(poster: items.first?.cover)
             .task { if items.isEmpty { await loadMore() } }
         }
     }
@@ -2149,9 +2158,13 @@ private struct DoubanTitleView: View {
     var body: some View {
         WithPerceptionTracking {
             Group {
+                #if os(iOS)
+                DiscoverDetailView(item: match ?? placeholder, initialSearchQuery: item.title)
+                #else
                 if let match { DiscoverDetailView(item: match) }
                 else if looked { card }
                 else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
+                #endif
             }
             .task(id: item.id) {
                 guard !looked else { return }
@@ -2162,6 +2175,14 @@ private struct DoubanTitleView: View {
             }
         }
     }
+
+    #if os(iOS)
+    private var placeholder: TMDBCatalog.Item {
+        .init(id: -1, mediaType: item.mediaType, name: item.title, originalName: item.title,
+              year: item.year, overview: item.subtitle, poster: item.cover, backdrop: nil,
+              rating: item.rating, genreIDs: [])
+    }
+    #endif
 
     private var card: some View {
         ScrollView {

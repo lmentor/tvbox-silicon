@@ -1,7 +1,7 @@
 import Foundation
 import Perception
 
-/// Subscription-qualified hides. The same key scheme as `PinnedSources`.
+/// Subscription-qualified hides. Imported JSON keeps the source owner across asset updates.
 @MainActor @Perceptible public final class HiddenSources {
     private var keys: [String]
     /// Bumps when a source is hidden or shown, so a cached source row can be reused until then.
@@ -9,17 +9,30 @@ import Perception
     private let defaults: UserDefaults
     /// Called after the list changes here (not after `adopt`), for iCloud sync.
     @PerceptionIgnored public var onChange: (@MainActor () -> Void)?
+    /// All changes, including cloud adoption, invalidate retained catalog/navigation state.
+    @PerceptionIgnored public var onVisibilityChange: (@MainActor () -> Void)?
     private static let storageKey = "hiddenSources.v1"
     private static let builtInRestoreKey = "hiddenSources.builtInRestore.v1"
     private static let autoRestoreKey = "hiddenSources.autoRestore.v1"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        keys = defaults.stringArray(forKey: Self.storageKey) ?? []
+        let saved = defaults.stringArray(forKey: Self.storageKey) ?? []
+        keys = Self.normalized(saved)
+        if keys != saved { defaults.set(keys, forKey: Self.storageKey) }
     }
 
     private func key(_ site: Site, origin: URL) -> String {
-        EpisodeSkipSettings.scope(origin: site.origin(or: origin), source: site.sourceKey, video: "")
+        EpisodeSkipSettings.scope(origin: PlaybackHistoryContext.sourceIdentity(site.origin(or: origin)), source: site.sourceKey, video: "")
+    }
+
+    private static func normalized(_ keys: [String]) -> [String] {
+        var seen = Set<String>()
+        return keys.map { key in
+            guard let fields = try? JSONDecoder().decode([String].self, from: Data(key.utf8)), fields.count == 3,
+                  let origin = URL(string: fields[0]) else { return key }
+            return EpisodeSkipSettings.scope(origin: PlaybackHistoryContext.sourceIdentity(origin), source: fields[1], video: fields[2])
+        }.filter { seen.insert($0).inserted }
     }
 
     public func contains(_ site: Site, origin: URL) -> Bool { keys.contains(key(site, origin: origin)) }
@@ -29,6 +42,7 @@ import Perception
         if keys.contains(key) { keys.removeAll { $0 == key } } else { keys.append(key) }
         defaults.set(keys, forKey: Self.storageKey)
         revision += 1
+        onVisibilityChange?()
         onChange?()
     }
 
@@ -38,6 +52,7 @@ import Perception
         keys.append(key)
         defaults.set(keys, forKey: Self.storageKey)
         revision += 1
+        onVisibilityChange?()
         onChange?()
     }
 
@@ -57,6 +72,7 @@ import Perception
         keys = next
         defaults.set(keys, forKey: Self.storageKey)
         revision += 1
+        onVisibilityChange?()
         onChange?()
     }
 
@@ -64,10 +80,12 @@ import Perception
     public var savedKeys: [String] { keys }
     /// The list merged with other devices'.
     public func adopt(_ keys: [String]) {
+        let keys = Self.normalized(keys)
         guard keys != self.keys else { return }
         self.keys = keys
         defaults.set(keys, forKey: Self.storageKey)
         revision += 1
+        onVisibilityChange?()
     }
 
     /// Built-in sources used to be hidden automatically like any other, so once, every hidden
@@ -79,6 +97,7 @@ import Perception
             keys.removeAll { restored.contains($0) }
             defaults.set(keys, forKey: Self.storageKey)
             revision += 1
+            onVisibilityChange?()
             onChange?()
         }
         defaults.set(true, forKey: Self.builtInRestoreKey)
@@ -95,6 +114,7 @@ import Perception
             keys.removeAll { restored.contains($0) }
             defaults.set(keys, forKey: Self.storageKey)
             revision += 1
+            onVisibilityChange?()
             onChange?()
         }
         defaults.set(true, forKey: Self.autoRestoreKey)

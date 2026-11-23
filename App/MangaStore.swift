@@ -7,7 +7,13 @@ import TVCore
     static let shared = MangaStore()
 
     private(set) var sources: [MangaInstalledSource] = MangaSources.shared.installed
+    /// Hidden sources remain installed with their profiles, library and reading history intact.
+    private(set) var hiddenSourceKeys = Set<String>()
+    var visibleSources: [MangaInstalledSource] { sources.filter { !hiddenSourceKeys.contains($0.key) } }
     private(set) var repositories: [URL] = MangaSources.shared.repositories
+    private(set) var repositoryEntries: [String: [MangaRepositoryEntry]] = [:]
+    private(set) var repositoryErrors: [String: [String: String]] = [:]
+    private(set) var preparingRepositories: Set<String> = []
     private(set) var favorites: [MangaLibrary.Favorite] = MangaLibrary.load("favorites.json", as: [MangaLibrary.Favorite].self) ?? []
     private(set) var history: [MangaLibrary.Progress] = MangaLibrary.load("history.json", as: [MangaLibrary.Progress].self) ?? []
     /// Shown on the page that started it: a message from a source (UI.showMessage).
@@ -40,17 +46,36 @@ import TVCore
             MainActor.assumeIsolated { MangaStore.shared.notice = text }
         }
         if selectedSource == nil || !sources.contains(where: { $0.key == selectedSource }) { selectedSource = sources.first?.key }
+        reloadSources()
+        Task { @MainActor in
+            for repository in repositories {
+                if repositoryEntries[repository.absoluteString]?.isEmpty != false { try? await refreshRepository(repository) }
+                else { try? await prepareRepository(repository) }
+            }
+        }
     }
 
-    var currentSource: MangaInstalledSource? { sources.first { $0.key == selectedSource } ?? sources.first }
+    var currentSource: MangaInstalledSource? { visibleSources.first { $0.key == selectedSource } ?? visibleSources.first }
+
+    func applyHiddenSources(_ hidden: HiddenSources) {
+        hiddenSourceKeys = Set(sources.filter { hidden.contains(LocalSearchManga.site($0), origin: LocalSearchManga.origin) }.map(\.key))
+    }
 
     func reloadSources() {
         sources = MangaSources.shared.installed
         repositories = MangaSources.shared.repositories
+        repositoryEntries = Dictionary(uniqueKeysWithValues: repositories.map { ($0.absoluteString, MangaSources.shared.cachedEntries(of: $0)) })
+        repositoryErrors = Dictionary(uniqueKeysWithValues: repositories.map { ($0.absoluteString, MangaSources.shared.preparationErrors(of: $0)) })
         if selectedSource == nil || !sources.contains(where: { $0.key == selectedSource }) { selectedSource = sources.first?.key }
     }
 
     func name(of key: String) -> String { sources.first { $0.key == key }?.name ?? key }
+
+    /// Preserve repository order and list each source once when lists overlap.
+    var listedSources: [MangaRepositoryEntry] {
+        var seen: Set<String> = []
+        return repositories.flatMap { repositoryEntries[$0.absoluteString] ?? [] }.filter { seen.insert($0.id).inserted }
+    }
 
     // MARK: Shelf
 
@@ -71,7 +96,10 @@ import TVCore
         if let index = favorites.firstIndex(where: { $0.id == progress.id }) { favorites[index].comic = progress.comic; MangaLibrary.save(favorites, as: "favorites.json") }
     }
     func forget(_ progress: MangaLibrary.Progress) {
-        history.removeAll { $0.id == progress.id }
+        forget(ids: [progress.id])
+    }
+    func forget(ids: Set<String>) {
+        history.removeAll { ids.contains($0.id) }
         MangaLibrary.save(history, as: "history.json")
     }
     func clearHistory() { history = []; MangaLibrary.save(history, as: "history.json") }
@@ -86,6 +114,34 @@ import TVCore
 
     func install(_ address: URL) async throws {
         try await MangaSources.shared.install(from: address)
+        reloadSources()
+    }
+    @discardableResult
+    func install(_ entry: MangaRepositoryEntry) async throws -> MangaInstalledSource {
+        let source = try await MangaSources.shared.install(entry)
+        reloadSources()
+        return source
+    }
+    @discardableResult
+    func importRepository(_ url: URL) async throws -> Int {
+        preparingRepositories.insert(url.absoluteString)
+        defer { preparingRepositories.remove(url.absoluteString); reloadSources() }
+        let entries = try await MangaSources.shared.importRepository(url)
+        return entries.count
+    }
+    func refreshRepository(_ url: URL) async throws {
+        preparingRepositories.insert(url.absoluteString)
+        defer { preparingRepositories.remove(url.absoluteString); reloadSources() }
+        _ = try await MangaSources.shared.refreshRepository(url)
+    }
+    func prepareRepository(_ url: URL) async throws {
+        guard !preparingRepositories.contains(url.absoluteString) else { return }
+        preparingRepositories.insert(url.absoluteString)
+        defer { preparingRepositories.remove(url.absoluteString); reloadSources() }
+        try await MangaSources.shared.prepareRepository(url)
+    }
+    func deleteRepository(_ url: URL) throws {
+        try MangaSources.shared.deleteRepository(url)
         reloadSources()
     }
     func remove(_ key: String) async {
@@ -133,11 +189,31 @@ enum MangaReaderMode: String, CaseIterable, Identifiable {
 }
 
 struct MangaCover: View {
+    @Environment(\.usesSearchPosterThumbnails) private var usesSearchPosterThumbnails
+    #if os(iOS)
+    @Environment(\.isLocalPageActive) private var localPageActive
+    #endif
     let source: String
     let url: String
     @State private var image: CGImage?
+    @State private var imageKey = ""
     @State private var failed = false
-    private var key: String { source + "\n" + url }
+    @State private var mounted = false
+    @State private var viewportVisible = false
+    private var key: String { source + "\n" + url + (usesSearchPosterThumbnails ? "\nsearch-360" : "") }
+    private var pageActive: Bool {
+        #if os(iOS)
+        localPageActive
+        #else
+        true
+        #endif
+    }
+    private var loadActive: Bool { !usesSearchPosterThumbnails || (pageActive && mounted && viewportVisible) }
+    private struct Request: Equatable { let key: String; let active: Bool }
+    private var displayedImage: CGImage? {
+        guard loadActive else { return nil }
+        return imageKey == key ? image : MangaCoverCache.shared.image(key)
+    }
     var body: some View {
         WithPerceptionTracking {
             #if os(tvOS)
@@ -145,46 +221,73 @@ struct MangaCover: View {
             // card button lifts the first image in its label and draws the glass rim around it. A clipped stack never grew.
             GeometryReader { proxy in
                 WithPerceptionTracking {
-                    Image(decorative: PosterImage.cover(image, proxy.size), scale: 1).resizable()
+                    Image(decorative: PosterImage.cover(displayedImage, proxy.size), scale: 1).resizable()
                         .overlay {
                             WithPerceptionTracking {
-                                if image == nil { Image(systemName: failed ? "photo" : "book.closed").font(.title2).foregroundStyle(.white.opacity(0.5)) }
+                                if displayedImage == nil { Image(systemName: failed ? "photo" : "book.closed").font(.title2).foregroundStyle(.white.opacity(0.5)) }
                             }
                         }
                         .preference(key: CardCoverHeightKey.self, value: proxy.size.height)
                 }
             }
-            .task(id: key) { await load() }
+            .task(id: Request(key: key, active: loadActive)) { await load() }
             #else
             ZStack {
                 Rectangle().fill(Color(white: 0.2))
-                if let image {
+                if let image = displayedImage {
                     Image(decorative: image, scale: 1).resizable().scaledToFill()
                 } else {
                     Image(systemName: failed ? "photo" : "book.closed").font(.title2).foregroundStyle(.white.opacity(0.5))
                 }
             }
             .clipped()
-            .task(id: key) { await load() }
+            .background {
+                #if os(iOS)
+                if usesSearchPosterThumbnails {
+                    SearchPosterViewportObserver(enabled: pageActive && mounted) { visible in
+                        if viewportVisible != visible { viewportVisible = visible }
+                    }.allowsHitTesting(false)
+                }
+                #endif
+            }
+            .task(id: Request(key: key, active: loadActive)) { await load() }
+            .onAppear { if usesSearchPosterThumbnails { mounted = true } }
+            .onDisappear { if usesSearchPosterThumbnails { mounted = false; image = nil; imageKey = "" } }
             #endif
         }
     }
 
     private func load() async {
-            if let cached = MangaCoverCache.shared.image(key) { image = cached; return }
-            image = nil; failed = false
+            guard loadActive else { image = nil; imageKey = ""; return }
+            if let cached = MangaCoverCache.shared.image(key) { image = cached; imageKey = key; return }
+            image = nil; imageKey = ""; failed = false
             guard !url.isEmpty else { failed = true; return }
             do {
                 let data = try await MangaImages.shared.data(source: source, url: url, kind: .cover)
-                let decoded = await Task.detached(priority: .userInitiated) { MangaImages.bitmap(data, width: 480) }.value
+                try Task.checkCancellation()
+                let thumbnail = usesSearchPosterThumbnails
+                let decode = Task.detached(priority: .utility) {
+                    guard !Task.isCancelled else { return nil as CGImage? }
+                    return thumbnail ? MangaImages.coverBitmap(data, maxPixels: 360) : MangaImages.bitmap(data, width: 480)
+                }
+                let decoded = await withTaskCancellationHandler { await decode.value } onCancel: { decode.cancel() }
                 guard !Task.isCancelled else { return }
-                if let decoded { MangaCoverCache.shared.store(decoded, key); image = decoded } else { failed = true }
+                if let decoded { MangaCoverCache.shared.store(decoded, key); image = decoded; imageKey = key } else { failed = true }
             } catch { if !Task.isCancelled { failed = true } }
     }
 }
 
 /// A cover with its title under it, for grids and shelves.
+private struct MangaLandscapePostersKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var mangaLandscapePosters: Bool {
+        get { self[MangaLandscapePostersKey.self] }
+        set { self[MangaLandscapePostersKey.self] = newValue }
+    }
+}
+
 struct MangaCard: View {
+    @Environment(\.mangaLandscapePosters) private var landscapePosters
     let comic: MangaComic
     var caption: String? = nil
     var showsSource = false
@@ -206,7 +309,7 @@ struct MangaCard: View {
             .accessibilityElement(children: .combine)
             #else
             VStack(alignment: .leading, spacing: 8) {
-                Color.clear.aspectRatio(3.0 / 4.0, contentMode: .fit)
+                Color.clear.aspectRatio(landscapePosters ? 16.0 / 9.0 : 3.0 / 4.0, contentMode: .fit)
                     .overlay { WithPerceptionTracking { MangaCover(source: comic.sourceKey, url: comic.cover) } }
                     .posterClip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 VStack(alignment: .leading, spacing: 2) {
@@ -252,6 +355,7 @@ enum MangaLayout {
 /// A titled row of covers that scrolls sideways. On iPhone and the Mac its heading is Watch Now's: the whole line opens
 /// the full list (`route`), with a chevron; on Apple TV a See All button does.
 struct MangaShelfRow: View {
+    @Environment(\.mangaLandscapePosters) private var landscapePosters
     let title: String
     let comics: [MangaComic]
     var captions: [String: String] = [:]
@@ -296,7 +400,7 @@ struct MangaShelfRow: View {
                         ForEach(comics) { comic in
                             WithPerceptionTracking {
                                 MangaComicLink(comic: comic, caption: captions[comic.identity], showsSource: showsSource)
-                                    .frame(width: MangaLayout.cardWidth)
+                                    .frame(width: landscapePosters ? max(180, MangaLayout.cardWidth) : MangaLayout.cardWidth)
                             }
                         }
                     }
@@ -336,6 +440,7 @@ struct MangaShelfPage: View {
 
 /// An endless grid of comics: a search, a category, a ranking or an explore list, a page at a time.
 struct MangaComicGrid: View {
+    @Environment(\.mangaLandscapePosters) private var landscapePosters
     let load: (MangaCursor?) async throws -> MangaPage
     var id: String
     @State private var comics: [MangaComic] = []
@@ -343,11 +448,13 @@ struct MangaComicGrid: View {
     @State private var finished = false
     @State private var loading = false
     @State private var failure: String?
+    @State private var requestID = UUID()
 
     var body: some View {
         WithPerceptionTracking {
             VStack(spacing: 0) {
-                LazyVGrid(columns: MangaLayout.columns, alignment: .leading, spacing: Layout.gridRowSpacing) {
+                LazyVGrid(columns: landscapePosters ? [GridItem(.adaptive(minimum: 156, maximum: 240), spacing: 12, alignment: .top)] : MangaLayout.columns,
+                          alignment: .leading, spacing: Layout.gridRowSpacing) {
                     WithPerceptionTracking {
                         ForEach(comics) { comic in
                             WithPerceptionTracking {
@@ -380,25 +487,29 @@ struct MangaComicGrid: View {
     }
 
     private func reset() async {
-        comics = []; next = nil; finished = false; failure = nil
+        requestID = UUID()
+        comics = []; next = nil; finished = false; failure = nil; loading = false
         await more()
     }
 
     private func more() async {
         guard !loading, !finished else { return }
+        let request = requestID, selection = id
         loading = true; failure = nil
-        defer { loading = false }
+        defer { if requestID == request, id == selection { loading = false } }
         do {
             let page = try await load(comics.isEmpty ? nil : next)
+            guard !Task.isCancelled, requestID == request, id == selection else { return }
             let known = Set(comics.map(\.id))
             let fresh = page.comics.filter { !known.contains($0.id) }
             if let first = fresh.first { await MangaImages.shared.prepareCovers(source: first.sourceKey, urls: fresh.map(\.cover)) }
+            guard !Task.isCancelled, requestID == request, id == selection else { return }
             comics += fresh
             next = page.next
             finished = page.next == nil || fresh.isEmpty
         } catch is CancellationError {
         } catch {
-            failure = error.mangaMessage
+            if requestID == request, id == selection { failure = error.mangaMessage }
         }
     }
 }

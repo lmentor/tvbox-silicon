@@ -393,9 +393,13 @@ struct DiscoverAiringTitleView: View {
     var body: some View {
         WithPerceptionTracking {
             Group {
+                #if os(iOS)
+                DiscoverDetailView(item: match ?? placeholder, initialSearchQuery: item.title)
+                #else
                 if let match { DiscoverDetailView(item: match) }
                 else if looked { card }
                 else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
+                #endif
             }
             .task(id: item.id) {
                 guard !looked else { return }
@@ -417,6 +421,14 @@ struct DiscoverAiringTitleView: View {
         return nil
     }
     private static func normal(_ name: String) -> String { name.lowercased().filter { !$0.isWhitespace && !$0.isPunctuation } }
+
+    #if os(iOS)
+    private var placeholder: TMDBCatalog.Item {
+        .init(id: -1, mediaType: .tv, name: item.title, originalName: item.originalTitle,
+              year: nil, overview: item.overview ?? "", poster: item.cover, backdrop: nil,
+              rating: item.rating, genreIDs: [])
+    }
+    #endif
 
     private var card: some View {
         ScrollView {

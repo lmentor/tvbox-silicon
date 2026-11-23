@@ -7,8 +7,6 @@ struct LocalDanmakuCatalogPanel: View {
     let enhancements: NativeMediaEnhancements
     let model: CatalogDanmakuModel
     let importFile: () -> Void
-    var importing = false
-    var importError: String? = nil
     var openConfiguration: (() -> Void)? = nil
     @State private var sources: [NativeDanmakuCatalogSource] = []
     @State private var keyword = ""
@@ -46,10 +44,9 @@ struct LocalDanmakuCatalogPanel: View {
             VStack(alignment: .leading, spacing: 12) {
                 sourceControls
                 searchControls
-                if busy { ProgressView() }
+                if busy || enhancements.selectingTrack { ProgressView() }
                 if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
-                if let importError { Text(importError).font(.caption).foregroundStyle(.orange) }
-                if importing { ProgressView("正在导入弹幕…") }
+                if let message = enhancements.trackSelectionError { Text(message).font(.caption).foregroundStyle(.orange) }
                 resultContent
                 importControls
             }
@@ -96,9 +93,18 @@ struct LocalDanmakuCatalogPanel: View {
     private var searchControls: some View {
         WithPerceptionTracking {
             HStack {
-                TextField("影片名称", text: $keyword).textFieldStyle(LocalGlassTextFieldStyle()).onSubmit { search() }
+                TextField("影片名称", text: $keyword)
+                    #if os(iOS)
+                    // This field-scoped UIKit trait uses the system keyboard:
+                    // some keyboard extensions misroute keys after player rotation.
+                    .keyboardType(.namePhonePad)
+                    .submitLabel(.search)
+                    #endif
+                    .textFieldStyle(LocalGlassTextFieldStyle()).onSubmit { search() }
                 Button("搜索") { search() }.disabled(busy || keyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || enabledSources.isEmpty)
-                if busy { Button("取消") { cancel(); status = "已取消" } }
+                if busy || enhancements.selectingTrack {
+                    Button("取消") { cancel(); enhancements.cancelTrackSelection(); status = "已取消" }
+                }
             }
         }
     }
@@ -115,7 +121,12 @@ struct LocalDanmakuCatalogPanel: View {
         VStack(alignment: .leading, spacing: 10) {
             Button("返回搜索结果") { cancel(); self.chosen = nil; episodes = [] }
             Text(chosen.title).font(.headline)
-            TextField("筛选弹幕集数", text: $episodeQuery).textFieldStyle(LocalGlassTextFieldStyle())
+            TextField("筛选弹幕集数", text: $episodeQuery)
+                #if os(iOS)
+                .keyboardType(.namePhonePad)
+                .submitLabel(.done)
+                #endif
+                .textFieldStyle(LocalGlassTextFieldStyle())
             episodePages
             ForEach(visibleEpisodes) { episode in
                 Button(episode.title) { load(episode, result: chosen) }
@@ -138,13 +149,13 @@ struct LocalDanmakuCatalogPanel: View {
     private var importControls: some View {
         HStack {
             Button(action: importFile) { Text("导入弹幕文件").frame(minHeight: 44).contentShape(Rectangle()) }
-                .disabled(busy || importing).accessibilityIdentifier("player.danmaku.import")
-            Button { run { try await enhancements.restoreSource() } } label: {
+                .disabled(busy || enhancements.selectingTrack).accessibilityIdentifier("player.danmaku.import")
+            Button { enhancements.selectTrack { try await enhancements.restoreSource() } } label: {
                 Text("恢复来源弹幕").frame(minHeight: 44).contentShape(Rectangle())
-            }.disabled(busy || importing)
+            }.disabled(busy || enhancements.selectingTrack)
             Button(role: .destructive) { cancel(); enhancements.clear() } label: {
                 Text("清除").frame(minHeight: 44).contentShape(Rectangle())
-            }.disabled(importing)
+            }.disabled(enhancements.selectingTrack)
         }.buttonStyle(.plain)
     }
     private func beginMedia() {
@@ -221,11 +232,9 @@ struct LocalDanmakuCatalogPanel: View {
         }
     }
     private func load(_ episode: NativeDanmakuCatalogEpisode, result: NativeDanmakuCatalogResult) {
-        run {
+        enhancements.selectTrack { [enhancements] in
             try await enhancements.prepareCatalog(episode, result: result)
             try Task.checkCancellation()
-            enhancements.remember(result: result, episode: episode)
-            status = "已加载 " + episode.title
         }
     }
 }

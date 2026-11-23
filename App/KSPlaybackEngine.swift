@@ -149,6 +149,7 @@ struct KSPlaybackChapter: Identifiable, Equatable {
     var onTick: (() -> Void)?
     var onFinish: ((Error?) -> Void)?
     var onDecoderChange: (() -> Void)?
+    var onAudioInterruption: (() -> Void)?
     /// External and AI cues remain owned by the session; PiP samples them at the decoded frame time.
     var pictureInPictureSubtitleProvider: ((Double) -> (primary: PlayerSubtitlePresentation, secondary: PlayerSubtitlePresentation))?
     private(set) var renderingRevision = UUID()
@@ -156,6 +157,7 @@ struct KSPlaybackChapter: Identifiable, Equatable {
     var pipController: AVPictureInPictureController? { pipPresenter?.controller ?? core?.pipController }
     var pictureInPictureActive: Bool { pipController?.isPictureInPictureActive == true }
     var inputRevision: UUID { openID }
+    private(set) var transportRevision = UUID()
     var seeking: Bool { currentSeek != nil || pendingSeek != nil }
     var timelineRevision: Int { renderingTimeline }
     /// The first actual picture can arrive after a paused seek's completion.
@@ -174,6 +176,24 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         return snapshot
     }
     var seekable: Bool { core?.seekable == true }
+    var liveOutputWasStable: Bool { liveWatchdog.hadSustainedOutput }
+    var boostVideoLag: Double? {
+        guard let core, hasPresentedPicture, !seeking, core.loadState == .playable,
+              let diff = core.dynamicInfo?.audioVideoSyncDiff, diff.isFinite else { return nil }
+        return max(0, -diff)
+    }
+    func cachedTimeRanges(_ coverage: [MobileMediaServices.VideoCacheCoverage]) -> [ClosedRange<Double>] {
+        var bytes: [String: [Range<Int64>]] = [:]
+        var lengths: [String: Int64] = [:]
+        var segments: [String: [PlaybackCacheTimeline.Segment]] = [:]
+        for item in coverage {
+            bytes[item.resourceID] = item.ranges
+            lengths[item.resourceID] = item.total
+            segments[item.resourceID] = item.segments.map { .init(bytes: $0.bytes, time: $0.time) }
+        }
+        return PlaybackCacheTimeline.coveredRanges(indexes: core?.cacheTimeline ?? [], coverage: bytes,
+                                                   lengths: lengths, segments: segments)
+    }
     /// Direct picture time avoids a prefilling audio queue advancing danmaku ahead of the frame.
     var displayPosition: Double {
         guard let core else { return position }
@@ -181,6 +201,9 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         return value.isFinite && value >= 0 ? value : position
     }
     @PerceptionIgnored private var core: KSMEPlayer?
+    // The facade has one native player/output owner, even while the session
+    // resets between episodes. Its reader is closed and its buffers are empty.
+    @PerceptionIgnored private var idleCore: KSMEPlayer?
     @PerceptionIgnored private var pipPresenter: KSCompositedPictureInPicture?
     @PerceptionIgnored private var openID = UUID()
     @PerceptionIgnored private var options: KSOptions?
@@ -196,9 +219,20 @@ struct KSPlaybackChapter: Identifiable, Equatable {
     @PerceptionIgnored private var externalSubtitleOrder: [String] = []
     @PerceptionIgnored private var pendingTrackSelections: [(KSPlaybackTrack.Kind, String?)] = []
     @PerceptionIgnored private var wantsPlaying = false
+    @PerceptionIgnored private var backgroundSuspended = false
+    @PerceptionIgnored private var audioInterruptionObserver: PlayerAudioInterruption?
+    @PerceptionIgnored private var audioInterrupted = false
+    @PerceptionIgnored private var resumeAfterAudioInterruption = false
+    @PerceptionIgnored private var needsAudioReactivation = false
+    // Retain a denied/manual interruption pause through an async input open,
+    // even if the call ended before the URL or native tracks became ready.
+    @PerceptionIgnored private var interruptionPausePending = false
+    // A replacement decoder/input for the same item inherits the lock pause.
+    @PerceptionIgnored var pausedForDeviceLock = false
     @PerceptionIgnored private var failedVideo = false
     @PerceptionIgnored private var decoderDiagnosticCount = 0
     @PerceptionIgnored private var pictureWatchdog = PlaybackPictureWatchdog()
+    @PerceptionIgnored private var liveWatchdog = LivePlaybackWatchdog()
     @PerceptionIgnored private var startupStages = Set<String>()
     @PerceptionIgnored private var nextPlaybackInfoSample = 0.0
     @PerceptionIgnored private var lastStoppedPicture: Double?
@@ -218,6 +252,19 @@ struct KSPlaybackChapter: Identifiable, Equatable {
     }
     @PerceptionIgnored private var currentSeek: SeekRequest?
     @PerceptionIgnored private var pendingSeek: SeekRequest?
+
+    override init() {
+        super.init()
+        audioInterruptionObserver = PlayerAudioInterruption { [weak self] began, shouldResume in
+            self?.handleAudioInterruption(began: began, shouldResume: shouldResume)
+        }
+    }
+
+    func beginPlaybackRequest() {
+        // A fresh user selection after a call may play. A preparation callback
+        // for an older request must not clear the interruption's pause.
+        if !audioInterrupted { interruptionPausePending = false }
+    }
 
     func open(url: URL, headers: [String: String], mediaID: String, format: String? = nil,
               discPlaylist: Int? = nil, startTime: Double = 0, isLive: Bool = false,
@@ -272,16 +319,20 @@ struct KSPlaybackChapter: Identifiable, Equatable {
             }
         }
         options.hardwareDecode = decoder != "software"
+        options.isLiveStreaming = isLive
         options.asynchronousDecompression = decoder != "software"
         options.autoDeInterlace = true
         options.videoDelay = -audioDelay
         options.startPlayTime = max(0, startTime)
         options.autoSelectEmbedSubtitle = true
         options.formatContextOptions["rw_timeout"] = 20_000_000
+        // A live TS already lists its programs in PAT/PMT. Forcing further PMT
+        // scanning prevents FFmpeg from finishing once those tracks are known.
+        if isLive { options.formatContextOptions["scan_all_pmts"] = 0 }
         if ["rtsp", "rtsps"].contains(url.scheme?.lowercased() ?? "") { options.formatContextOptions["rtsp_transport"] = "tcp" }
         if let discPlaylist { options.formatContextOptions["playlist"] = String(discPlaylist) }
         self.options = options
-        let player = KSMEPlayer(url: url, options: options)
+        let player = acquirePlayer(url: url, options: options)
         let playerIdentity = ObjectIdentifier(player)
         core = player
         if let output = player.videoOutput as? MetalPlayView, AVPictureInPictureController.isPictureInPictureSupported() {
@@ -289,7 +340,8 @@ struct KSPlaybackChapter: Identifiable, Equatable {
             pipPresenter = presenter
             player.applicationPictureInPictureController = presenter.controller
             output.pictureInPictureFrame = { [weak self, weak player, weak presenter, weak output] buffer, timestamp in
-                guard let self, let player, let presenter, let output, self.core === player else { return false }
+                guard let self, let player, let presenter, let output, self.core === player,
+                      self.openID == activeOpen else { return false }
                 return presenter.submit(buffer, time: player.relativeVideoTime(for: timestamp),
                                         active: output.pictureInPictureActive)
             }
@@ -318,19 +370,34 @@ struct KSPlaybackChapter: Identifiable, Equatable {
             picture.frame = host.bounds; picture.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             host.addSubview(picture)
         }
-        wantsPlaying = true; paused = false; buffering = true
+        wantsPlaying = !pausedForDeviceLock && !audioInterrupted && !interruptionPausePending
+        paused = !wantsPlaying; buffering = wantsPlaying
         renderingRevision = UUID()
         player.prepareToPlay()
         let identity = mediaID
         clock = Task { [weak self, weak player] in
             while !Task.isCancelled {
-                guard let self, let player, self.core === player, self.mediaID == identity else { return }
+                guard let self, let player, self.core === player, self.mediaID == identity,
+                      self.openID == activeOpen else { return }
                 self.sample()
                 try? await Task.sleep(for: .milliseconds(50))
             }
         }
     }
+    private func acquirePlayer(url: URL, options: KSPlaybackOptions) -> KSMEPlayer {
+        if let player = idleCore {
+            idleCore = nil
+            player.replace(url: url, options: options)
+            return player
+        }
+        return KSMEPlayer(url: url, options: options)
+    }
     func shutdown() {
+        transportRevision = UUID()
+        backgroundSuspended = false
+        // Keep the active system interruption across decoder/input replacement,
+        // but never carry an old item's automatic-resume intent into a new one.
+        resumeAfterAudioInterruption = false
         PictureInPicture.shared.stop(engine: self)
         openID = UUID()
         if let output = core?.videoOutput as? MetalPlayView {
@@ -344,8 +411,14 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         currentSeek = nil; pendingSeek = nil; seekSequence += 1; renderingTimeline &+= 1
         core?.delegate = nil; core?.playbackCommand = nil; core?.seekCommand = nil
         core?.pipController?.stopPictureInPicture(); observedPiP = nil
-        core?.shutdown(); core?.view?.removeFromSuperview(); core = nil; options = nil
+        if let core {
+            core.shutdown()
+            core.view?.removeFromSuperview()
+            idleCore = core
+        }
+        core = nil; options = nil
         failedVideo = false; decoderDiagnosticCount = 0; pictureWatchdog = PlaybackPictureWatchdog(); startupStages = []
+        liveWatchdog = LivePlaybackWatchdog()
         nextPlaybackInfoSample = 0
         videoBitDepth = nil
         mediaID = nil; position = 0; duration = 0; bufferedPosition = 0
@@ -360,32 +433,116 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         for request in cancelled { request.completion(false) }
     }
     func play() {
-        guard !failedVideo else { return }
+        transportRevision = UUID()
+        guard !audioInterrupted, core != nil else { return }
+        if !failedVideo { guard reactivateInterruptedAudio() else { return } }
+        interruptionPausePending = false
+        pausedForDeviceLock = false
         wantsPlaying = true; paused = false
+        // A foreground rebuild may still be deferred. Accept a newer explicit
+        // resume as intent without restarting that failed/hidden native output.
+        if failedVideo || backgroundSuspended { return }
         if isReady, duration > 0, position >= duration - 0.1 {
             seek(to: 0)
         } else if currentSeek == nil { core?.play() }
         synchronizePictureInPictureClock()
     }
-    func pause() { wantsPlaying = false; paused = true; core?.pause(); synchronizePictureInPictureClock() }
+    func pause() {
+        transportRevision = UUID()
+        resumeAfterAudioInterruption = false
+        wantsPlaying = false; paused = true; core?.pause(); synchronizePictureInPictureClock()
+    }
+    func pauseForDeviceLock(resumePending: Bool) -> Bool {
+        // Buffering and seeking can stop native output while the item still intends to play.
+        guard wantsPlaying || resumeAfterAudioInterruption || resumePending, core != nil,
+              videoSelection != "no",
+              (!isReady && tracks.isEmpty) || tracks.contains(where: { $0.kind == .video && $0.selected }) else { return false }
+        pausedForDeviceLock = true
+        pause()
+        return true
+    }
+    private func handleAudioInterruption(began: Bool, shouldResume: Bool) {
+        if began {
+            guard !audioInterrupted else { return }
+            audioInterrupted = true
+            needsAudioReactivation = true
+            interruptionPausePending = true
+            resumeAfterAudioInterruption = core != nil && wantsPlaying && !pausedForDeviceLock
+            // Do not use pause(): it represents a user pause and cancels resume.
+            wantsPlaying = false; paused = true; buffering = false
+            core?.pause()
+            synchronizePictureInPictureClock()
+            if core != nil { onAudioInterruption?() }
+            Diagnostics.shared.record(.info, "player.audio", "interruption=began resume=\(resumeAfterAudioInterruption)")
+        } else {
+            guard audioInterrupted else { return }
+            audioInterrupted = false
+            let resume = resumeAfterAudioInterruption && shouldResume && !pausedForDeviceLock
+            resumeAfterAudioInterruption = false
+            Diagnostics.shared.record(.info, "player.audio", "interruption=ended resume=\(resume)")
+            if resume { play() }
+        }
+    }
+    private func reactivateInterruptedAudio() -> Bool {
+        guard needsAudioReactivation else { return true }
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            // Interruption may invalidate queued sample buffers. Both native
+            // outputs were paused at .began, so play() restarts their feeders.
+            core?.audioOutput.flush()
+            needsAudioReactivation = false
+            return true
+        } catch {
+            wantsPlaying = false; paused = true; buffering = false
+            core?.pause()
+            synchronizePictureInPictureClock()
+            Diagnostics.shared.failure("player.audio", "Reactivate interrupted audio", error)
+            return false
+        }
+    }
     func resumeAfterForeground() {
         guard let core else { return }
+        let resumeHeldOutput = backgroundSuspended && UIApplication.shared.applicationState == .active
+        if resumeHeldOutput { backgroundSuspended = false }
         core.enterForeground()
+        if resumeHeldOutput, wantsPlaying, !failedVideo, !audioInterrupted, !seeking { core.play() }
         core.view?.setNeedsLayout()
         core.view?.layoutIfNeeded()
         sample()
     }
+    func suspendForBackground() {
+        guard UIApplication.shared.applicationState != .active, !pictureInPictureActive,
+              core != nil, videoSelection != "no",
+              !isReady || tracks.contains(where: { $0.kind == .video && $0.selected }) else { return }
+        // A failed/declined PiP handoff may leave audio running while iOS has
+        // suspended the inline display link. Hold outputs without changing the
+        // viewer's latest play/pause intent or disc/cache reader ownership.
+        backgroundSuspended = true
+        core?.pause(); buffering = false
+        synchronizePictureInPictureClock()
+    }
+    func pictureInPictureStartFailed() { suspendForBackground() }
     func attachPictureInPicture(to view: UIView) { pipPresenter?.attach(to: view) }
     func detachPictureInPicture(from view: UIView) { pipPresenter?.detach(from: view) }
     func retainPictureInPictureSource() { pipPresenter?.retainSource() }
     func setPictureInPictureActive(_ active: Bool) {
         (core?.videoOutput as? MetalPlayView)?.pictureInPictureActive = active
-        pipPresenter?.refresh(active: active)
+        pipPresenter?.setActive(active)
+        if active, backgroundSuspended {
+            backgroundSuspended = false
+            if wantsPlaying, !failedVideo, !audioInterrupted, !seeking { core?.play() }
+        }
     }
-    func preparePictureInPicture() { pipPresenter?.refresh(active: false) }
+    func preparePictureInPicture() {
+        pipPresenter?.prepareToStart()
+        // AVKit's active KVO can arrive after CADisplayLink is suspended. Feed
+        // its source throughout the pending start while retaining the inline
+        // picture until the successful didStart handoff.
+        setPictureInPictureActive(true)
+    }
     private func synchronizePictureInPictureClock() {
         pipPresenter?.synchronizeClock(time: seeking ? position : displayPosition,
-            rate: paused || buffering || seeking ? 0 : Double(speed))
+            rate: paused || buffering || seeking || failedVideo || backgroundSuspended ? 0 : Double(speed))
     }
     func pictureInPictureSubtitles(at time: Double) -> (primary: PlayerSubtitlePresentation, secondary: PlayerSubtitlePresentation, style: SubtitleStyle) {
         if let core { sampleSubtitles(core, at: time) }
@@ -422,6 +579,7 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         renderingRevision = UUID()
     }
     func seek(to requested: Double, completion: @escaping (Bool) -> Void = { _ in }) {
+        transportRevision = UUID()
         guard requested.isFinite, let core, isReady, core.seekable else { completion(false); return }
         seekSequence += 1
         renderingTimeline &+= 1
@@ -460,7 +618,7 @@ struct KSPlaybackChapter: Identifiable, Equatable {
                       self.currentSeek == nil else { return }
                 if self.pendingSeek != nil { self.performNextSeek() }
                 else if !self.pendingTrackSelections.isEmpty { self.applyPendingTrackSelections() }
-                else if self.wantsPlaying { player.play() }
+                else if self.wantsPlaying && !self.backgroundSuspended { player.play() }
                 else { player.pause() }
                 self.sample()
             }
@@ -538,19 +696,37 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         }
         refreshTracks()
         if needsSeek { seek(to: currentPosition) }
-        else if wantsPlaying { player.play() }
+        else if wantsPlaying && !backgroundSuspended { player.play() }
         else { player.pause() }
     }
+    private static func pictureSize(_ player: KSMEPlayer) -> CGSize {
+        // A software decoder can display a frame even when CoreMedia cannot
+        // describe its compressed codec. Decoded frames also reflect stream
+        // resolution changes and any rotation already applied by FFmpeg.
+        if let picture = player.videoOutput?.pixelBuffer, picture.width > 0, picture.height > 0 {
+            let pixels = CGSize(width: picture.width, height: picture.height)
+            let aspect = picture.aspectRatio
+            if aspect.width.isFinite, aspect.height.isFinite, aspect.width > 0, aspect.height > 0 {
+                let height = pixels.height * aspect.height / aspect.width
+                if height.isFinite, height > 0 { return CGSize(width: pixels.width, height: height) }
+            }
+            return pixels
+        }
+        let size = player.naturalSize
+        return size.width.isFinite && size.height.isFinite && size.width > 0 && size.height > 0 ? size : .zero
+    }
+
     private func sample() {
         guard let player = core else { return }
+        let sampleOpen = openID
         if !seeking { position = Self.finite(player.currentPlaybackTime) }
         duration = Self.finite(player.duration)
         bufferedPosition = max(position, Self.finite(player.playableTime))
-        presentationSize = player.naturalSize
+        presentationSize = Self.pictureSize(player)
         hasPicture = player.videoOutput?.pixelBuffer != nil || (player.isReadyToPlay && player.tracks(mediaType: .video).isEmpty)
         if hasPicture { hasPresentedPicture = true }
         isReady = player.isReadyToPlay
-        buffering = wantsPlaying && !failedVideo && player.loadState != .playable
+        buffering = wantsPlaying && !failedVideo && !backgroundSuspended && player.loadState != .playable
         paused = !wantsPlaying
         sampleStoppedPicture(player.displayedVideoTime)
         bytesRead = max(0, player.dynamicInfo?.bytesRead ?? 0)
@@ -612,17 +788,30 @@ struct KSPlaybackChapter: Identifiable, Equatable {
         // the deadline follows decode/input evidence, independently of buffering.
         if pictureWatchdog.update(now: ProcessInfo.processInfo.systemUptime, ready: isReady,
             selectedVideo: videoSelection != "no" && tracks.contains(where: { $0.kind == .video && $0.selected }),
-            picture: hasPicture, playing: !paused, seeking: seeking,
+            picture: hasPicture, playing: !paused && !backgroundSuspended, seeking: seeking,
             decoderStarted: (options?.decodeVideoTime ?? 0) > 0 && (options?.readVideoTime ?? 0) > 0,
             bytes: bytesRead, position: position, inputEnded: player.hasReachedEndOfInput) {
             failVideo("视频没有输出可显示的画面，请切换解码方式或线路。")
         }
+        guard core === player, openID == sampleOpen else { return }
+        sampleLiveOutput(now: sampleTime, player: player)
+        // A live failure may synchronously replace the session's input/line.
+        guard core === player, openID == sampleOpen else { return }
         let pip = pipController
         if observedPiP !== pip { observedPiP = pip; renderingRevision = UUID() }
         sampleSubtitles(player)
         synchronizePictureInPictureClock()
         onTick?()
         if pictureInPictureActive, !seeking, paused || buffering { pipPresenter?.refreshPaused() }
+    }
+    private func sampleLiveOutput(now: TimeInterval, player: KSMEPlayer) {
+        guard options?.isLiveStreaming == true, !failedVideo else { return }
+        let selectedVideo = videoSelection != "no" && tracks.contains { $0.kind == .video && $0.selected }
+        if liveWatchdog.update(now: now, playing: !paused && !backgroundSuspended && !seeking,
+            ready: isReady, hasPicture: hasPicture, selectedVideo: selectedVideo,
+            outputTime: selectedVideo ? player.displayedVideoTime : position) {
+            failVideo("直播画面或声音长时间没有更新，请重试或切换线路。")
+        }
     }
     private func sampleStoppedPicture(_ value: Double) {
         guard value.isFinite, value >= 0, lastStoppedPicture != value else { return }
@@ -796,7 +985,7 @@ struct KSPlaybackChapter: Identifiable, Equatable {
     private static func finite(_ value: Double) -> Double { value.isFinite ? max(0, value) : 0 }
     var failureDiagnostic: String {
         let layer = core?.videoOutput?.displayLayer
-        return "decoder=\(currentDecoder) ready=\(isReady) picture=\(hasPicture) everPicture=\(hasPresentedPicture) time=\(position) displayed=\(displayPosition) seeking=\(seeking) playing=\(wantsPlaying) bytes=\(bytesRead) size=\(presentationSize) layer=\(layer?.status.rawValue ?? -1) layerCode=\(layer?.error.map { ($0 as NSError).code } ?? 0)"
+        return "decoder=\(currentDecoder) ready=\(isReady) picture=\(hasPicture) everPicture=\(hasPresentedPicture) time=\(position) displayed=\(displayPosition) seeking=\(seeking) playing=\(wantsPlaying) backgroundHeld=\(backgroundSuspended) bytes=\(bytesRead) size=\(presentationSize) layer=\(layer?.status.rawValue ?? -1) layerCode=\(layer?.error.map { ($0 as NSError).code } ?? 0)"
     }
     private func failVideo(_ message: String) {
         guard !failedVideo else { return }
@@ -809,17 +998,32 @@ struct KSPlaybackChapter: Identifiable, Equatable {
     private func owns(_ player: some MediaPlayerProtocol) -> Bool { core === player }
     func readyToPlay(player: some MediaPlayerProtocol) {
         guard owns(player) else { return }
+        let activeOpen = openID
         isReady = true; refreshTracks()
         for track in tracks where track.selected && track.kind != .subtitle { defaultTracks[track.kind.rawValue] = track.id }
-        sample(); renderingRevision = UUID(); onReady?()
-        if wantsPlaying, !seeking { core?.play() }
+        sample()
+        guard owns(player), openID == activeOpen else { return }
+        renderingRevision = UUID(); onReady?()
+        guard owns(player), openID == activeOpen else { return }
+        if wantsPlaying, !seeking, !backgroundSuspended { core?.play() }
     }
     func changeLoadState(player: some MediaPlayerProtocol) { if owns(player) { sample() } }
     func changeBuffering(player: some MediaPlayerProtocol, progress: Int) { if owns(player) { sample() } }
     func playBack(player: some MediaPlayerProtocol, loopCount: Int) {}
     func finish(player: some MediaPlayerProtocol, error: Error?) {
         guard owns(player) else { return }
-        if error == nil { position = duration; wantsPlaying = false; paused = true; buffering = false }
+        if error == nil {
+            // An EOF already queued before pause/interruption must not loop or
+            // advance. The current transport intent owns this decision.
+            guard wantsPlaying, !audioInterrupted, !pausedForDeviceLock, !backgroundSuspended else { return }
+            if options?.isLiveStreaming == true {
+                // A live response ending is a disconnect. Retain the viewer's
+                // play intent so same-channel failover can reopen playing.
+                onFinish?(KSPlaybackFailure(message: "直播连接已结束，请重试或切换线路。"))
+                return
+            }
+            position = duration; wantsPlaying = false; paused = true; buffering = false
+        }
         onFinish?(error)
     }
 }

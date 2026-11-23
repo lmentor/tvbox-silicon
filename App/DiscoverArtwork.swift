@@ -109,6 +109,51 @@ actor DiscoverPainter {
     }
 }
 
+/// A static native cover for details with no usable artwork. The lower edge uses the same
+/// surface as the entire page, so short artwork containers never leave a visible colour seam.
+struct DetailArtworkPlaceholder: View {
+    static let surface = Color(white: 0.06)
+    let width: CGFloat
+    let height: CGFloat
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Self.surface
+            RadialGradient(colors: [Brand.indigo.opacity(0.20), Brand.cyan.opacity(0.055), .clear],
+                           center: UnitPoint(x: 0.5, y: 0.26), startRadius: 0, endRadius: max(width * 0.8, 1))
+                .mask(LinearGradient(stops: [.init(color: .black, location: 0),
+                                             .init(color: .black, location: 0.5),
+                                             .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom))
+        }
+        .frame(width: width, height: height)
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+    }
+}
+
+/// The emblem belongs to the scrolling header, so it cannot sit behind lower sections on iOS 16.
+struct DetailArtworkEmblem: View {
+    var compact = false
+    private var size: CGFloat { compact ? 62 : 100 }
+
+    var body: some View {
+        VStack(spacing: compact ? 8 : 14) {
+            Image(systemName: "film")
+                .font(.system(size: size * 0.44, weight: .light))
+                .foregroundStyle(.white.opacity(0.55))
+                .frame(width: size, height: size)
+                .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: size * 0.24, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                        .strokeBorder(.white.opacity(0.10), lineWidth: 1)
+                }
+            Text("暂无海报").font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.5))
+        }
+        .accessibilityElement(children: .ignore).accessibilityLabel("暂无海报")
+        .allowsHitTesting(false)
+    }
+}
+
 /// Lives behind the scroll view. Only the cover responds to scroll; the sampled surface stays
 /// screen-sized. The image is already progressively blurred, avoiding live full-screen blur passes.
 struct DiscoverBackdrop: View {
@@ -118,6 +163,13 @@ struct DiscoverBackdrop: View {
     let scrollY: CGFloat
     let trailer: TMDBMatch.Trailer?
     let playsTrailer: Bool
+    var showsArtworkPlaceholder = false
+    #if os(iOS)
+    @AppStorage(LocalTrailerPreferences.autoplayKey) private var autoplayTrailers = true
+    private var showsTrailer: Bool { autoplayTrailers && playsTrailer }
+    #else
+    private var showsTrailer: Bool { playsTrailer }
+    #endif
     @State private var videoReady = false
     /// Mac: the floating sidebar's width, which the split view reports as a leading inset.
     @State private var leadingInset: CGFloat = 0
@@ -131,7 +183,7 @@ struct DiscoverBackdrop: View {
                         Image(decorative: paint.image, scale: 1).resizable().scaledToFill()
                             .frame(width: width, height: heroHeight).clipped()
                     }
-                    if let trailer, playsTrailer {
+                    if let trailer, showsTrailer {
                         DiscoverTrailer(trailer: trailer).frame(width: width, height: heroHeight).clipped()
                     }
                     LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .leading, endPoint: .trailing)
@@ -149,18 +201,20 @@ struct DiscoverBackdrop: View {
             .discoverFullBleed()
             .accessibilityHidden(true)
             .appOnChange(of: trailer?.key) { _, _ in videoReady = false }
-            .appOnChange(of: playsTrailer) { _, plays in if !plays { videoReady = false } }
+            .appOnChange(of: showsTrailer) { _, plays in if !plays { videoReady = false } }
             #endif
         }
     }
     #if !os(tvOS)
     private var paintedBackdrop: some View {
         ZStack(alignment: .top) {
-            (paint?.color ?? Color(white: 0.06))
+            (paint?.color ?? DetailArtworkPlaceholder.surface)
             if let paint {
                 poster(paint)
+            } else if showsArtworkPlaceholder {
+                DetailArtworkPlaceholder(width: width, height: heroHeight)
             }
-            if let trailer, playsTrailer {
+            if let trailer, showsTrailer {
                 trailerLayer(trailer)
             }
         }
@@ -173,7 +227,7 @@ struct DiscoverBackdrop: View {
             .scaleEffect(1.2 + max(0, -scrollY) / max(heroHeight, 1), anchor: .center)
             .offset(y: -scrollY * 0.78)
             .opacity(Double(fade))
-            .opacity(videoReady ? 0 : 1)
+            .opacity(showsTrailer && videoReady ? 0 : 1)
             .frame(width: width, height: heroHeight, alignment: .top).clipped()
             .mask {
                 WithPerceptionTracking {

@@ -88,6 +88,7 @@ runtime_files += [
     for src in sorted((repo / 'Runtime/PythonHost/base').rglob('*.py')) if src.is_file()
 ]
 runtime_files.append((repo / 'App/Resources/local-html-home-sdk.js', app / 'local-html-home-sdk.js'))
+runtime_files.append((repo / 'App/Resources/local-html-home-responsive.js', app / 'local-html-home-responsive.js'))
 runtime_files += [
     (src, app / 'NodeHost' / src.relative_to(repo / 'Runtime/NodeHost'))
     for src in sorted((repo / 'Runtime/NodeHost').rglob('*')) if src.is_file()

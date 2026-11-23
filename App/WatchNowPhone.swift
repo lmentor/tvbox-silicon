@@ -84,27 +84,7 @@ struct WatchNowPhonePage: View {
             }
             .accessibilityIdentifier("home.continueWatching")
         }
-        if sections.contains(.pinnedSources) {
-            let pinned = store.orderedSites(config).filter { store.pinnedSources.contains($0, origin: config.origin) }
-            if !pinned.isEmpty {
-                VStack(alignment: .leading, spacing: 0) {
-                    WatchNowPhoneHeading(title: L10n.text("Pinned Sources"), action: { store.section = .sites })
-                    LazyVGrid(columns: Layout.cardColumns, spacing: Layout.cardSpacing) {
-                        WithPerceptionTracking {
-                            ForEach(pinned) { site in
-                                WithPerceptionTracking {
-                                    RouteLink { WithPerceptionTracking { SiteView(site: site, origin: config.origin, jarURL: config.spiderURL) } } label: { WithPerceptionTracking { SiteCard(site: site, marksPinned: false) } }
-                                        .tileButton().contextMenu { WithPerceptionTracking { PinSourceButton(site: site, origin: config.origin) } }
-                                        .accessibilityIdentifier("home.pinned." + site.key)
-                                }
-                            }
-                        }
-                    }
-                    .padding(.horizontal, DiscoverLayout.gutter)
-                }
-                .accessibilityIdentifier("home.pinnedSources")
-            }
-        }
+
         if sections.contains(.recommendations) { RecommendationsView(config: config, rails: true) }
         if sections.contains(.favorites), !store.favorites.items.isEmpty {
             WatchNowPhoneShelf(title: L10n.text("Favorites"), action: { store.section = .favorites }) {

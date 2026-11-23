@@ -32,6 +32,7 @@ enum NativeBASRenderer {
     static func sprites(_ effect: DanmakuEffect, age: Double, size: CGSize, scale: CGFloat, textScale: Double, maxCount: Int, pixelBudget: Int, cache: Cache? = nil, preferences: DanmakuText.Preferences = .init(), identity: UInt64 = 0) -> [DanmakuEngine.Sprite] {
         var result: [DanmakuEngine.Sprite] = []
         var remainingPixels = pixelBudget
+        let stage = DanmakuEngine.authoredStage(in: size)
         for (index, item) in effect.items.enumerated() {
             if result.count >= maxCount || remainingPixels <= 0 { break }
             guard age >= 0, age <= item.lifetime else { continue }
@@ -61,10 +62,10 @@ enum NativeBASRenderer {
                 image = bitmap; sourceBounds = CGRect(x: 0, y: 0, width: Double(bitmap.width) / Double(scale), height: Double(bitmap.height) / Double(scale))
             }
             let projection = max(0.001, abs(cos(state.rotateY * .pi / 180)))
-            let width = sourceBounds.width * CGFloat(state.scaleX * projection) * size.width / 1280
-            let height = sourceBounds.height * CGFloat(state.scaleY) * size.height / 720
-            let frame = CGRect(x: (CGFloat(state.x) + sourceBounds.minX) * size.width / 1280 - width * CGFloat(state.anchorX),
-                y: (CGFloat(state.y) + sourceBounds.minY) * size.height / 720 - height * CGFloat(state.anchorY), width: width, height: height)
+            let width = sourceBounds.width * CGFloat(state.scaleX * projection) * stage.width / 1280
+            let height = sourceBounds.height * CGFloat(state.scaleY) * stage.height / 720
+            let frame = CGRect(x: stage.minX + (CGFloat(state.x) + sourceBounds.minX) * stage.width / 1280 - width * CGFloat(state.anchorX),
+                y: stage.minY + (CGFloat(state.y) + sourceBounds.minY) * stage.height / 720 - height * CGFloat(state.anchorY), width: width, height: height)
             guard image.width * image.height <= remainingPixels else { continue }
             remainingPixels -= image.width * image.height
             result.append(DanmakuEngine.Sprite(image: image, frame: frame, opacity: state.opacity, rotation: state.rotateZ, id: identity + UInt64(index) + 1))

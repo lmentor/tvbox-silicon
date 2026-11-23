@@ -18,6 +18,7 @@ extension Store {
     private let store: Store
     private var active = false
     private var targets: [(MPRemoteCommand, Any)] = []
+    private var commandRevision = UUID()
     private var artworkURL: URL?
     private var artwork: MPMediaItemArtwork?
     private var artworkTask: Task<Void, Never>?
@@ -39,6 +40,7 @@ extension Store {
         var canAdvance: Bool
         var seeking: Double?
         var timeline: UUID
+        var activePlayback: Bool
         var video: Bool
     }
 
@@ -46,7 +48,8 @@ extension Store {
         let music = store.music
         return State(track: music.track?.id, phase: music.phase, duration: music.duration, index: music.queue?.index,
                      count: music.queue?.tracks.count ?? 0, canAdvance: music.canAdvance,
-                     seeking: music.seekingTo, timeline: music.timelineRevision, video: store.playing != nil)
+                     seeking: music.seekingTo, timeline: music.timelineRevision,
+                     activePlayback: music.keepsNowPlayingActive, video: store.playing != nil)
     }
 
     private func observe() {
@@ -60,6 +63,7 @@ extension Store {
         guard let track = music.track, store.playing == nil else {
             if active {
                 active = false
+                commandRevision = UUID()
                 for (command, target) in targets { command.removeTarget(target) }
                 targets = []
                 center.nowPlayingInfo = nil
@@ -90,11 +94,9 @@ extension Store {
         if track.artwork != artworkURL { loadArtwork(track.artwork) }
         if let artwork { info[MPMediaItemPropertyArtwork] = artwork }
         center.nowPlayingInfo = info
-        center.playbackState = switch music.phase {
-        case .playing: .playing
-        case .idle: .stopped
-        default: .paused
-        }
+        // Resolving a new source is still an active playback request. Publishing
+        // it as paused lets the system relinquish ownership during a background gap.
+        center.playbackState = music.phase == .idle ? .stopped : music.keepsNowPlayingActive ? .playing : .paused
     }
 
     private func loadArtwork(_ url: URL?) {
@@ -116,31 +118,50 @@ extension Store {
 
     private func addTargets() {
         let commands = MPRemoteCommandCenter.shared()
-        func on(_ command: MPRemoteCommand, _ action: @escaping @MainActor (MusicPlaybackSession, MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
+        func on(_ command: MPRemoteCommand, _ action: Action) {
             command.isEnabled = true
-            let target = command.addTarget { [weak self] event in
-                MainActor.assumeIsolated {
-                    guard let music = self?.store.music, music.track != nil else { return .noActionableNowPlayingItem }
-                    return action(music, event)
-                }
-            }
+            let target = command.addTarget(handler: Self.handler(action, owner: self, run: commandRevision))
             targets.append((command, target))
         }
-        on(commands.playCommand) { music, _ in
-            if music.phase != .playing && music.phase != .loading { music.toggle() }
+        on(commands.playCommand, .play)
+        on(commands.pauseCommand, .pause)
+        on(commands.togglePlayPauseCommand, .toggle)
+        on(commands.nextTrackCommand, .next)
+        on(commands.previousTrackCommand, .previous)
+        on(commands.changePlaybackPositionCommand, .position)
+    }
+
+    private enum Action: Sendable { case play, pause, toggle, next, previous, position }
+
+    /// MediaPlayer can invoke a command on its own queue. Copy only the command's
+    /// value across actors; neither the framework event nor the session leaves its owner.
+    private nonisolated static func handler(_ action: Action, owner: MusicRemoteControl, run: UUID) -> (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        { [weak owner] event in
+            let position = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime
+            if action == .position, position?.isFinite != true { return .commandFailed }
+            Task { @MainActor [weak owner] in
+                guard let owner, owner.commandRevision == run else { return }
+                owner.perform(action, position: position)
+            }
             return .success
         }
-        on(commands.pauseCommand) { music, _ in music.pause(); return .success }
-        on(commands.togglePlayPauseCommand) { music, _ in music.toggle(); return .success }
-        on(commands.nextTrackCommand) { music, _ in
-            guard music.canAdvance else { return .noSuchContent }
-            music.next(); return .success
+    }
+
+    private func perform(_ action: Action, position: Double?) {
+        guard active, store.playing == nil, store.music.track != nil else { return }
+        let music = store.music
+        switch action {
+        case .play:
+            if music.phase != .playing && music.phase != .loading { music.toggle() }
+        case .pause: music.pause()
+        case .toggle: music.toggle()
+        case .next: if music.canAdvance { music.next() }
+        case .previous: music.previous()
+        case .position: if music.canSeek, let position { music.seek(to: position) }
         }
-        on(commands.previousTrackCommand) { music, _ in music.previous(); return .success }
-        on(commands.changePlaybackPositionCommand) { music, event in
-            guard music.canSeek, let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            music.seek(to: event.positionTime); return .success
-        }
+        // Do not depend on a later Perception turn before returning ownership to
+        // Control Center, especially while a new source is still resolving.
+        update()
     }
 }
 #endif

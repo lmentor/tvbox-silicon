@@ -40,15 +40,28 @@ public struct PlaybackHistoryContext: Codable, Hashable, Sendable {
     /// The subscription selected when playback began. Empty means the standalone library.
     /// Older records infer their owner from their catalog origin without rewriting or deleting them.
     public var historyScope: String?
+    /// HTML records created before a stable work key may have different local video IDs
+    /// for each selection. Keep those IDs for resume, and group only confirmed provenance.
+    public var historySeriesID: String?
+    public var htmlHistoryProof: HTMLHomePlayback.HistoryProof?
     public var readingProgress: ReadingHistoryProgress?
+    /// Optional for older history files and backups. Only the current episode's
+    /// successfully loaded track is saved, not a title-wide automatic guess.
+    public var danmakuSelection: PlaybackDanmakuSelection?
     public var libraryScope: String? {
         if let historyScope { return historyScope.isEmpty ? nil : historyScope }
         return LocalMediaLibrary.isLocalSource(sourceKey) || sourceKey == CloudFiles.sourceKey ? nil : origin.absoluteString
     }
     public var historyIdentity: String {
         let source = Self.sourceIdentity(origin)
-        let catalog = source == origin ? id : EpisodeSkipSettings.scope(origin: source, source: sourceKey, video: videoID)
-        let parts = [libraryScope ?? "", catalog, episodeFlag, episodeID]
+        let proof = origin == LocalMediaLibrary.origin && sourceKey == "local.media.url" && htmlHistoryProof?.isValid == true ? htmlHistoryProof : nil
+        let catalog = EpisodeSkipSettings.scope(origin: source, source: sourceKey, video: proof == nil ? videoID : historySeriesID ?? videoID)
+        var parts = [libraryScope ?? "", catalog]
+        // A synchronized alias is meaningful only with valid, equally owned
+        // evidence. Invalid or missing metadata must never erase a resume row.
+        if let proof { parts += [proof.sourceID, proof.workDigest.map { "work:" + $0 } ?? "title:" + proof.titleDigest] }
+        // A cloud folder is not a catalog series: it can contain unrelated films.
+        if sourceKey == CloudFiles.sourceKey { parts += [episodeFlag, episodeID] }
         return parts.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
     }
     public var id: String { EpisodeSkipSettings.scope(origin: origin, source: sourceKey, video: videoID) }
@@ -89,6 +102,25 @@ public struct PlaybackHistoryContext: Codable, Hashable, Sendable {
             self = replacingPoster(artwork.poster, headers: artwork.headers, confirmed: artwork.isConfirmed ?? true,
                                    confirmedAt: artwork.confirmedAt ?? .distantPast)
         }
+        self = restoringHTMLSeriesIdentity()
+    }
+
+    fileprivate func restoringHTMLSeriesIdentity() -> Self {
+        guard htmlHistoryProof?.isValid != true else { return self }
+        var result = self
+        result.htmlHistoryProof = nil
+        result.historySeriesID = nil
+        guard origin == LocalMediaLibrary.origin, sourceKey == "local.media.url", videoID.hasPrefix("html-media-"),
+              let record = LocalMediaLibrary.shared.record(sourceKey: sourceKey, id: videoID),
+              let reference = record.htmlHome else { return result }
+        let homepage = LocalHTMLHomeStore.load().sources.first { $0.id == reference.sourceID }?.address
+        result.htmlHistoryProof = HTMLHomePlayback.historyProof(sourceID: reference.sourceID, workID: reference.workID,
+            title: record.video.name, episodes: reference.episodes, fallbackPages: [reference.fallbackPage, homepage].compactMap { $0 },
+            selectedEpisodeID: episodeID)
+        result.historySeriesID = result.htmlHistoryProof == nil ? nil : reference.historyID
+            ?? HTMLHomePlayback.historyID(sourceID: reference.sourceID, workID: reference.workID,
+                                          title: record.video.name, episodes: reference.episodes, fallbackPage: reference.fallbackPage ?? homepage)
+        return result
     }
 
     public func replacingPoster(_ poster: URL?, headers: [String: String] = [:], confirmed: Bool = false,
@@ -202,6 +234,10 @@ extension PlaybackHistoryEntry {
         let confirmedAt: Date
     }
     @PerceptionIgnored private var confirmedArtwork: [Artwork] = []
+    /// A progress tick reuses the already-read catalog proof, including a failed
+    /// lookup, instead of rereading the local registry and source settings.
+    @PerceptionIgnored private var htmlContexts: [String: PlaybackHistoryContext] = [:]
+    @PerceptionIgnored private var danmakuDecisions: [(context: PlaybackHistoryContext, selection: PlaybackDanmakuSelection?)] = []
     private let cache: MediaCache
     /// Store updates this when the selected subscription changes during playback. Nil leaves explicit
     /// contexts alone (imports); an empty string records in the standalone library.
@@ -223,9 +259,8 @@ extension PlaybackHistoryEntry {
             entriesRevision = persistence.latestRevision
         } else if let data = try? Data(contentsOf: file), data.count <= 32 * 1024 * 1024,
            let decoded = try? JSONDecoder().decode([PlaybackHistoryEntry].self, from: data) {
-            var seen = Set<String>()
-            entries = Self.bounded(decoded.filter { Self.valid($0) }.sorted { $0.updatedAt > $1.updatedAt }
-                .filter { seen.insert($0.id).inserted })
+            entries = Self.consolidated(decoded)
+            if entries != decoded { persist() }
         }
         persistence.prioritize(entries, cache: cache)
     }
@@ -236,12 +271,14 @@ extension PlaybackHistoryEntry {
         if let reading = originalContext.readingProgress {
             guard reading.isValid else { return }
         } else if position < 1 { return }
-        var context = originalContext
+        var context = restoredHTMLContext(originalContext)
         if context.poster != nil, PosterPresentation.imageURL(context.poster, excluding: [context.videoID, context.episodeID]) == nil {
             context = context.replacingPoster(nil, confirmedAt: context.posterConfirmedAt)
         }
         if let recordingScope { context.historyScope = recordingScope }
         refreshPendingEntries()
+        context = Self.matchingHTMLSeries(context, in: entries)
+        context.danmakuSelection = danmakuSelection(for: context)
         if let known = confirmedArtwork.last(where: { $0.context.id == context.id && $0.context.libraryScope == context.libraryScope }),
            context.artworkDecisionDate == nil || known.confirmedAt > (context.artworkDecisionDate ?? .distantPast) {
             context = context.replacingPoster(known.poster, headers: known.headers, confirmed: known.confirmed, confirmedAt: known.confirmedAt)
@@ -274,6 +311,40 @@ extension PlaybackHistoryEntry {
                               onlyIfUnchanged: Bool = false, decidedAt: Date = Date()) {
         guard let poster = PosterPresentation.imageURL(poster, excluding: [reference.videoID, reference.episodeID]) else { return }
         decideArtwork(for: reference, poster: poster, headers: headers, confirmed: true, onlyIfUnchanged: onlyIfUnchanged, decidedAt: decidedAt)
+    }
+
+    private static func sameDanmakuEpisode(_ lhs: PlaybackHistoryContext, _ rhs: PlaybackHistoryContext) -> Bool {
+        lhs.libraryScope == rhs.libraryScope && sameDanmakuWork(lhs, rhs) &&
+        lhs.episodeFlag == rhs.episodeFlag &&
+        lhs.episodeName == rhs.episodeName &&
+        (lhs.episodeID == rhs.episodeID || !lhs.episodeName.isEmpty)
+    }
+    private static func sameDanmakuWork(_ lhs: PlaybackHistoryContext, _ rhs: PlaybackHistoryContext) -> Bool {
+        lhs.sourceKey == rhs.sourceKey && lhs.videoID == rhs.videoID &&
+        PlaybackHistoryContext.sourceIdentity(lhs.origin) == PlaybackHistoryContext.sourceIdentity(rhs.origin)
+    }
+
+    public func danmakuSelection(for context: PlaybackHistoryContext) -> PlaybackDanmakuSelection? {
+        refreshPendingEntries()
+        if let decision = danmakuDecisions.last(where: { Self.sameDanmakuEpisode($0.context, context) }) { return decision.selection }
+        return entries.first(where: { Self.sameDanmakuEpisode($0.context, context) })?.context.danmakuSelection ?? context.danmakuSelection
+    }
+
+    /// A selection can finish before the first progress sample. Retain that
+    /// decision so a later sample carrying the original Channel cannot erase it.
+    public func updateDanmaku(for context: PlaybackHistoryContext, selection: PlaybackDanmakuSelection?) {
+        guard isEnabled else { return }
+        refreshPendingEntries()
+        danmakuDecisions.removeAll { Self.sameDanmakuEpisode($0.context, context) }
+        danmakuDecisions.append((context, selection))
+        if danmakuDecisions.count > 32 { danmakuDecisions.removeFirst(danmakuDecisions.count - 32) }
+        var changed = false
+        entries = entries.map { entry in
+            guard Self.sameDanmakuEpisode(entry.context, context), entry.context.danmakuSelection != selection else { return entry }
+            var updated = entry.context; updated.danmakuSelection = selection; changed = true
+            return PlaybackHistoryEntry(context: updated, position: entry.position, duration: entry.duration, updatedAt: entry.updatedAt)
+        }
+        if changed { persist(); onChange?() }
     }
     /// A rejected match is a newer decision even when the fallback has no image. Old sessions and
     /// optional cache writes cannot turn that explicit choice back into the former TMDB cover.
@@ -314,10 +385,7 @@ extension PlaybackHistoryEntry {
 
     /// Another device's merged history. Removing progress leaves the independent cache and skip preferences intact.
     public func adopt(_ synced: [PlaybackHistoryEntry]) {
-        var seen = Set<String>()
-        let next = Self.bounded(synced.filter { Self.valid($0) }.sorted { $0.updatedAt > $1.updatedAt }
-            .filter { seen.insert($0.id).inserted })
-        entries = next
+        entries = Self.consolidated(synced)
         persist()
     }
 
@@ -338,13 +406,78 @@ extension PlaybackHistoryEntry {
             var context = entry.context; context.historyScope = owner; changed = true
             return PlaybackHistoryEntry(context: context, position: entry.position, duration: entry.duration, updatedAt: entry.updatedAt)
         }
-        if changed { persist() }
+        if changed { entries = Self.consolidated(entries); persist() }
     }
     public func clear(scope: String?) {
         refreshPendingEntries()
         remove(Set(entries(in: scope).map(\.id)))
     }
     public func clear() { entries.removeAll(); persist(); onChange?() }
+    private func restoredHTMLContext(_ context: PlaybackHistoryContext) -> PlaybackHistoryContext {
+        guard context.origin == LocalMediaLibrary.origin, context.videoID.hasPrefix("html-media-"),
+              context.htmlHistoryProof?.isValid != true else { return context.restoringHTMLSeriesIdentity() }
+        if let cached = htmlContexts[context.id] {
+            var result = context
+            result.historySeriesID = cached.historySeriesID
+            result.htmlHistoryProof = cached.htmlHistoryProof
+            return result
+        }
+        let restored = context.restoringHTMLSeriesIdentity()
+        if htmlContexts.count >= 64 { htmlContexts.removeAll(keepingCapacity: true) }
+        htmlContexts[context.id] = restored
+        return restored
+    }
+    private static func matchingHTMLSeries<S: Sequence>(_ context: PlaybackHistoryContext, in values: S) -> PlaybackHistoryContext
+        where S.Element == PlaybackHistoryEntry {
+        guard context.origin == LocalMediaLibrary.origin, context.sourceKey == "local.media.url",
+              let proof = context.htmlHistoryProof, proof.isValid else { return context }
+        let references = Set(proof.referenceDigests)
+        var candidates: [PlaybackHistoryContext] = []
+        for entry in values {
+            let other = entry.context
+            guard other.libraryScope == context.libraryScope, other.origin == context.origin, other.sourceKey == context.sourceKey,
+                  let otherProof = other.htmlHistoryProof, proof.hasSameOwnerAndWork(as: otherProof), otherProof.isValid else { continue }
+            // A previously proven alias or the same exact snapshot keeps its
+            // established identity when a later independent candidate appears.
+            if other.id == context.id || other.historyIdentity == context.historyIdentity {
+                var result = context
+                result.historySeriesID = other.historySeriesID ?? other.videoID
+                result.htmlHistoryProof = proof.including(otherProof)
+                return result
+            }
+            if proof.workDigest != nil || otherProof.referenceDigests.contains(where: references.contains) { candidates.append(other) }
+        }
+        guard candidates.count == 1, let candidate = candidates.first, let previous = candidate.htmlHistoryProof else { return context }
+        var result = context
+        result.historySeriesID = candidate.historySeriesID ?? candidate.videoID
+        result.htmlHistoryProof = proof.including(previous)
+        return result
+    }
+    private static func consolidated(_ values: [PlaybackHistoryEntry]) -> [PlaybackHistoryEntry] {
+        var htmlContexts: [String: PlaybackHistoryContext] = [:]
+        let normalized = values.filter { valid($0) }.map { entry in
+            var context = entry.context
+            if context.htmlHistoryProof?.isValid != true {
+                if let cached = htmlContexts[context.id] {
+                    context.historySeriesID = cached.historySeriesID
+                    context.htmlHistoryProof = cached.htmlHistoryProof
+                }
+                else { context = context.restoringHTMLSeriesIdentity(); htmlContexts[context.id] = context }
+            }
+            return context == entry.context ? entry : PlaybackHistoryEntry(context: context, position: entry.position,
+                                                                          duration: entry.duration, updatedAt: entry.updatedAt)
+        }
+        var result: [String: PlaybackHistoryEntry] = [:]
+        // Each chronological snapshot may extend exactly one known predecessor.
+        // Deduplicating first would discard intermediate rolling-window proof.
+        for entry in normalized.sorted(by: { $0.updatedAt < $1.updatedAt }) {
+            let context = matchingHTMLSeries(entry.context, in: result.values)
+            let updated = context == entry.context ? entry : PlaybackHistoryEntry(context: context, position: entry.position,
+                                                                                  duration: entry.duration, updatedAt: entry.updatedAt)
+            result[updated.id] = updated
+        }
+        return bounded(result.values.sorted { $0.updatedAt > $1.updatedAt })
+    }
     private static func bounded(_ values: [PlaybackHistoryEntry]) -> [PlaybackHistoryEntry] {
         var counts: [String: Int] = [:]
         return values.filter { entry in

@@ -120,6 +120,7 @@ struct GlobalSearchView: View {
     @State private var entering = false
     #endif
     private var model: SearchModel { store.searchModel }
+    private var searchConfig: Subscription? { store.subscription ?? LocalSearchManga.catalog }
     private var paginationActive: Bool {
         #if os(iOS)
         localPageActive
@@ -136,23 +137,15 @@ struct GlobalSearchView: View {
     private var posters: [SearchPoster] { model.items }
     private var sourceItems: [SearchSourceItem] {
         #if os(iOS)
-        var items = model.matches.filter { model.includesInSelectedGroup($0.id) }.map { result in
+        let items = model.matches.filter { model.includesInSelectedGroup($0.id) }.map { result in
             SearchSourceItem(id: result.id, name: result.site.name,
                              count: model.videoCount(for: result.id),
                              dot: store.health(of: result.site).warning)
         }
-        // A saved source filter remains visible while that source's first page is still pending.
-        if let selected = model.selectedSource, !items.contains(where: { $0.id == selected }),
-           let site = store.subscription?.sites.first(where: { $0.id == selected }),
-           model.includesInSelectedGroup(site.id), model.asking.contains(site.key) {
-            let answered = model.results.contains { $0.id == selected }
-            items.append(.init(id: site.id, name: site.name, count: answered ? model.videoCount(for: site.id) : nil,
-                               dot: store.health(of: site).warning))
-        }
         return [.init(id: "", name: "全部站点", count: model.videoCount)] + items
         #else
         // Built-in sources can be selected while their first search is still in flight.
-        let builtins = (store.subscription?.sites ?? []).filter(\.isBuiltIn).filter { site in
+        let builtins = (searchConfig?.sites ?? []).filter(\.isBuiltIn).filter { site in
             model.includesInSelectedGroup(site.id) && model.total > 0 && (model.results.contains { $0.site.key == site.key } ||
                 (model.busy && model.asking.contains(site.key)))
         }.map { site in
@@ -177,37 +170,44 @@ struct GlobalSearchView: View {
                 .screenBackdrop()
                 .fullScreenCover(isPresented: $entering) { WithPerceptionTracking { searchEntry } }
                 .sheet(isPresented: $showFailures) { WithPerceptionTracking { failureDetails } }
-                .onAppear { if let config = store.subscription { model.resumeSuspended(config: config) } }
+                .onAppear { if let config = searchConfig { model.resumeSuspended(config: config) } }
                 // The keyboard's screen covers the page without leaving it, so a running search goes on under it.
                 .onDisappear { if !entering { endVisible = false; model.suspend() } }
             #else
             searchResultLayout
-                .topBar(hardEdge: true) { WithPerceptionTracking { if let config = store.subscription, showsHeader { searchHeader(config) } } }
+                #if os(iOS)
+                .searchPosterThumbnails()
+                #endif
+                .topBar(hardEdge: true) { WithPerceptionTracking { if let config = searchConfig, showsHeader { searchHeader(config) } } }
                 .screenBackdrop()
                 .screenTitle(L10n.text("Global Search"))
                 #if os(iOS)
                 .toolbar { ToolbarItem(placement: .navigationBarTrailing) { searchSettingsButton } }
                 .localGlassDialog(isPresented: $showsSearchSettings, title: "搜索设置", maxWidth: 560, maxHeight: 700, layout: .centered) {
                     WithPerceptionTracking {
-                        if let config = store.subscription { LocalSearchSettingsView(config: config) }
+                        if let config = searchConfig {
+                            LocalSearchSettingsView(config: config) {
+                                if !model.keyword.isEmpty { submit(config) }
+                            }
+                        }
                     }
                 }
                 .navigationBarTitleDisplayMode(.inline)
                 .appOnChange(of: localPageActive) { _, active in
-                    if active, let config = store.subscription {
+                    if active, let config = searchConfig {
                         model.resumeSuspended(config: config)
                         requestNextPage(config: config)
                     } else { model.suspend() }
                 }
                 #else
                 .toolbar { ToolbarItem(placement: .primaryAction) { searchSettingsButton } }
-                .sheet(isPresented: $showsSearchSettings) { if let config = store.subscription { LocalSearchSettingsView(config: config) } }
+                .sheet(isPresented: $showsSearchSettings) { if let config = searchConfig { LocalSearchSettingsView(config: config) } }
                 #endif
                 // The system search field, as on Sources and Live TV: under the title on iPhone and iPad, in the toolbar on
                 // the Mac. Only Return or the keyboard's Search key searches; clearing the field goes back to the recent searches.
                 .catalogSearchable(text: $model.draft, prompt: L10n.text("Search videos"))
                 .searchFieldFocused($inputFocused)
-                .onSubmit(of: .search) { if let config = store.subscription { submit(config) } }
+                .onSubmit(of: .search) { if let config = searchConfig { submit(config) } }
                 .appOnChange(of: model.draft) { _, draft in if draft.isEmpty && !model.keyword.isEmpty { model.reset() } }
                 #if os(iOS)
                 .scrollDismissesKeyboard(.interactively)
@@ -219,7 +219,7 @@ struct GlobalSearchView: View {
                     #if os(macOS)
                     if model.keyword.isEmpty { inputFocused = true }
                     #endif
-                    if paginationActive, let config = store.subscription {
+                    if paginationActive, let config = searchConfig {
                         model.resumeSuspended(config: config)
                         requestNextPage(config: config)
                     }
@@ -246,7 +246,7 @@ struct GlobalSearchView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(store.subscription == nil)
+            .disabled(searchConfig == nil)
             .accessibilityLabel("搜索设置")
             .accessibilityIdentifier("search.settings")
         }
@@ -261,22 +261,29 @@ struct GlobalSearchView: View {
         #if os(iOS)
         GeometryReader { geometry in
             WithPerceptionTracking {
-                let rail = !model.keyword.isEmpty && store.subscription != nil
-                let railWidth = min(208, max(104, geometry.size.width * (geometry.size.width < 600 ? 0.30 : 0.24)))
+                let rail = !model.keyword.isEmpty && searchConfig != nil
+                let width = min(Layout.maxWidth, max(0, geometry.size.width))
+                let compact = width < 600
+                let railInset: CGFloat = compact ? 8 : Layout.gutter
+                let railWidth = min(208, max(104, width * (compact ? 0.30 : 0.24)))
+                let resultsWidth = max(0, width - (rail ? railWidth + railInset : 0))
                 HStack(alignment: .top, spacing: 0) {
                     if rail {
                         SearchSiteRail(items: sourceItems, selection: model.selectedSource ?? "", waiting: model.busy,
-                                       compact: geometry.size.width < 600) { id in
+                                       compact: compact) { id in
                             model.select(id.isEmpty ? nil : id)
                         }
                         .frame(width: railWidth)
-                        .padding(.leading, geometry.size.width < 600 ? 8 : Layout.gutter)
+                        .padding(.leading, railInset)
                         .padding(.vertical, Layout.gutter)
                     }
-                    positionedSearchResults(usesSiteRail: rail)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // The viewport owns the column width. Lazy rows must not change
+                    // the HStack's proposal as new titles/posters scroll into view.
+                    positionedSearchResults(usesSiteRail: rail, viewportWidth: resultsWidth)
+                        .frame(width: resultsWidth)
+                        .frame(maxHeight: .infinity)
                 }
-                .frame(maxWidth: Layout.maxWidth, maxHeight: .infinity)
+                .frame(width: width)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -285,12 +292,12 @@ struct GlobalSearchView: View {
         #endif
     }
 
-    @ViewBuilder private func positionedSearchResults(usesSiteRail: Bool) -> some View {
+    @ViewBuilder private func positionedSearchResults(usesSiteRail: Bool, viewportWidth: CGFloat? = nil) -> some View {
         @AppBindable var model = model
         if #available(iOS 17, macOS 14, tvOS 17, *) {
             ScrollViewReader { reader in
                 WithPerceptionTracking {
-                    searchResults(usesSiteRail: usesSiteRail).scrollPosition(id: $model.scrollID)
+                    searchResults(usesSiteRail: usesSiteRail, viewportWidth: viewportWidth).scrollPosition(id: $model.scrollID)
                         .appOnChange(of: model.selectedSource) { _, _ in reader.scrollTo("search.top", anchor: .top) }
                         .appOnChange(of: model.selectedGroup) { _, _ in reader.scrollTo("search.top", anchor: .top) }
                         .appOnChange(of: model.keyword) { _, _ in reader.scrollTo("search.top", anchor: .top) }
@@ -300,7 +307,7 @@ struct GlobalSearchView: View {
             let savedID = model.scrollID
             ScrollViewReader { reader in
                 WithPerceptionTracking {
-                    searchResults(usesSiteRail: usesSiteRail)
+                    searchResults(usesSiteRail: usesSiteRail, viewportWidth: viewportWidth)
                         .task {
                             // Restoring after a title's back navigation needs the grid laid out first.
                             try? await Task.sleep(for: .milliseconds(60))
@@ -331,16 +338,16 @@ struct GlobalSearchView: View {
         }
     }
 
-    private func searchResults(usesSiteRail: Bool = false) -> some View {
+    private func searchResults(usesSiteRail: Bool = false, viewportWidth: CGFloat? = nil) -> some View {
         ScrollView {
             WithPerceptionTracking {
                 VStack(alignment: .leading, spacing: 24) {
                     #if os(tvOS)
-                    if let config = store.subscription, !model.keyword.isEmpty {
+                    if let config = searchConfig, !model.keyword.isEmpty {
                         searchHeader(config).padding(.horizontal, -Layout.gutter)
                     }
                     #endif
-                    if let config = store.subscription {
+                    if let config = searchConfig {
                         if model.keyword.isEmpty {
                             #if os(tvOS)
                             // Recent searches are on the keyboard's screen, with the suggestions.
@@ -361,7 +368,7 @@ struct GlobalSearchView: View {
                                     }.accessibilityIdentifier("search.sources.strip")
                                 }
                                 searchResultCaption
-                                searchResultContent(config, usesSiteRail: usesSiteRail)
+                                searchResultContent(config, usesSiteRail: usesSiteRail, viewportWidth: viewportWidth)
                             }
                             #else
                             searchResultContent(config, usesSiteRail: usesSiteRail)
@@ -371,7 +378,17 @@ struct GlobalSearchView: View {
                         EmptyResults(symbol: "magnifyingglass", title: L10n.text("No Sources Yet"), message: L10n.text("Add a TVBox subscription in Settings."),
                                      action: L10n.text("Settings"), actionSymbol: "gearshape") { store.section = .settings }
                     }
-                }.pageContainer().id("search.top")
+                }
+                #if os(iOS)
+                // Fix the scroll content as well as its viewport. An unconstrained
+                // padded lazy grid can acquire horizontal overflow/offset on iOS 16.
+                .frame(width: viewportWidth.map { max(0, $0 - Layout.gutter * 2) }, alignment: .leading)
+                .padding(Layout.gutter)
+                .frame(width: viewportWidth, alignment: .leading)
+                #else
+                .pageContainer()
+                #endif
+                .id("search.top")
             }
         }
         .coordinateSpace(name: "search.results")
@@ -382,6 +399,16 @@ struct GlobalSearchView: View {
         ScrollStrip(scrollTo: model.selectedGroup) {
             WithPerceptionTracking {
                 HStack(spacing: 4) {
+                    Button { model.selectGroup(nil) } label: {
+                        Text("全部").font(.subheadline.weight(.semibold)).lineLimit(1)
+                            .foregroundStyle(model.selectedGroup == nil ? Brand.accent : Color.secondary)
+                            .padding(.horizontal, 14).frame(minHeight: 44)
+                            .overlay(alignment: .bottom) {
+                                Rectangle().fill(model.selectedGroup == nil ? Brand.accent : .clear).frame(height: 2)
+                            }
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain).id("")
+                        .accessibilityAddTraits(model.selectedGroup == nil ? [.isSelected] : [])
                     ForEach(model.groups) { group in
                         WithPerceptionTracking {
                             let selected = model.selectedGroup == group.id
@@ -408,7 +435,7 @@ struct GlobalSearchView: View {
     }
 
     private var searchResultCaption: some View {
-        let selected = model.selectedSource.flatMap { id in store.subscription?.sites.first { $0.id == id } }
+        let selected = model.selectedSource.flatMap { id in model.matches.first { $0.id == id }?.site }
         return HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(selected.map { SourceLabel($0.name).text } ?? "全部结果").lineLimit(2)
             Spacer(minLength: 0)
@@ -420,7 +447,7 @@ struct GlobalSearchView: View {
     }
     #endif
 
-    @ViewBuilder private func searchResultContent(_ config: Subscription, usesSiteRail: Bool) -> some View {
+    @ViewBuilder private func searchResultContent(_ config: Subscription, usesSiteRail: Bool, viewportWidth: CGFloat? = nil) -> some View {
         #if os(iOS)
         let emptyGroup = model.groups.first { $0.id == model.selectedGroup }?.siteIDs.isEmpty == true
         #else
@@ -450,7 +477,8 @@ struct GlobalSearchView: View {
                 emptyResults(config)
             }
         } else {
-            LazyVGrid(columns: resultColumns(usesSiteRail: usesSiteRail),
+            LazyVGrid(columns: resultColumns(usesSiteRail: usesSiteRail,
+                                            contentWidth: viewportWidth.map { max(0, $0 - Layout.gutter * 2) }),
                       spacing: listed ? Layout.gridSpacing : Layout.gridRowSpacing) {
                 WithPerceptionTracking { resultLinks(config) }
             }.appScrollTargetLayout().tvFocusSection()
@@ -474,8 +502,14 @@ struct GlobalSearchView: View {
         }
     }
 
-    private func resultColumns(usesSiteRail: Bool) -> [GridItem] {
+    private func resultColumns(usesSiteRail: Bool, contentWidth: CGFloat? = nil) -> [GridItem] {
         #if os(iOS)
+        if let contentWidth {
+            let minimum = listed ? 320 : Layout.posterMin
+            let count = listed && usesSiteRail ? 1 : max(1, Int((contentWidth + Layout.gridSpacing) / (minimum + Layout.gridSpacing)))
+            let cellWidth = max(0, (contentWidth - CGFloat(count - 1) * Layout.gridSpacing) / CGFloat(count))
+            return Array(repeating: GridItem(.fixed(cellWidth), spacing: Layout.gridSpacing, alignment: .top), count: count)
+        }
         if listed, usesSiteRail { return [GridItem(.flexible(minimum: 0), alignment: .top)] }
         if listed { return Self.rowColumns }
         return [GridItem(.adaptive(minimum: Layout.posterMin), spacing: Layout.gridSpacing, alignment: .top)]
@@ -548,7 +582,7 @@ struct GlobalSearchView: View {
                         VStack(alignment: .leading, spacing: 24) {
                             // Editing, dictation and search completions only update the draft. The remote
                             // needs an explicit, focusable submit action before starting expensive plugins.
-                            if let config = store.subscription {
+                            if let config = searchConfig {
                                 let query = model.draft.trimmingCharacters(in: .whitespacesAndNewlines)
                                 if !query.isEmpty, query != model.keyword {
                                     SearchQueryButton(query: query) { submit(config) }.accessibilityIdentifier("search.submit")
@@ -572,7 +606,7 @@ struct GlobalSearchView: View {
                     }
                 }
                 .task(id: model.draft) { await suggest(model.draft) }
-                .onSubmit(of: .search) { if let config = store.subscription { submit(config) } }
+                .onSubmit(of: .search) { if let config = searchConfig { submit(config) } }
                 .screenBackdrop()
             }
         }
@@ -824,8 +858,12 @@ struct GlobalSearchView: View {
             WithPerceptionTracking {
                 RouteLink {
                     WithPerceptionTracking {
-                        CatalogDestination(video: item.video, client: CatalogClient(site: item.site, origin: config.origin, jarURL: config.spiderURL))
-                            .onAppear { rememberQuery() }
+                        if let comic = model.comic(for: item) {
+                            MangaDetailView(comic: comic).onAppear { rememberQuery() }
+                        } else {
+                            CatalogDestination(video: item.video, client: CatalogClient(site: item.site, origin: config.origin, jarURL: config.spiderURL))
+                                .onAppear { rememberQuery() }
+                        }
                     }
                 } label: {
                     WithPerceptionTracking {
@@ -862,7 +900,12 @@ struct GlobalSearchView: View {
         let detail = [video.year, video.category?.split(separator: ",").first.map(String.init)].compactMap { $0 }.joined(separator: " · ")
         return HStack(alignment: .top, spacing: 12) {
             Color.clear.frame(width: 64, height: 96)
-                .overlay { WithPerceptionTracking { PosterImage(url: video.poster, headers: video.posterHeaders) } }
+                .overlay {
+                    WithPerceptionTracking {
+                        if let comic = model.comic(for: item) { MangaCover(source: comic.sourceKey, url: comic.cover) }
+                        else { PosterImage(url: video.poster, headers: video.posterHeaders) }
+                    }
+                }
                 .posterClip(RoundedRectangle(cornerRadius: 8, style: .continuous))
             VStack(alignment: .leading, spacing: 4) {
                 Text(video.name).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
@@ -876,10 +919,10 @@ struct GlobalSearchView: View {
                 Spacer(minLength: 0)
                 Text(SourceLabel(item.site.name).text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
         .padding(8)
-        .frame(maxWidth: .infinity, minHeight: 112, alignment: .leading)
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 112, alignment: .leading)
         // A plain fill, not glass: a long list of results would otherwise draw a glass layer per row.
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -888,7 +931,8 @@ struct GlobalSearchView: View {
     private func searchPoster(_ item: SearchPoster) -> some View {
         #if os(iOS)
         return VStack(alignment: .leading, spacing: 4) {
-            LocalSitePosterCard(video: item.video, landscape: false)
+            if let comic = model.comic(for: item) { MangaCard(comic: comic) }
+            else { LocalSitePosterCard(video: item.video, landscape: false) }
             Text([item.video.year, SourceLabel(item.site.name).text].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
         }
@@ -969,7 +1013,7 @@ struct GlobalSearchView: View {
     }
 
     private func pauseNote(_ site: Site) -> String {
-        guard let until = store.subscription.flatMap({ SourceHealth.shared.pausedUntil(site, origin: $0.origin) }) else {
+        guard let until = searchConfig.flatMap({ SourceHealth.shared.pausedUntil(site, origin: $0.origin) }) else {
             return L10n.text("Skipped after repeated failures")
         }
         return L10n.text("Skipped after repeated failures; back in search at %@", until.formatted(date: .omitted, time: .shortened))
@@ -1008,7 +1052,7 @@ struct GlobalSearchView: View {
                     WithPerceptionTracking {
                         HStack {
                             Button(L10n.text("Retry failed sources")) {
-                                if let config = store.subscription { model.resume(config: config, retryFailures: true) }
+                                if let config = searchConfig { model.resume(config: config, retryFailures: true) }
                                 showFailures = false
                             }.controlButton(prominent: true).disabled(model.busy || (model.failures.isEmpty && model.paused.isEmpty))
                             Spacer()
@@ -1022,7 +1066,7 @@ struct GlobalSearchView: View {
                         ToolbarItem(placement: .confirmationAction) { Button(L10n.text("Done")) { showFailures = false } }
                         ToolbarItem(placement: .primaryAction) {
                             Button(L10n.text("Retry failed sources")) {
-                                if let config = store.subscription { model.resume(config: config, retryFailures: true) }
+                                if let config = searchConfig { model.resume(config: config, retryFailures: true) }
                                 showFailures = false
                             }.disabled(model.busy || (model.failures.isEmpty && model.paused.isEmpty))
                         }
@@ -1040,7 +1084,7 @@ struct GlobalSearchView: View {
 
     private func useHistory(_ item: String) {
         model.draft = item
-        if let config = store.subscription { submit(config) }
+        if let config = searchConfig { submit(config) }
     }
 
     private func removeSearch(_ item: String) {

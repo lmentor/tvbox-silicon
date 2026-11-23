@@ -396,10 +396,7 @@ public actor LXSourceRuntime {
         }
         if let value = envelope["value"], value["error"] == nil { return value }
         let reason = envelope["error"]?.string ?? envelope["value"]?["error"]?.string ?? ""
-        if reason.contains("interrupted") || reason.contains("timeout") {
-            throw MusicProviderError.timeout
-        }
-        throw MusicProviderError.noResource
+        throw MusicProviderError.sourceFailure(reason)
     }
 
     func musicStream(_ source: LXSource, library: LXSourceLibrary, key: String, quality: String,
@@ -509,6 +506,26 @@ public struct LXMusicProvider: MusicStreamProvider {
         try await resolve(songID, platform: platform, track: nil, quality: quality)
     }
 
+    public func candidates(songID: String, platform: MusicPlatform) -> [MusicCandidate] {
+        sources.filter { $0.actions == nil || $0.sources[LXSourceKey.key(platform)] != nil }.map {
+            MusicCandidate(platform: platform, songID: songID, provider: id, sourceID: $0.id, sourceName: $0.info.name)
+        }
+    }
+
+    public func resolve(_ candidate: MusicCandidate, track: MusicTrack?, quality: MusicAudioQuality) async throws -> ResolvedMusicStream {
+        guard let sourceID = candidate.sourceID else {
+            return try await resolve(candidate.songID, platform: candidate.platform, track: track, quality: quality)
+        }
+        guard let source = sources.first(where: { $0.id == sourceID }) else { throw MusicProviderError.noResource }
+        let deadline = Date().addingTimeInterval(8)
+        let metadata = try? await MusicHTTP.withTimeout(2) {
+            try await LXMusicMetadata.shared.info(songID: candidate.songID, platform: candidate.platform, track: track, transport: transport)
+        }
+        try Task.checkCancellation()
+        return try await lookup(source, key: LXSourceKey.key(candidate.platform), platform: candidate.platform, track: track,
+                                quality: quality, info: metadata ?? LXSourceKey.musicInfo(songID: candidate.songID, platform: candidate.platform, track: track), deadline: deadline)
+    }
+
     public func resolve(_ songID: String, platform: MusicPlatform, track: MusicTrack?, quality: MusicAudioQuality) async throws -> ResolvedMusicStream {
         let deadline = Date().addingTimeInterval(12)
         let key = LXSourceKey.key(platform)
@@ -536,7 +553,7 @@ public struct LXMusicProvider: MusicStreamProvider {
                 group.addTask {
                     do {
                         return .success(try await lookup(source, key: key, platform: platform, track: track,
-                                                        quality: quality, info: info, deadline: min(deadline, Date().addingTimeInterval(4))))
+                                                        quality: quality, info: info, deadline: min(deadline, Date().addingTimeInterval(8))))
                     } catch { return .failure(MusicProviderError(error)) }
                 }
             }
@@ -567,7 +584,9 @@ public struct LXMusicProvider: MusicStreamProvider {
             guard let declared = capabilities[key] else { throw MusicProviderError.noResource }
             let tiers = LXSourceKey.qualities(from: declared, for: quality)
             var failure = MusicProviderError.noResource
+            var needsCompatibleTier = false
             for tier in tiers {
+                if needsCompatibleTier && !["320k", "192k", "128k"].contains(tier) { continue }
                 try Task.checkCancellation()
                 let left = deadline.timeIntervalSinceNow
                 guard left > 0.3 else { throw MusicProviderError.timeout }
@@ -592,6 +611,7 @@ public struct LXMusicProvider: MusicStreamProvider {
                 } catch {
                     try Task.checkCancellation()
                     failure = MusicProviderError(error)
+                    if case .unsupportedFormat = failure { needsCompatibleTier = true; continue }
                     if failure != .noResource { break }
                 }
             }

@@ -16,9 +16,16 @@ enum LocalHTMLHomePolicy {
         let suffix = port != nil && port != (scheme == "https" ? 443 : 80) ? ":\(port!)" : ""
         return "\(scheme)://\(host)\(suffix)"
     }
-    static func ownsDocument(_ url: URL?, origin expected: String, localFile: Bool) -> Bool {
-        guard let url else { return localFile }
-        if localFile { return url.scheme == "about" && (url.absoluteString.removingPercentEncoding ?? url.absoluteString).components(separatedBy: "#")[0] == "about:blank" }
+    static func ownsDocument(_ url: URL?, origin expected: String, localFile: Bool, fileURL: URL? = nil) -> Bool {
+        guard let url else { return false }
+        if localFile {
+            guard let fileURL, fileURL.isFileURL, url.isFileURL,
+                  var actual = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  var selected = URLComponents(url: fileURL, resolvingAgainstBaseURL: false) else { return false }
+            actual.fragment = nil; actual.query = nil
+            selected.fragment = nil; selected.query = nil
+            return actual.url == selected.url
+        }
         return origin(url) == expected && expected != "null"
     }
     static func address(_ input: String) throws -> URL {
@@ -28,6 +35,37 @@ enum LocalHTMLHomePolicy {
             throw LocalHTMLHomeError("首页仅可请求 HTTP / HTTPS 内容地址，不能访问应用内部地址。")
         }
         return url
+    }
+    /// A pan push sends a file identifier to a subscribed resolver. It is not
+    /// an HTTP request and must never grant net.request these extra schemes.
+    static func pushInput(_ input: String) throws -> String {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.utf8.count <= 32768,
+              !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+            throw LocalHTMLHomeError("推送链接无效或过长。")
+        }
+        if value.lowercased().hasPrefix("magnet:") {
+            guard value.lowercased().hasPrefix("magnet:?"),
+                  let parts = URLComponents(string: value),
+                  parts.queryItems?.contains(where: {
+                      $0.name.lowercased() == "xt" && $0.value?.range(
+                          of: #"^urn:(?:btih:(?:[0-9a-f]{40}|[a-z2-7]{32})|btmh:1220[0-9a-f]{64})$"#,
+                          options: [.regularExpression, .caseInsensitive]) != nil
+                  }) == true else {
+                throw LocalHTMLHomeError("磁力链接缺少有效的资源标识。")
+            }
+            return value
+        }
+        if value.lowercased().hasPrefix("ed2k:") {
+            let parts = value.components(separatedBy: "|")
+            guard parts.count >= 6, parts[0].lowercased() == "ed2k://", parts[1].lowercased() == "file",
+                  !parts[2].isEmpty, parts[3].utf8.allSatisfy({ (48...57).contains($0) }), let size = UInt64(parts[3]), size > 0,
+                  parts[4].count == 32, parts[4].utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
+                  parts.last == "/" else { throw LocalHTMLHomeError("ED2K 文件链接无效。") }
+            // Preserve the original separators, filename and hash for the spider.
+            return value
+        }
+        return try address(value).absoluteString
     }
     private static func isInternalHost(_ input: String) -> Bool {
         let host = input.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]."))

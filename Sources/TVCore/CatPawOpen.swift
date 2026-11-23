@@ -12,8 +12,14 @@ public enum CatPawOpen {
               let answer = try? await CatalogClient(site: site, origin: origin, jarURL: jarURL).catPawRequest(["catWebsite": "1"]),
               let address = answer["url"]?.string, let url = URL(string: address),
               url.scheme == "http", ["127.0.0.1", "localhost"].contains(url.host() ?? ""),
-              url.port != nil, url.path == "/website" else { return nil }
+              url.port != nil, ["/website", "/website/"].contains(url.path) else { return nil }
         return url
+    }
+
+    /// The current site's opt-in website, retaining the source's original key after merging.
+    public static func siteSettings(site: Site, origin: URL, jarURL: URL?) async -> URL? {
+        guard site.hasSiteSettings, let page = await configCenter(site: site, origin: origin, jarURL: jarURL) else { return nil }
+        return LocalSiteIntegration.website(page, site: site)
     }
 
     /// The bundle an added address names: its checksum file (`…/index.js.md5`) or the bundle itself.

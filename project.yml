@@ -3,7 +3,7 @@
     "base": {
       "DEVELOPMENT_TEAM": "",
       "SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator26.[2-9]*]": "$(inherited) TVBOX_SDK26_1",
-      "CURRENT_PROJECT_VERSION": "1",
+      "CURRENT_PROJECT_VERSION": "6",
       "ICLOUD_ENTITLEMENTS": "",
       "GENERATE_INFOPLIST_FILE": true,
       "SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator2[7-9]*]": "$(inherited) TVBOX_SDK26_1 TVBOX_SDK27",

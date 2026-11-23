@@ -164,9 +164,9 @@ struct MusicBrowseShelves: View {
 
     private func tiles(_ items: [MusicCollection]) -> some View {
         LazyHStack(alignment: .top, spacing: MusicBrowseMetrics.tileSpacing) {
-            WithPerceptionTracking {
-                ForEach(items) { perceptionArgument0 in WithPerceptionTracking { MusicCollectionTile(collection: perceptionArgument0, size: MusicBrowseMetrics.cover) } }
-            }
+            // Each tile already tracks its own state. Let the stack keep the
+            // offscreen covers lazy on iOS 16 rather than wrapping the whole shelf.
+            ForEach(items) { item in MusicCollectionTile(collection: item, size: MusicBrowseMetrics.cover) }
         }
     }
 }
@@ -186,9 +186,7 @@ struct MusicCollectionsPage: View {
                         #endif
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: MusicBrowseMetrics.cover, maximum: MusicBrowseMetrics.cover * 1.35), spacing: 20, alignment: .top)],
                                   alignment: .leading, spacing: 24) {
-                                      WithPerceptionTracking {
-                                ForEach(collections) { perceptionArgument0 in WithPerceptionTracking { MusicCollectionTile(collection: perceptionArgument0) } }
-                                      }
+                            ForEach(collections) { item in MusicCollectionTile(collection: item) }
                         }
                     }
                     .pageContainer()

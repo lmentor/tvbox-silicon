@@ -9,7 +9,7 @@ public enum SourceLists {
 
 public struct SourceGroup: Equatable, Sendable, Identifiable {
     public enum Kind: Equatable, Sendable {
-        case pinned, builtIn, subscription(String)
+        case builtIn, subscription(String)
         /// The sources the viewer hid, last on the page.
         case hidden
     }
@@ -18,7 +18,6 @@ public struct SourceGroup: Equatable, Sendable, Identifiable {
     public var sites: [Site]
     public var id: String {
         switch kind {
-        case .pinned: "pinned"
         case .builtIn: "builtIn"
         case .subscription(let address): address
         case .hidden: "hidden"
@@ -27,22 +26,16 @@ public struct SourceGroup: Equatable, Sendable, Identifiable {
 }
 
 public enum SourceGroups {
-    public static func make(entries: [SubscriptionEntry], documents: [String: Subscription], builtIns: [Site], builtInOrigin: URL, mergedSites: [Site], pinOrder: [Site], userHidden: (Site) -> Bool, includeHidden: Bool, jarURL: URL?) -> [SourceGroup] {
-        func isPinned(_ site: Site, fallback: URL) -> Bool {
-            let origin = site.origin(or: fallback)
-            return pinOrder.contains { $0.sourceKey == site.sourceKey && $0.origin(or: fallback) == origin }
-        }
+    public static func make(entries: [SubscriptionEntry], documents: [String: Subscription], builtIns: [Site], builtInOrigin: URL, mergedSites: [Site], userHidden: (Site) -> Bool, includeHidden: Bool, jarURL: URL?) -> [SourceGroup] {
         func eligible(_ site: Site) -> Bool {
             !site.hidden && site.canBrowse(jarURL: jarURL) && (includeHidden || !userHidden(site))
         }
         var groups: [SourceGroup] = []
-        let pinnedSites = pinOrder.filter(eligible)
-        if !pinnedSites.isEmpty { groups.append(SourceGroup(kind: .pinned, title: "Pinned Group", sites: pinnedSites)) }
-        let builtInSites = builtIns.filter { eligible($0) && !isPinned($0, fallback: builtInOrigin) }
+        let builtInSites = builtIns.filter { eligible($0) }
         if !builtInSites.isEmpty { groups.append(SourceGroup(kind: .builtIn, title: "Built-in", sites: builtInSites)) }
         for entry in entries where entry.enabled {
             guard let origin = documents[entry.address]?.origin else { continue }
-            let own = mergedSites.filter { !$0.isBuiltIn && $0.provenance?.origin == origin && !isPinned($0, fallback: origin) && eligible($0) }
+            let own = mergedSites.filter { !$0.isBuiltIn && $0.provenance?.origin == origin && eligible($0) }
             if !own.isEmpty { groups.append(SourceGroup(kind: .subscription(entry.address), title: entry.title, sites: own)) }
         }
         // Hidden sources leave their groups and wait in one group at the end, where they can be unhidden.
@@ -53,13 +46,13 @@ public enum SourceGroups {
         return groups
     }
 
-    /// The Watch Now source row. Pinned and built-in sources keep the order they were given.
+    /// The Watch Now source row. Built-in sources keep the order they were given.
     /// Every other source follows the sources page: one subscription after another, in that page's order.
     /// Hidden sources stay in their group on the sources page and do not join this row.
-    public static func homeRow(pinned: [Site], builtIn: [Site], groups: [SourceGroup]) -> [Site] {
-        let placed = Set((pinned + builtIn).map(\.id))
+    public static func homeRow(builtIn: [Site], groups: [SourceGroup]) -> [Site] {
+        let placed = Set(builtIn.map(\.id))
         let directory = groups.filter { $0.kind != .hidden }.flatMap(\.sites)
-        return pinned + builtIn + directory.filter { !placed.contains($0.id) }
+        return builtIn + directory.filter { !placed.contains($0.id) }
     }
 }
 

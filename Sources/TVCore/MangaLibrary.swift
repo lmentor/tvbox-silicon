@@ -29,6 +29,13 @@ public enum MangaLibrary {
             self.comic = comic; self.chapterID = chapterID; self.chapterTitle = chapterTitle; self.chapterIndex = chapterIndex
             self.chapterCount = chapterCount; self.page = page; self.pageCount = pageCount; self.updated = updated
         }
+        /// Keep the stable chapter ID when catalogs reorder; old/renamed IDs
+        /// still resume at a valid saved position, including one-shot comics.
+        public func position(in chapters: [MangaChapter], fromBeginning: Bool = false) -> (chapter: Int, page: Int) {
+            guard !fromBeginning else { return (0, 0) }
+            let chapter = chapters.firstIndex { $0.id == chapterID } ?? min(max(0, chapterIndex), max(0, chapters.count - 1))
+            return (chapter, max(0, page))
+        }
     }
 
     public struct Favorite: Codable, Hashable, Sendable, Identifiable {
@@ -51,9 +58,27 @@ public enum MangaLibrary {
 /// unscrambling hooks, then a disk cache, so a chapter opens again at once and pages read offline.
 public actor MangaImages {
     public static let shared = MangaImages()
-    public enum Kind: Sendable { case page, cover }
+    public enum Kind: Sendable, Hashable { case page, cover }
 
-    private var pending: [String: Task<Data, Error>] = [:]
+    private struct Request: Hashable, Sendable {
+        let source: String
+        let url: String
+        let kind: Kind
+        let comic: String?
+        let chapter: String?
+        var cacheKey: String { source + "\n" + url }
+        var maximumBytes: Int { kind == .cover ? 8 * 1024 * 1024 : 64 * 1024 * 1024 }
+    }
+    private struct Pending {
+        let id: UUID
+        var task: Task<Void, Never>?
+        var waiters: [UUID: CheckedContinuation<Data, Error>]
+    }
+    private struct Loaded: Sendable { let data: Data; let stored: Bool }
+    private var pending: [Request: Pending] = [:]
+    private var queued: [(request: Request, id: UUID)] = []
+    private var running = 0
+    private let concurrentLimit = 6
     private var thumbnailRequests: [String: (url: String, headers: [String: String])] = [:]
     private var writes = 0
     private static var folder: URL { URL.cachesDirectory.appending(path: "com.tvbox.yingxia/MangaImages", directoryHint: .isDirectory) }
@@ -74,29 +99,118 @@ public actor MangaImages {
     }
 
     public func data(source: String, url: String, kind: Kind, comic: String? = nil, chapter: String? = nil) async throws -> Data {
-        let key = source + "\n" + url
-        if let data = try? Data(contentsOf: Self.file(key)) { return data }
-        if let task = pending[key] { return try await task.value }
-        let thumbnail = kind == .cover ? thumbnailRequests[key] : nil
-        let task = Task { try await Self.download(source: source, url: url, kind: kind, comic: comic, chapter: chapter, thumbnail: thumbnail) }
-        pending[key] = task
-        defer { pending[key] = nil }
-        let data = try await task.value
-        try? FileManager.default.createDirectory(at: Self.folder, withIntermediateDirectories: true)
-        try? data.write(to: Self.file(key), options: .atomic)
-        writes += 1
-        if writes % 80 == 0 { Task.detached(priority: .background) { Self.trim() } }
-        return data
+        try Task.checkCancellation()
+        let request = Request(source: source, url: url, kind: kind, comic: comic, chapter: chapter)
+        let waiter = UUID()
+        return try await withTaskCancellationHandler {
+            let data: Data = try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                if var active = pending[request] {
+                    active.waiters[waiter] = continuation
+                    pending[request] = active
+                } else {
+                    let id = UUID()
+                    pending[request] = Pending(id: id, task: nil, waiters: [waiter: continuation])
+                    queued.append((request, id))
+                    startQueued()
+                }
+            }
+            try Task.checkCancellation()
+            return data
+        } onCancel: {
+            Task { await self.cancel(request, waiter: waiter) }
+        }
+    }
+
+    private func cancel(_ request: Request, waiter: UUID) {
+        guard var active = pending[request], let continuation = active.waiters.removeValue(forKey: waiter) else { return }
+        continuation.resume(throwing: CancellationError())
+        if active.waiters.isEmpty {
+            pending[request] = nil
+            active.task?.cancel()
+            queued.removeAll { $0.id == active.id }
+        } else { pending[request] = active }
+    }
+
+    private func startQueued() {
+        while running < concurrentLimit, !queued.isEmpty {
+            // A visible reader page takes the next free slot before queued covers.
+            let index = queued.firstIndex { $0.request.kind == .page } ?? queued.startIndex
+            let next = queued.remove(at: index)
+            guard var active = pending[next.request], active.id == next.id else { continue }
+            let thumbnail = next.request.kind == .cover ? thumbnailRequests[next.request.cacheKey] : nil
+            running += 1
+            active.task = Task.detached(priority: .utility) {
+                let result: Result<Loaded, Error>
+                do { result = .success(try await Self.read(next.request, thumbnail: thumbnail)) }
+                catch { result = .failure(error) }
+                await self.finish(next.request, id: next.id, result: result)
+            }
+            pending[next.request] = active
+        }
+    }
+
+    private func finish(_ request: Request, id: UUID, result: Result<Loaded, Error>) {
+        running -= 1
+        defer { startQueued() }
+        if case .success(let loaded) = result, loaded.stored {
+            writes += 1
+            if writes % 80 == 0 { Task.detached(priority: .background) { Self.trim() } }
+        }
+        guard let active = pending[request], active.id == id else { return }
+        pending[request] = nil
+        for waiter in active.waiters.values { waiter.resume(with: result.map(\.data)) }
+    }
+
+    private nonisolated static func read(_ request: Request, thumbnail: (url: String, headers: [String: String])?) async throws -> Loaded {
+        try Task.checkCancellation()
+        let cachedFile = file(request.cacheKey)
+        if let size = try? cachedFile.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > request.maximumBytes {
+            throw URLError(.dataLengthExceedsMaximum)
+        }
+        if let data = try? Data(contentsOf: cachedFile) {
+            guard data.count <= request.maximumBytes else { throw URLError(.dataLengthExceedsMaximum) }
+            try Task.checkCancellation()
+            return Loaded(data: data, stored: false)
+        }
+        let data = try await download(source: request.source, url: request.url, kind: request.kind,
+                                      comic: request.comic, chapter: request.chapter, thumbnail: thumbnail,
+                                      maximumBytes: request.maximumBytes)
+        try Task.checkCancellation()
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? data.write(to: cachedFile, options: .atomic)
+        return Loaded(data: data, stored: true)
     }
 
     private static func download(source: String, url: String, kind: Kind, comic: String?, chapter: String?,
-                                 thumbnail: (url: String, headers: [String: String])?) async throws -> Data {
+                                 thumbnail: (url: String, headers: [String: String])?, maximumBytes: Int) async throws -> Data {
         let runtime = MangaRuntime.shared
-        let info = try? await runtime.info(source)
+        let lease = try await runtime.imageLease(source, cover: kind == .cover)
+        let result: Result<Data, Error>
         var config: MangaRuntime.ImageConfig?
+        do {
+            let value = try await downloadInLease(lease, url: url, kind: kind, comic: comic, chapter: chapter,
+                                                  thumbnail: thumbnail, maximumBytes: maximumBytes, config: &config)
+            result = .success(value)
+        } catch { result = .failure(error) }
+        let completedConfig = config
+        // Both config release and native VM teardown belong to this image slot.
+        await Task.detached(priority: .utility) { await runtime.closeImageLease(lease, config: completedConfig) }.value
+        return try result.get()
+    }
+
+    private static func downloadInLease(_ lease: MangaRuntime.ImageLease, url: String, kind: Kind,
+                                        comic: String?, chapter: String?, thumbnail: (url: String, headers: [String: String])?,
+                                        maximumBytes: Int, config: inout MangaRuntime.ImageConfig?) async throws -> Data {
+        let runtime = MangaRuntime.shared
+        let info = lease.info
+        try Task.checkCancellation()
         var request: MangaHTTP.Request
-        if kind == .page, info?.hasImageConfig == true {
-            config = try await runtime.imageConfig(source, kind: "image", url: url, comic: comic, chapter: chapter)
+        if kind == .page, info.hasImageConfig {
+            config = try await runtime.imageConfig(lease, kind: "image", url: url, comic: comic, chapter: chapter)
+            request = config!.request
+        } else if kind == .cover, info.hasThumbnailConfig {
+            config = try await runtime.imageConfig(lease, kind: "thumbnail", url: url, comic: comic, chapter: chapter)
             request = config!.request
         } else if let thumbnail, let target = URL(string: thumbnail.url) {
             request = MangaHTTP.Request(url: target, headers: thumbnail.headers)
@@ -106,17 +220,26 @@ public actor MangaImages {
             }
             request = MangaHTTP.Request(url: target)
         }
-        defer { if let config { Task { await runtime.release(source, config: config.id) } } }
-        var (data, response) = try await MangaHTTP.data(request)
-        if !(200..<300).contains(response.statusCode), let config, config.onLoadFailed, let retry = await runtime.retryRequest(source, config: config.id) {
-            (data, response) = try await MangaHTTP.data(retry)
+        try Task.checkCancellation()
+        request.cookies = MangaCookieJar.forSource(info.key)
+        var (data, response) = try await MangaHTTP.data(request, maximumBytes: maximumBytes)
+        try Task.checkCancellation()
+        if !(200..<300).contains(response.statusCode), let config, config.onLoadFailed,
+           let retry = await runtime.retryRequest(lease, config: config.id) {
+            try Task.checkCancellation()
+            (data, response) = try await MangaHTTP.data(retry, maximumBytes: maximumBytes)
         }
+        try Task.checkCancellation()
         guard (200..<300).contains(response.statusCode) else { throw TVError.http(response.statusCode) }
-        if let config, config.onResponse { data = try await runtime.transformResponse(source, config: config.id, data: data) }
+        if let config, config.onResponse { data = try await runtime.transformResponse(lease, config: config.id, data: data) }
+        try Task.checkCancellation()
+        guard data.count <= maximumBytes else { throw URLError(.dataLengthExceedsMaximum) }
         if let config, config.modifyImage, let image = decode(data) {
-            let modified = try await runtime.modify(source, config: config.id, image: image)
+            let modified = try await runtime.modify(lease, config: config.id, image: image)
+            try Task.checkCancellation()
             if let encoded = encode(modified) { data = encoded }
         }
+        guard data.count <= maximumBytes else { throw URLError(.dataLengthExceedsMaximum) }
         guard CGImageSourceCreateWithData(data as CFData, nil).map({ CGImageSourceGetCount($0) > 0 }) == true else {
             throw TVError.unsupported(L10n.text("The source sent something that is not an image."))
         }
@@ -171,6 +294,17 @@ public actor MangaImages {
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: min(maximum, 16000),
+            kCGImageSourceShouldCacheImmediately: true,
+        ] as CFDictionary)
+    }
+
+    /// Search covers use a longest-side bound; reader strips retain bitmap(width:).
+    public nonisolated static func coverBitmap(_ data: Data, maxPixels: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixels),
             kCGImageSourceShouldCacheImmediately: true,
         ] as CFDictionary)
     }

@@ -5,21 +5,29 @@ struct LocalCacheSettingsView: View {
     @AppStorage("local.videoCache.enabled") private var enabled = true
     @AppStorage("local.videoCache.sizeGB") private var size = 1
     @AppStorage("local.playback.prefetchNext") private var prefetch = true
-    @State private var cachedBytes = 0
-    @State private var reusedBytes = 0
+    @State private var summary: MobileMediaServices.VideoCacheSummary?
     @State private var cacheStatus: String?
     @State private var clearing = false
+    @State private var retrying = false
     var body: some View {
         SettingsPage(title: "视频缓存", symbol: "internaldrive") {
-            SettingsGroup(title: "视频缓存", footer: "按播放请求缓存媒体数据，切换媒体和退出后释放。用户下载单独保留。") {
+            SettingsGroup(title: "视频缓存", footer: "缓存容量由当前播放与下一集预加载共用，切换媒体和退出后释放。用户下载单独保留。") {
                 Toggle("开启视频缓存", isOn: $enabled)
                 Picker("缓存容量", selection: $size) { ForEach(1...4, id: \.self) { Text("\($0) GB").tag($0) } }.disabled(!enabled)
                 Toggle("预加载下一集", isOn: $prefetch)
             }
             SettingsGroup(title: "缓存使用情况") {
-                SettingsRow(symbol: "internaldrive", tint: Brand.cyan, title: "已缓存 \(ByteCountFormatter.string(fromByteCount: Int64(cachedBytes), countStyle: .file))")
-                SettingsRow(symbol: "arrow.triangle.2.circlepath", tint: .blue, title: "已复用 \(ByteCountFormatter.string(fromByteCount: Int64(reusedBytes), countStyle: .file))")
-                if let cacheStatus { Text(cacheStatus).font(.footnote).foregroundStyle(.secondary) }
+                SettingsRow(symbol: "internaldrive", tint: Brand.cyan, title: summary?.usageText ?? "缓存用量暂不可用")
+                SettingsRow(symbol: "arrow.triangle.2.circlepath", tint: .blue, title: "已复用 \(ByteCountFormatter.string(fromByteCount: Int64(summary?.hits ?? 0), countStyle: .binary))")
+                if let status = enabled ? cacheStatus ?? summary?.statusText : "视频缓存已关闭" {
+                    Text(status).font(.footnote).foregroundStyle(.secondary)
+                }
+                if enabled && (summary?.failure != nil || cacheStatus != nil) {
+                    SettingsActionRow(title: retrying ? "重试中…" : "重试视频缓存") {
+                        retrying = true
+                        Task { await configureCache(); await refreshUsage(); retrying = false }
+                    }.disabled(retrying || clearing)
+                }
                 SettingsActionRow(title: clearing ? "清理中…" : "清理视频缓存", destructive: true) {
                     clearing = true
                     Task {
@@ -35,19 +43,31 @@ struct LocalCacheSettingsView: View {
             }
         }
         .task(id: "\(enabled):\(size)") {
-            do {
-                try await MobileMediaServices.configureVideoCache(enabled: enabled, sizeGB: size)
-                cacheStatus = nil
-            } catch { cacheStatus = "缓存服务暂不可用，下次播放会按当前设置重试。" }
+            await configureCache()
             while !Task.isCancelled {
                 await refreshUsage()
                 do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
             }
         }
     }
+    @MainActor private func configureCache() async {
+        do {
+            try await MobileMediaServices.configureVideoCache(enabled: enabled, sizeGB: size)
+            guard !Task.isCancelled else { return }
+            cacheStatus = nil
+        } catch {
+            if !Task.isCancelled { cacheStatus = "缓存服务暂不可用，可重试。" }
+        }
+    }
     @MainActor private func refreshUsage() async {
-        guard let value = try? await MobileMediaServices.videoCacheSummary(), !Task.isCancelled else { return }
-        cachedBytes = value.bytes; reusedBytes = value.hits
+        do {
+            let value = try await MobileMediaServices.videoCacheSummary()
+            guard !Task.isCancelled else { return }
+            summary = value; cacheStatus = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            summary = nil; cacheStatus = "缓存用量暂不可用，可重试。"
+        }
     }
 }
 

@@ -144,6 +144,32 @@ function rebuild(parsed, removed, markers) {
   return output;
 }
 
+// Use the exact rewritten/cleaned playlist delivered to FFmpeg. This is a
+// complete-segment timeline, never a byte-rate estimate or a network probe.
+export function hlsCacheTimeline(content, sourceUrl) {
+  const lines = String(content).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (!lines.includes('#EXT-X-ENDLIST') || lines.some(line => /^#EXT-X-(?:STREAM-INF|I-FRAME-STREAM-INF|MEDIA|DISCONTINUITY|PART|PART-INF|PRELOAD-HINT|DEFINE|SKIP|RENDITION-REPORT)(?::|$)/.test(line))) return null;
+  const parsed = mediaEntries(lines, sourceUrl);
+  if (parsed.invalid || !parsed.entries.length) return null;
+  let time = 0;
+  return parsed.entries.map(entry => {
+    const parts = [];
+    const part = (url, range) => {
+      const match = range?.match(/(\d+)@(\d+)$/);
+      const start = match ? Number(match[2]) : null, end = match ? start + Number(match[1]) : null;
+      parts.push({ url: absoluteUri(url, sourceUrl), range: match ? [start, end] : null });
+    };
+    part(entry.url, entry.byteRange);
+    if (entry.key?.METHOD === 'AES-128') part(entry.key.URI);
+    if (entry.map) {
+      const fields = attributes(entry.map.line); part(fields.URI, fields.BYTERANGE);
+      if (entry.map.key?.METHOD === 'AES-128') part(entry.map.key.URI);
+    }
+    const start = time; time += entry.duration;
+    return { start, end: time, parts };
+  });
+}
+
 export function cleanHlsPlaylist(content, sourceUrl, { enabled = true, rewriteUri } = {}) {
   const original = Buffer.isBuffer(content) ? content.toString('utf8') : String(content ?? '');
   if (!original.trimStart().startsWith('#EXTM3U')) return { content: original, removedSegments: 0, skippedReason: 'not-hls' };

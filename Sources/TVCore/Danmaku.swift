@@ -27,7 +27,13 @@ public enum DanmakuSource {
 
     static func register(_ url: URL, bilibiliCID cid: String, duration: Double?) {
         lock.withLock {
-            tracks[url.absoluteString] = Track(cid: cid, duration: duration); order.append(url.absoluteString)
+            let key = url.absoluteString
+            let previous = tracks[key]
+            // History restores the CID before loading comments, but playback
+            // resolution may already have supplied a concert's full duration.
+            let knownDuration = duration ?? (previous?.cid == cid ? previous?.duration : nil)
+            tracks[key] = Track(cid: cid, duration: knownDuration)
+            order.removeAll { $0 == key }; order.append(key)
             while order.count > 8 { tracks[order.removeFirst()] = nil }
         }
     }
@@ -58,6 +64,7 @@ public enum DanmakuSource {
 
     /// Whether the address has comments to load.
     public static func has(_ url: URL) -> Bool { lock.withLock { tracks[url.absoluteString] != nil } }
+    public static func bilibiliCID(for url: URL) -> String? { lock.withLock { tracks[url.absoluteString]?.cid } }
 
     /// The comments for a media address in time order, or nil when it has none.
     public static func comments(for url: URL, session: URLSession = .shared) async -> [Danmaku]? {
@@ -211,6 +218,9 @@ public struct DanmakuLayout {
         public let start: Double
         public let width: Double
         public let lane: Int
+        /// A late window or fallback glyph can exceed the established row pitch.
+        /// Reserve every row its actual bitmap occupies without moving older cues.
+        public var rowSpan: Int = 1
         /// Points per second; zero for fixed comments.
         public let speed: Double
     }
@@ -224,7 +234,9 @@ public struct DanmakuLayout {
 
     public init(width: Double, height: Double, laneHeight: Double, scrollArea: Double = 0.75, scrollDuration: Double = 8, fixedDuration: Double = 4, maxRows: Int = 0) {
         self.width = width; self.laneHeight = laneHeight; self.scrollDuration = scrollDuration; self.fixedDuration = fixedDuration
-        fixedLanes = max(1, Int(height * scrollArea / laneHeight))
+        // A small chosen area may not fit even one complete row. Do not force
+        // that row outside the area; a smaller font or larger area can fit it.
+        fixedLanes = max(0, Int(height * scrollArea / laneHeight))
         scrollLanes = min(maxRows > 0 ? maxRows : fixedLanes, fixedLanes)
         lanes = Array(repeating: nil, count: fixedLanes)
     }
@@ -245,35 +257,42 @@ public struct DanmakuLayout {
         // independent of the user's scrolling-speed preference.
         if placement.start > time {
             return Placement(comment: placement.comment, start: placement.start,
-                width: placement.width, lane: placement.lane, speed: speed)
+                width: placement.width, lane: placement.lane, rowSpan: placement.rowSpan, speed: speed)
         }
         let travelled = max(0, time - placement.start) * placement.speed
         return Placement(comment: placement.comment, start: time - travelled / speed,
-                         width: placement.width, lane: placement.lane, speed: speed)
+                         width: placement.width, lane: placement.lane, rowSpan: placement.rowSpan, speed: speed)
     }
 
-    public mutating func place(_ comment: Danmaku, width textWidth: Double, at time: Double) -> Placement? {
+    public mutating func place(_ comment: Danmaku, width textWidth: Double, height textHeight: Double = 0, at time: Double) -> Placement? {
         guard comment.position != .positioned else { return nil }
+        guard textHeight.isFinite, textHeight >= 0, laneHeight.isFinite, laneHeight > 0 else { return nil }
         let fixed = comment.position == .top || comment.position == .bottom
+        let rowLimit = fixed ? fixedLanes : scrollLanes
+        let requiredRows = max(1, ceil(textHeight / laneHeight - 0.000001))
+        guard requiredRows <= Double(rowLimit) else { return nil }
+        let rowSpan = Int(requiredRows)
         let speed = fixed ? 0 : (width + textWidth) / scrollDuration
         // MacCat schedules a shared 1280-point stage with a 36-point gap.
         // Scale that gap with the viewport, independently of text/line spacing.
         let gap = 36 * width / 1280
-        for ordinal in 0..<(fixed ? fixedLanes : scrollLanes) {
-            let lane = comment.position == .bottom ? fixedLanes - ordinal - 1 : ordinal
-            if let previous = lanes[lane] {
+        for ordinal in 0...(rowLimit - rowSpan) {
+            let lane = comment.position == .bottom ? fixedLanes - ordinal - rowSpan : ordinal
+            let rows = lane..<(lane + rowSpan)
+            let available = rows.allSatisfy { index in
+                guard let previous = lanes[index] else { return true }
                 let finish = previous.start + duration(previous)
-                if fixed {
-                    guard finish <= time else { continue }
-                } else if finish > time {
-                    guard previous.speed > 0,
-                          previous.comment.position == comment.position,
-                          previous.start + (previous.width + gap) / previous.speed <= time,
-                          speed <= previous.speed || finish <= time + (width - gap) / speed else { continue }
+                if fixed { return finish <= time }
+                if finish > time {
+                    return previous.speed > 0 && previous.comment.position == comment.position
+                        && previous.start + (previous.width + gap) / previous.speed <= time
+                        && (speed <= previous.speed || finish <= time + (width - gap) / speed)
                 }
+                return true
             }
-            let placement = Placement(comment: comment, start: time, width: textWidth, lane: lane, speed: speed)
-            lanes[lane] = placement
+            guard available else { continue }
+            let placement = Placement(comment: comment, start: time, width: textWidth, lane: lane, rowSpan: rowSpan, speed: speed)
+            for index in rows { lanes[index] = placement }
             return placement
         }
         return nil

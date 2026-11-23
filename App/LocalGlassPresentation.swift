@@ -6,19 +6,20 @@ import UIKit
 
 private struct LocalGlassDialogKey: EnvironmentKey { static let defaultValue = false }
 private struct LocalGlassSharedBackdropKey: EnvironmentKey { static let defaultValue = false }
+private struct LocalSourceCompactControlsKey: EnvironmentKey { static let defaultValue = false }
 private struct LocalDialogContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat { 0 }
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 enum LocalDialogLayout: Equatable {
-    case centered, upper, calendar, expanded, player
+    case centered, upper, calendar, expanded, player, sources
 
     func height(in viewport: CGSize, maximum: CGFloat?, content: CGFloat, header: CGFloat) -> CGFloat {
         let available = max(1, viewport.height - 24)
         let limit: CGFloat
         switch self {
-        case .centered:
+        case .centered, .sources:
             limit = min(maximum ?? 580, available)
         case .upper:
             // Portrait dialogs occupy the upper half. A keyboard or landscape viewport
@@ -33,6 +34,10 @@ enum LocalDialogLayout: Equatable {
     }
 }
 extension EnvironmentValues {
+    var localSourceCompactControls: Bool {
+        get { self[LocalSourceCompactControlsKey.self] }
+        set { self[LocalSourceCompactControlsKey.self] = newValue }
+    }
     var localGlassSharedBackdrop: Bool {
         get { self[LocalGlassSharedBackdropKey.self] }
         set { self[LocalGlassSharedBackdropKey.self] = newValue }
@@ -148,14 +153,28 @@ extension View {
 
     /// A separate modal controller preserves native dismissal and navigation on iOS 16.2.
     /// It uses a transparent presentation host so the card floats above the existing page.
-    func localGlassDialog<Dialog: View>(isPresented: Binding<Bool>, title: String,
+    @ViewBuilder func localGlassDialog<Dialog: View>(isPresented: Binding<Bool>, title: String,
                                        maxWidth: CGFloat = 560, maxHeight: CGFloat? = nil,
                                        layout: LocalDialogLayout = .centered,
+                                       animated: Bool = true,
                                        onDismiss: (() -> Void)? = nil,
                                        @ViewBuilder content: @escaping () -> Dialog) -> some View {
-        fullScreenCover(isPresented: isPresented, onDismiss: onDismiss) {
-            LocalGlassDialog(title: title, maxWidth: maxWidth, maxHeight: maxHeight, layout: layout,
-                             close: { isPresented.wrappedValue = false }, content: content)
+        if animated {
+            fullScreenCover(isPresented: isPresented, onDismiss: onDismiss) {
+                LocalGlassDialog(title: title, maxWidth: maxWidth, maxHeight: maxHeight, layout: layout,
+                                 close: { isPresented.wrappedValue = false }, content: content)
+            }
+        } else {
+            // Keep the transaction on the presentation anchor so dock and page
+            // animations still work. Frequent source clicks need no full-screen slide.
+            background {
+                Color.clear
+                    .fullScreenCover(isPresented: isPresented, onDismiss: onDismiss) {
+                        LocalGlassDialog(title: title, maxWidth: maxWidth, maxHeight: maxHeight, layout: layout,
+                                         close: { isPresented.wrappedValue = false }, content: content)
+                    }
+                    .transaction { $0.disablesAnimations = true; $0.animation = nil }
+            }
         }
     }
 }
@@ -169,11 +188,14 @@ private struct LocalGlassDialog<Content: View>: View {
     let close: () -> Void
     @State private var contentHeight: CGFloat = 0
     @State private var headerHeight: CGFloat = 52
+    @State private var keyboardOverlap: CGFloat = 0
     @ViewBuilder var content: () -> Content
 
     var body: some View {
         GeometryReader { viewport in
             WithPerceptionTracking {
+                let sourceFrame = LocalSourcePanelLayout.frame(viewport: viewport.size, keyboardOverlap: keyboardOverlap,
+                                                               maximumWidth: maxWidth, maximumHeight: maxHeight ?? 520)
                 ZStack {
                     Color.black.opacity(layout == .player ? 0.12 : scheme == .dark ? 0.22 : 0.12)
                         .ignoresSafeArea()
@@ -200,13 +222,16 @@ private struct LocalGlassDialog<Content: View>: View {
                         }
                         content()
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                            .ignoresSafeArea(layout == .sources ? .keyboard : [], edges: .bottom)
                     }
-                    .frame(width: max(1, min(maxWidth, viewport.size.width - 28)),
-                           height: layout.height(in: viewport.size, maximum: maxHeight,
-                                                 content: contentHeight, header: title.isEmpty ? 0 : headerHeight))
+                    .frame(width: layout == .sources ? sourceFrame.width : max(1, min(maxWidth, viewport.size.width - 28)),
+                           height: layout == .sources ? sourceFrame.height : layout.height(in: viewport.size, maximum: maxHeight,
+                                                 content: contentHeight, header: title.isEmpty ? 0 : headerHeight), alignment: .top)
                     .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                     .modifier(LocalDialogSurface(layout: layout))
                     .environment(\.isLocalGlassDialog, true)
+                    .environment(\.localSourceCompactControls,
+                                 layout == .sources && LocalSourcePanelLayout.compactControls(height: sourceFrame.height))
                     .environment(\.localGlassSharedBackdrop, false)
                     .environment(\.usesLocalDock, false)
                     .environment(\.localDockInset, 0)
@@ -221,14 +246,24 @@ private struct LocalGlassDialog<Content: View>: View {
                             withTransaction(transaction) { contentHeight = height }
                         }
                     }
-                    .padding(.vertical, 12).padding(.horizontal, 14)
+                    .padding(.top, layout == .sources ? sourceFrame.minY : 12)
+                    .padding(.bottom, layout == .sources ? 0 : 12).padding(.horizontal, 14)
                     .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: layout == .player ? .trailing : layout == .upper ? .top : .center)
+                           alignment: layout == .player ? .trailing : layout == .upper || layout == .sources ? .top : .center)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background { LocalTransparentPresentation() }
+                .background {
+                    LocalTransparentPresentation()
+                    if layout == .sources {
+                        PlayerPopupKeyboard { overlap in
+                            guard abs(keyboardOverlap - overlap) > 0.5 else { return }
+                            keyboardOverlap = overlap
+                        }
+                    }
+                }
             }
         }
+        .ignoresSafeArea(layout == .sources ? .keyboard : [], edges: .bottom)
         .appSheetBackground(.clear)
         .accessibilityAction(.escape, close)
     }

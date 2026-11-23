@@ -15,6 +15,8 @@ struct LocalSettingsView: View {
                 LocalSettingsCard(symbol: "house.fill", title: "首页") { LocalHomeSettingsView() }
                 LocalSettingsCard(symbol: "list.bullet.rectangle", title: "订阅") { LocalSourceSettingsView(kind: .subscription) }
                 LocalSettingsCard(symbol: "chevron.left.forwardslash.chevron.right", title: "python") { LocalSourceSettingsView(kind: .python) }
+                LocalSettingsCard(symbol: "books.vertical.fill", title: "漫画") { LocalMangaSettingsView() }
+                LocalSettingsCard(symbol: AppSection.live.icon, title: "直播") { IPTVSettingsView() }
                 LocalSettingsCard(symbol: "heart.fill", title: "收藏") { FavoritesView() }
                 LocalSettingsCard(symbol: "film.stack", title: "TMDB") { TMDBServiceSettingsView() }
                 LocalSettingsCard(symbol: "captions.bubble", title: "在线字幕") { LocalOnlineSubtitleSettingsView() }
@@ -59,8 +61,12 @@ private struct LocalSettingsCard<Destination: View>: View {
 }
 
 struct LocalHomeSettingsView: View {
+    @AppStorage(LocalTrailerPreferences.autoplayKey) private var autoplayTrailers = true
     @AppStorage(LocalHomeDestination.key) private var destination = LocalHomeDestination.home
     @AppStorage("local.home.continueWatching") private var recent = true
+    @AppStorage(LocalDockPreferences.history) private var showsHistory = true
+    @AppStorage(LocalDockPreferences.live) private var showsLive = true
+    @AppStorage(LocalDockPreferences.music) private var showsMusic = true
     var body: some View {
         SettingsPage(title: "首页", symbol: "house.fill") {
             LocalAppearanceSettingsSection()
@@ -69,7 +75,15 @@ struct LocalHomeSettingsView: View {
                     ForEach(LocalHomeDestination.allCases) { Text($0.title).tag($0) }
                 }
                 Toggle("继续观看", isOn: $recent)
+                Toggle("预告片自动播放", isOn: $autoplayTrailers)
+                    .accessibilityIdentifier("settings.home.trailer.autoplay")
             }
+            SettingsGroup(title: "底栏显示") {
+                Toggle("观看", isOn: $showsHistory).accessibilityIdentifier("settings.home.dock.history")
+                Toggle("直播", isOn: $showsLive).accessibilityIdentifier("settings.home.dock.live")
+                Toggle("音乐", isOn: $showsMusic).accessibilityIdentifier("settings.home.dock.music")
+            }
+            LocalHomeActionSettings()
             LocalHTMLHomeSettingsSection()
         }
     }

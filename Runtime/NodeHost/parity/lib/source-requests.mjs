@@ -13,7 +13,22 @@ export function runSourceRequest(context, request, response, handler, receiver) 
     response.removeListener('close', closed);
     response.removeListener('finish', complete);
   };
-  const complete = () => { finished = true; cleanup(); };
+  const search = request.headers['x-yingxia-search'] === '1';
+  const scope = { playSessionId: request.headers['x-wincat-play-session'],
+    requestPath: request.headers['x-wincat-request-path'] || new URL(request.url || '/', 'http://local').pathname,
+    signal: controller.signal, search, searchOperation: request.headers['x-yingxia-search-operation'],
+    activeHTTP: 0, maximumBytes: search ? 8 * 1024 * 1024 : undefined,
+    successful: false, detached: new Set() };
+  const complete = () => {
+    finished = true;
+    if (search) controller.abort(new AppError('API_CANCELLED', '站点搜索已结束'));
+    else {
+      scope.successful = true;
+      for (const detach of scope.detached) detach();
+      scope.detached.clear();
+    }
+    cleanup();
+  };
   const cancel = () => {
     controller.abort(new AppError('API_CANCELLED', '站点请求已取消'));
     cleanup();
@@ -29,10 +44,7 @@ export function runSourceRequest(context, request, response, handler, receiver) 
   response.once('finish', complete);
   // Successful play replies may start background danmaku work. Only a client
   // disconnect before the reply finishes cancels work belonging to this scope.
-  return context.run({ playSessionId: request.headers['x-wincat-play-session'],
-    requestPath: request.headers['x-wincat-request-path'] || new URL(request.url || '/', 'http://local').pathname,
-    signal: controller.signal },
-    () => handler.call(receiver, request, response));
+  return context.run(scope, () => handler.call(receiver, request, response));
 }
 
 function isLocalBridge(input, options, port, protocol = 'http:') {
@@ -48,7 +60,7 @@ function isLocalBridge(input, options, port, protocol = 'http:') {
   } catch { return false; }
 }
 
-export function installRequestCancellation(context, { bridgePort = () => undefined } = {}) {
+export function installRequestCancellation(context, { bridgePort = () => undefined, activity = () => {} } = {}) {
   const originals = [];
   const tracked = new WeakSet();
   for (const module of [http, https]) for (const method of ['request', 'get']) {
@@ -67,8 +79,47 @@ export function installRequestCancellation(context, { bridgePort = () => undefin
       }
       if (!signal || tracked.has(request)) return request;
       tracked.add(request);
+      let counted = false;
+      if (scope.search) {
+        if (scope.activeHTTP >= 4) {
+          request.destroy(Object.assign(new Error('The source has too many pending HTTP requests'), { code: 'ERR_SEARCH_HTTP_BUSY' }));
+          return request;
+        }
+        scope.activeHTTP += 1; counted = true;
+        // Observe pushed bytes before client data handlers allocate/parse the body.
+        request.prependOnceListener('response', response => {
+          let received = 0;
+          const tooLarge = () => {
+            const error = Object.assign(new Error('The source response exceeds the 8 MB search limit'), { code: 'ERR_RESPONSE_TOO_LARGE' });
+            request.destroy(error); response.destroy(error);
+          };
+          if (Number(response.headers['content-length']) > scope.maximumBytes) { tooLarge(); return; }
+          const push = response.push;
+          response.push = function (chunk, ...rest) {
+            if (chunk) {
+              received += chunk.length;
+              if (received > scope.maximumBytes) { tooLarge(); return false; }
+            }
+            return push.call(this, chunk, ...rest);
+          };
+        });
+      }
+      let trackedOperation = !scope.search && scope.successful ? undefined : scope.searchOperation;
+      if (trackedOperation) activity(1, scope.search, trackedOperation);
+      else if (scope.searchOperation) activity(1, false);
+      const detach = () => {
+        if (!trackedOperation) return;
+        activity(0, false, trackedOperation, -1);
+        trackedOperation = undefined;
+      };
+      if (trackedOperation && !scope.search) scope.detached.add(detach);
       const abort = () => request.destroy(signal.reason);
-      const cleanup = () => signal.removeEventListener('abort', abort);
+      const cleanup = () => {
+        signal.removeEventListener('abort', abort);
+        if (counted) { counted = false; scope.activeHTTP -= 1; }
+        if (scope.searchOperation) activity(-1, scope.search, trackedOperation);
+        scope.detached.delete(detach);
+      };
       signal.addEventListener('abort', abort, { once: true });
       request.once('close', cleanup);
       // Preserve ClientRequest's asynchronous error contract even for an
@@ -91,6 +142,7 @@ export function installRequestCancellation(context, { bridgePort = () => undefin
     if (!signal) return originalFetch.call(this, input, options);
     const supplied = options?.signal === undefined ? input?.signal : options.signal;
     return originalFetch.call(this, input, { ...options,
+      ...(scope.search ? { maximumBytes: scope.maximumBytes, retryReusedSocket: false } : {}),
       signal: supplied ? AbortSignal.any([signal, supplied]) : signal });
   };
   syncBuiltinESMExports();

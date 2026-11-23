@@ -62,6 +62,38 @@ import Perception
         }
     }
 
+    /// Refresh the displayed location from its first page. Reusing `request`
+    /// after pagination used to discard all preceding pages and keep old categories.
+    public func refresh(client: CatalogClient) async {
+        await refresh(context: client.reportContext) { request in
+            switch request {
+            case .home: return try await client.home()
+            case let .list(category, query, page, filters):
+                return try await client.list(category: category, query: query, page: page, filters: filters)
+            }
+        }
+    }
+
+    public func refresh(context: String = "-", fetch: @escaping @Sendable (Request) async throws -> CatalogPage) async {
+        let location: Request
+        switch request {
+        case .home: location = .home
+        case let .list(category, query, _, filters):
+            location = .list(category: category, query: query, page: 1, filters: filters)
+        }
+        let expectedGeneration = generation + 1
+        await load(location, context: context, fetch: fetch)
+        guard generation == expectedGeneration, location != .home, !Task.isCancelled else { return }
+        let current = generation
+        let task = Task { try await fetch(.home) }
+        pendingCategories = task
+        defer { if generation == current { pendingCategories = nil } }
+        let result = try? await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+        guard generation == current, !Task.isCancelled, !task.isCancelled, let result else { return }
+        categories = result.categories
+        mergeFilters(result)
+    }
+
     /// Appends the next page of the shown list, as scrolling to the end of it does.
     public func loadMore(client: CatalogClient) async {
         await loadMore(context: client.reportContext) { request in
@@ -136,7 +168,7 @@ import Perception
             guard generation == current, !Task.isCancelled else { return }
             mergeFilters(result)
             var seen = Set<String>()
-            let fresh = result.videos.filter { seen.insert($0.id).inserted }
+            let fresh = keepingCategory(result.videos.filter { seen.insert($0.id).inserted })
             // A refresh that answers the same leaves the shown covers untouched.
             if !refreshing || fresh != videos { videos = fresh }
             pageCount = result.pageCount
@@ -163,7 +195,7 @@ import Perception
             guard generation == currentGeneration, !Task.isCancelled, !task.isCancelled else { return }
             mergeFilters(result)
             var seen = Set(videos.map(\.id))
-            let fresh = result.videos.filter { seen.insert($0.id).inserted }
+            let fresh = keepingCategory(result.videos.filter { seen.insert($0.id).inserted })
             videos += fresh
             page = next
             // A source that ignores the page number answers every page with the same list. One empty answer
@@ -176,6 +208,13 @@ import Perception
             Diagnostics.shared.failure("catalog", "more \(context)", error)
             moreError = error.localizedDescription
         }
+    }
+
+    private func keepingCategory(_ videos: [Video]) -> [Video] {
+        guard case let .list(categoryID, query, _, _) = request,
+              query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let categoryID, let category = categories.first(where: { $0.id == categoryID }) else { return videos }
+        return videos.map { $0.keepingCategory(category.name) }
     }
 
     private func mergeFilters(_ result: CatalogPage) {

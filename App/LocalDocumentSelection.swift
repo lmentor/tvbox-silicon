@@ -2,14 +2,15 @@ import Foundation
 
 /// One picker route owns one set of provider grants until its import has finished.
 enum LocalDocumentSelectionKind: String, Identifiable, Sendable {
-    case pythonFiles, subscriptionFile, javaScriptFile
+    case pythonFiles, subscriptionFile, javaScriptFile, playlistFile
+    case sourceReplacement
     case htmlFile, backupFile, subtitleFile, danmakuFile, fontFile, mediaFile
     var id: String { rawValue }
     // Files uses checkmarks and an Open button for these batch source routes.
     // Dependencies still travel together inside each Python ZIP package.
     var allowsMultipleSelection: Bool {
         switch self {
-        case .pythonFiles, .javaScriptFile, .htmlFile: true
+        case .pythonFiles, .sourceReplacement, .javaScriptFile, .htmlFile: true
         default: false
         }
     }

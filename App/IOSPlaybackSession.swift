@@ -38,6 +38,10 @@ import TVCore
     var paused: Bool { engine.paused }
     var muted: Bool { engine.muted }
     var hasTimeline: Bool { engine.isReady && engine.seekable && engine.duration > 0 && !isLive }
+    private(set) var iptv: IPTVPlayback?
+    @PerceptionIgnored private var iptvWatch: Task<Void, Never>?
+    @PerceptionIgnored private var iptvOutputAt: TimeInterval?
+    @PerceptionIgnored private var iptvAudioStart: Double?
     private(set) var isLive = false
     private(set) var qualities: [StreamQuality] = []
     private(set) var quality: Int?
@@ -45,6 +49,8 @@ import TVCore
     var audioChoice: CMPersistentTrackID? { engine.tracks.first { $0.kind == .audio && $0.selected }.flatMap { Int32($0.id) } }
     private(set) var activeChannelID: String?
     @PerceptionIgnored private var activeObserver: NSObjectProtocol?
+    @PerceptionIgnored private var backgroundObserver: NSObjectProtocol?
+    @PerceptionIgnored private var backgroundHold: Task<Void, Never>?
     @PerceptionIgnored private var videoCacheObserver: NSObjectProtocol?
     @PerceptionIgnored private var cachePreparation: Task<Void, Never>?
     @PerceptionIgnored private var cachePreparationID = UUID()
@@ -53,6 +59,8 @@ import TVCore
     @PerceptionIgnored private var recoveryAttempts = 0
     @PerceptionIgnored private var decoderRecoveryAttempts = 0
     @PerceptionIgnored private var lastRecovery: Date?
+    @PerceptionIgnored private var deferredVideoRecovery: (generation: UUID, input: UUID, failure: KSPlaybackFailure,
+                                                          position: Double, timeline: Int)?
     var onPlaybackEnded: (() -> Void)?
     var onUnplayableFile: (() -> String?)?
     var upcomingEpisode: (@MainActor () async -> Channel?)?
@@ -98,6 +106,9 @@ import TVCore
     @PerceptionIgnored private var chat: BilibiliLiveChat?
     @PerceptionIgnored private var chatGeneration = UUID()
     @PerceptionIgnored private var playing: Channel?
+    /// The request handed to the cover stays stable while decoder/disc/quality changes can
+    /// replace the session's working source descriptor.
+    @PerceptionIgnored private var presentedChannel: Channel?
     @PerceptionIgnored private var sourceChannel: Channel?
     @PerceptionIgnored private var historyContext: PlaybackHistoryContext?
     @PerceptionIgnored private var pendingResume: Double?
@@ -119,12 +130,35 @@ import TVCore
     @PerceptionIgnored private var upcomingTask: Task<Void, Never>?
     @PerceptionIgnored private var upcoming: (Channel, Prepared)?
     @PerceptionIgnored private var upcomingAttempted = false
+    @PerceptionIgnored private var manualEpisodeSelection = false
+    @PerceptionIgnored private var manualEpisodeSelectionOwner: UUID?
+    @PerceptionIgnored private var interruptedEpisodePreparation: Channel?
+    /// A short-drama swipe can suspend a retry after it saved the resume position and
+    /// replaced the generation. Retain that intent if the viewer returns to this episode.
+    private struct EpisodeRecoveryIntent {
+        let channel: Channel
+        let position: Double
+        let timeline: Int
+        let reusePrepared: Bool
+        let failure: KSPlaybackFailure?
+        let previousRecovery: Date?
+    }
+    @PerceptionIgnored private var episodeRecoveryIntent: EpisodeRecoveryIntent?
+    @PerceptionIgnored private var interruptedEpisodeRecovery: EpisodeRecoveryIntent?
     @PerceptionIgnored private var prefetchWarm: Task<Void, Never>?
     @PerceptionIgnored private var prefetchComplete = false
     @PerceptionIgnored private var prefetchWarmID = UUID()
     @PerceptionIgnored private var advancing = false
     @PerceptionIgnored private var keepPausedAfterRestore = false
+    @PerceptionIgnored private var sleepObservers: [NSObjectProtocol] = []
+    @PerceptionIgnored private let sleepFade = PlaybackSleepFade()
+    @PerceptionIgnored private var sleepFadeRevision: UUID?
+    @PerceptionIgnored private var sleepFadeTransport: UUID?
+    @PerceptionIgnored private var sleepPendingTransport: UUID?
     private(set) var transfer = Transfer()
+    private(set) var videoCacheUsage: String?
+    private(set) var videoCacheStatus: String?
+    private(set) var cachedTimeRanges: [ClosedRange<Double>] = []
     private(set) var steps: [String] = []
     struct Transfer {
         var received: Int64 = 0
@@ -161,6 +195,21 @@ import TVCore
         engine.onTick = { [weak self] in self?.updatePictureState(); self?.updateSubtitles() }
         engine.onFinish = { [weak self] error in self?.finished(error) }
         engine.onDecoderChange = { [weak self] in self?.reopenCurrent() }
+        engine.onAudioInterruption = { [weak self] in
+            self?.resumeAfterEditing = false
+            self?.clearBoost()
+        }
+        sleepObservers = [
+            NotificationCenter.default.addObserver(forName: SleepTimer.fired, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.sleepTimerFired() }
+            },
+            NotificationCenter.default.addObserver(forName: SleepTimer.changed, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.sleepFadeRevision != SleepTimer.shared.revision else { return }
+                    self.sleepFade.cancel(); self.sleepFadeRevision = nil
+                }
+            },
+        ]
         engine.pictureInPictureSubtitleProvider = { [weak self] time in
             guard let self else { return (PlayerSubtitlePresentation(), PlayerSubtitlePresentation()) }
             self.subtitles.updateKS(lines: self.engine.subtitleLines, pictureSize: self.engine.presentationSize)
@@ -180,6 +229,9 @@ import TVCore
         activeObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in self?.recoverAfterForeground() }
         }
+        backgroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.scheduleBackgroundHold() }
+        }
         videoCacheObserver = NotificationCenter.default.addObserver(forName: MobileMediaServices.videoCacheChanged,
             object: nil, queue: .main) { [weak self] notification in
             let enabled = notification.userInfo?["enabled"] as? Bool ?? false
@@ -192,6 +244,39 @@ import TVCore
         }
     }
     func togglePlayback() { if paused { engine.play() } else { engine.pause(); clearBoost() } }
+    private func sleepTimerFired() {
+        guard playing != nil || preparation != nil || recovery != nil || iptv != nil else { return }
+        sleepFade.cancel()
+        sleepFadeRevision = SleepTimer.shared.revision
+        sleepFadeTransport = nil
+        clearBoost()
+        if paused || !engine.isReady || engine.seeking || pendingResume != nil || restoringPosition {
+            engine.pause()
+            // Resolution may still be completing. Opening its result must
+            // respect this pause unless a newer transport action supersedes it.
+            sleepPendingTransport = engine.transportRevision
+            saveHistory()
+            return
+        }
+        let media = engine.mediaID, transport = engine.transportRevision
+        sleepFadeTransport = transport
+        sleepFade.start(volume: engine.volume, isCurrent: { [weak self] in
+            self?.engine.mediaID == media
+        }, shouldContinue: { [weak self] in
+            guard let self else { return false }
+            return self.engine.transportRevision == transport && !self.paused
+        }, setVolume: { [weak self] in self?.engine.setVolume($0) }, pause: { [weak self] in
+            guard let self else { return }
+            self.engine.pause()
+            self.sleepPendingTransport = self.engine.transportRevision
+            self.saveHistory()
+        })
+    }
+    func pauseForDeviceLock() {
+        guard engine.pauseForDeviceLock(resumePending: resumeAfterEditing) else { return }
+        resumeAfterEditing = false
+        clearBoost()
+    }
     func skip(_ seconds: Double) { engine.seek(to: position + seconds) }
     func chooseAudio(_ id: CMPersistentTrackID) { engine.selectAudio(id: String(id)) }
     func setSpeed(_ speed: Float) { selectedSpeed = min(8, max(0.25, speed)); clearBoost(); engine.speed = selectedSpeed }
@@ -213,9 +298,23 @@ import TVCore
     func lineSwitchFailed(_ message: String) { switchNotice = nil; error = message; loading = false }
     func start(_ channel: Channel) {
         Self.current = self
-        if sourceChannel == channel, error == nil, engine.mediaID != nil { return }
+        if presentedChannel == channel, error == nil, preparation != nil || recovery != nil || engine.mediaID != nil || iptv != nil { return }
+        engine.beginPlaybackRequest()
+        if let id = IPTVStationReference.id(for: channel) {
+            if sourceChannel == channel, let iptv, error != nil {
+                restartIPTV(iptv)
+            } else if let choice = IPTVPlayback(reference: channel, id: id) {
+                startIPTV(choice, reference: channel)
+            } else {
+                stop()
+                sourceChannel = channel
+                error = "此频道的直播来源已停用、已移除或没有可用线路。"
+                loading = false
+            }
+            return
+        }
         stop()
-        begin(channel); sourceChannel = channel
+        begin(channel); sourceChannel = channel; presentedChannel = channel
         let active = generation
         preparation = Task { [weak self] in
             guard let self else { return }
@@ -224,6 +323,7 @@ import TVCore
                 var next = channel
                 var liveQualities: [StreamQuality] = [], liveQuality: Int?
                 if let (platform, id) = LiveCatalog.room(channel.url), platform.chat == "bilibili", let room = Int(id) { self.listen(room: room) }
+                if let room = IPTVPlatform.bilibiliChatRoom(channel.url) { self.listen(room: room) }
                 if LiveCatalog.isRoom(channel.url) { (next, liveQualities, liveQuality) = try await LiveCatalog.resolve(channel) }
                 let prepared = try await self.prepare(next)
                 guard self.generation == active, !Task.isCancelled else { Self.release(next, prepared); return }
@@ -246,6 +346,196 @@ import TVCore
             }
         }
     }
+    func chooseIPTVLine(_ index: Int) {
+        guard var choice = iptv, choice.station.lines.indices.contains(index) else { return }
+        choice.lineIndex = index
+        choice.programme = nil
+        choice.catchupLine = nil
+        restartIPTV(choice)
+    }
+
+    func playIPTVProgramme(_ programme: IPTVProgramme, line: IPTVLine) {
+        guard var choice = iptv else { return }
+        choice.programme = programme
+        choice.catchupLine = line
+        restartIPTV(choice)
+    }
+
+    private func restartIPTV(_ choice: IPTVPlayback) {
+        guard let reference = sourceChannel else { return }
+        var next = choice
+        next.attempted = []
+        next.refreshed = false
+        next.started = ProcessInfo.processInfo.systemUptime
+        startIPTV(next, reference: reference)
+    }
+
+    private func startIPTV(_ selection: IPTVPlayback, reference: Channel, resume: Double? = nil,
+                           preservingPlaybackIntent: Bool = false) {
+        guard selection.enabledRecord != nil else {
+            stopIPTV(selection, reference: reference, message: "此频道的直播来源已停用或已移除。")
+            return
+        }
+        if preservingPlaybackIntent { stopForAutomaticIPTVTransition() }
+        else { stop() }
+        var choice = selection
+        choice.attempted.insert(choice.lineIndex)
+        iptv = choice
+        let line = choice.line
+        let descriptor = PlaybackDescriptor(format: line.url.pathExtension, isLive: choice.programme == nil && !line.isRecording)
+        let channel = Channel(name: choice.station.name, group: choice.station.group, url: line.url, logo: choice.station.logo,
+                              headers: line.headers, resumePosition: resume, playback: descriptor)
+        begin(channel)
+        sourceChannel = reference; presentedChannel = reference
+        let active = generation
+        switchNotice = "正在尝试线路 \(choice.lineIndex + 1)/\(choice.station.lines.count) · \(line.name)"
+        // Include preparation, connection and the wait for real output in the same deadline.
+        let remaining = 25 - (ProcessInfo.processInfo.systemUptime - choice.started)
+        guard remaining > 0 else { stopIPTV(choice, reference: reference); return }
+        // Switch promptly when another line can help. The only/last line and a
+        // fixed replay have no alternative to try, so allow their CDN handshake
+        // and first keyframe to use the existing total startup budget.
+        let hasAnotherLine = choice.programme == nil && choice.station.lines.indices.contains { !choice.attempted.contains($0) }
+        let delay = hasAnotherLine ? min(8, remaining) : remaining
+        let network = IPTVNetworkPath.shared
+        iptvWatch = Task { [weak self] in
+            var delayLeft = delay
+            while delayLeft > 0 {
+                let prior = ProcessInfo.processInfo.systemUptime
+                try? await Task.sleep(for: .seconds(min(1, delayLeft)))
+                guard !Task.isCancelled, let self, self.generation == active, self.iptvOutputAt == nil else { return }
+                let elapsed = ProcessInfo.processInfo.systemUptime - prior
+                if self.engine.mediaID != nil && self.engine.paused {
+                    self.iptv?.started += elapsed
+                } else { delayLeft -= elapsed }
+            }
+            self?.iptvFailed(networkOffline: network.offline)
+        }
+        preparation = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.generation == active { self.preparation = nil } }
+            do {
+                let prepared = try await self.prepare(channel)
+                guard self.generation == active, !Task.isCancelled else { Self.release(channel, prepared); return }
+                self.playing = channel
+                self.activeChannelID = reference.id
+                self.currentPrepared = prepared
+                self.open(prepared, channel: channel)
+                self.externalSubtitles.begin(channel, playing: prepared.url)
+                self.startSampler(generation: active)
+            } catch {
+                guard self.generation == active, !Task.isCancelled else { return }
+                self.iptvFailed(networkOffline: network.offline)
+            }
+        }
+    }
+
+    private func iptvFailed(networkOffline: Bool) {
+        guard var choice = iptv, let reference = sourceChannel else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let resume = !isLive && engine.isReady && engine.seekable ? position : nil
+        if networkOffline {
+            stopForAutomaticIPTVTransition()
+            iptv = choice
+            sourceChannel = reference; presentedChannel = reference
+            steps = ["网络已断开，正在等待恢复"]
+            switchNotice = steps.first
+            let active = generation
+            iptvWatch = Task { [weak self] in
+                let deadline = ProcessInfo.processInfo.systemUptime + 25
+                while IPTVNetworkPath.shared.offline && !Task.isCancelled,
+                      ProcessInfo.processInfo.systemUptime < deadline {
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                guard !Task.isCancelled, let self, self.generation == active else { return }
+                guard !IPTVNetworkPath.shared.offline else {
+                    self.stopIPTV(choice, reference: reference, message: "网络仍未恢复，请连接网络后重试。")
+                    return
+                }
+                choice.started = ProcessInfo.processInfo.systemUptime
+                self.startIPTV(choice, reference: reference, resume: resume, preservingPlaybackIntent: true)
+            }
+            return
+        }
+        // After sustained output a subsequent disconnect starts a new recovery round.
+        if let output = iptvOutputAt, now - output >= 8, !isLive || engine.liveOutputWasStable {
+            choice.started = now
+            choice.attempted.removeAll()
+            choice.refreshed = false
+        }
+        continueIPTV(choice, reference: reference, resume: resume)
+    }
+
+    private func continueIPTV(_ selection: IPTVPlayback, reference: Channel, resume: Double?) {
+        var choice = selection
+        let remaining = 25 - (ProcessInfo.processInfo.systemUptime - choice.started)
+        let count = choice.station.lines.count
+        let next = (1...count).map { (choice.lineIndex + $0) % count }.first {
+            !choice.attempted.contains($0) && (choice.programme == nil || $0 == choice.lineIndex)
+        }
+        guard let record = choice.enabledRecord else {
+            stopIPTV(choice, reference: reference, message: "此频道的直播来源已停用或已移除。")
+            return
+        }
+        if remaining > 0, next == nil, !choice.refreshed, choice.programme == nil, !record.asSingle {
+            // Re-read this station's own source once. Respect a refresh already requested by
+            // the settings screen and never publish an obsolete result into a new player generation.
+            choice.refreshed = true
+            stopForAutomaticIPTVTransition()
+            iptv = choice; sourceChannel = reference; presentedChannel = reference
+            switchNotice = "正在更新频道线路"
+            let active = generation
+            iptvWatch = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(remaining))
+                guard !Task.isCancelled, let self, self.generation == active else { return }
+                self.stopIPTV(choice, reference: reference)
+            }
+            preparation = Task { [weak self] in
+                let library = IPTVLibrary.shared
+                if library.refreshingIDs.contains(record.id) {
+                    while library.refreshingIDs.contains(record.id) && !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(120))
+                    }
+                } else { try? await library.refresh(record.id) }
+                guard !Task.isCancelled, let self, self.generation == active else { return }
+                guard let current = choice.enabledRecord, let station = current.stations.first(where: { $0.id == choice.station.id }),
+                      !station.lines.isEmpty else {
+                    self.stopIPTV(choice, reference: reference, message: "直播来源已停用或频道已移除。")
+                    return
+                }
+                var renewed = choice
+                renewed.useRefreshedStation(station, in: current)
+                if !renewed.attempted.contains(renewed.lineIndex) {
+                    self.startIPTV(renewed, reference: reference, resume: resume, preservingPlaybackIntent: true)
+                } else { self.continueIPTV(renewed, reference: reference, resume: resume) }
+            }
+        } else if remaining > 0, let next {
+            choice.lineIndex = next
+            startIPTV(choice, reference: reference, resume: resume, preservingPlaybackIntent: true)
+        } else { stopIPTV(choice, reference: reference) }
+    }
+
+    private func stopIPTV(_ choice: IPTVPlayback, reference: Channel, message: String? = nil) {
+        stop()
+        iptv = choice
+        sourceChannel = reference; presentedChannel = reference
+        error = message ?? (choice.programme == nil ? "频道线路暂时无法播放，可重试或手动选择线路。" : "本档回看暂时无法播放，可重试或回到直播。")
+        loading = false
+    }
+
+    private func stopForAutomaticIPTVTransition() {
+        settleSleepBeforeReopen()
+        // An idle native core is paused by default during prepare/offline wait.
+        // Carry an actual media pause or a still-current timer stop across this
+        // internal stop; a later manual Play invalidates the timer's revision.
+        let preservePause = engine.mediaID != nil ? paused : sleepPendingTransport == engine.transportRevision
+        stop()
+        if preservePause {
+            engine.pause()
+            sleepPendingTransport = engine.transportRevision
+        }
+    }
+
     private func loadSourceDanmaku() async {
         guard LocalDanmakuPreferences.enabled(), LocalDanmakuPreferences.builtinEnabled(), !sourceDanmakuLoaded,
               let channel = sourceChannel, DanmakuSource.has(channel.url) else { return }
@@ -263,6 +553,7 @@ import TVCore
         if sourceDanmakuGeneration == active { sourceDanmakuLoading = nil }
     }
     private func begin(_ channel: Channel) {
+        engine.pausedForDeviceLock = false
         error = nil; loading = true; showsPicture = false; buffering = false; steps = ["正在解析播放地址"]
         preparationStarted = Date()
         transfer = Transfer(); transfer.host = channel.url.host()
@@ -276,12 +567,15 @@ import TVCore
         savedDownload = channel.url.scheme == DownloadLibrary.scheme
         isLive = channel.playback?.isLive == true || MediaAddress.streamingSchemes.contains(channel.url.scheme?.lowercased() ?? "")
             || LiveCatalog.isRoom(channel.url) || channel.group == L10n.text("Bilibili Live") || MediaDanmakuRegistry.descriptor(for: channel.url)?.live != nil
+        if iptv != nil, let explicit = channel.playback?.isLive { isLive = explicit }
         let source = channel.historyContext?.sourceKey
         if !DanmakuSource.has(channel.url), source != Bilibili.siteKey, source != CloudFiles.sourceKey { catalogDanmaku.startAutomatic(channel.historyContext) }
         ErrorReports.shared.playing(live: isLive, format: channel.playback?.format.isEmpty == false ? channel.playback!.format : channel.url.pathExtension,
                                     source: source, danmaku: catalogDanmaku.enabled, sharper: false)
     }
     private func open(_ prepared: Prepared, channel: Channel, selections: KSPlaybackSelections? = nil) {
+        settleSleepBeforeReopen()
+        let pauseForSleep = consumeSleepPause()
         updateRuntimePlaybackPins(Set([channel.url, prepared.url, prepared.audioURL].compactMap { $0 }))
         error = nil; loading = true; showsPicture = false; buffering = false
         remoteSkip.begin(channel: channel, isLive: isLive)
@@ -298,7 +592,7 @@ import TVCore
                     cacheIOURL: prepared.cacheIOURL, audioCacheIOURL: prepared.audioCacheIOURL, selections: selections)
         if selections != nil { externalSubtitles.restoreAfterReopen(channel) }
         engine.speed = selectedSpeed
-        if keepPausedAfterRestore { engine.pause() }
+        if keepPausedAfterRestore || pauseForSleep { engine.pause() }
         if let disc = prepared.disc {
             engine.setDiscChapters(disc.chapters.enumerated().map { index, chapter in
                 KSPlaybackChapter(id: index, title: chapter.title, start: chapter.time,
@@ -306,6 +600,20 @@ import TVCore
             })
         }
         ExternalDisplay.shared.refresh()
+    }
+    private func consumeSleepPause() -> Bool {
+        defer { sleepPendingTransport = nil }
+        return sleepPendingTransport == engine.transportRevision
+    }
+    private func settleSleepBeforeReopen() {
+        let shouldPause = sleepFade.isActive && sleepFadeTransport == engine.transportRevision
+        // Restore the old media's volume before shutdown clears its identity.
+        // A newer viewer transport command supersedes the consumed deadline.
+        sleepFade.cancel(); sleepFadeTransport = nil
+        if shouldPause {
+            engine.pause()
+            sleepPendingTransport = engine.transportRevision
+        }
     }
     private func updateRuntimePlaybackPins(_ addresses: Set<URL>) {
         let addresses = Set(addresses.filter {
@@ -335,6 +643,7 @@ import TVCore
     private func ready() {
         guard recovery == nil else { return }
         buffering = false
+        if iptv != nil, pendingResume == nil { updatePictureState(); return }
         Diagnostics.shared.record(.info, "player.startup", "stage=ready elapsed=\(Date().timeIntervalSince(preparationStarted))")
         if let requested = pendingResume {
             let target = PlaybackHistoryEntry.resumeTarget(requested, duration: duration)
@@ -366,6 +675,19 @@ import TVCore
         guard recovery == nil else { return }
         buffering = engine.buffering
         guard engine.isReady, !restoringPosition, pendingResume == nil else { return }
+        if let choice = iptv, iptvOutputAt == nil {
+            guard engine.mediaID == generation.uuidString, engine.hasPicture else { loading = true; return }
+            if !engine.tracks.contains(where: { $0.kind == .video }) {
+                guard engine.tracks.contains(where: { $0.kind == .audio && $0.selected }), !paused else { return }
+                if iptvAudioStart == nil { iptvAudioStart = position }
+                guard position - (iptvAudioStart ?? position) >= 0.5 else { return }
+            }
+            iptvOutputAt = ProcessInfo.processInfo.systemUptime
+            iptvWatch?.cancel(); iptvWatch = nil
+            switchNotice = nil
+            choice.rememberLine()
+            IPTVUserStations.shared.didPlay(choice.station)
+        }
         loading = false
         if engine.hasPicture && !showsPicture {
             Diagnostics.shared.record(.info, "player.startup", "stage=first-picture elapsed=\(Date().timeIntervalSince(preparationStarted))")
@@ -377,6 +699,8 @@ import TVCore
         sampler?.cancel()
         transferTicker?.cancel()
         enhancementTicker?.cancel()
+        videoCacheUsage = nil; videoCacheStatus = nil
+        cachedTimeRanges = []
         transferTicker = Task { [weak self] in
             var rate = PlaybackTransferRate()
             var previousInput: UUID?, previousOrigin: Bool?
@@ -386,12 +710,26 @@ import TVCore
                 let input = self.engine.inputRevision
                 let owner = self.currentPrepared?.owner
                 var bytes = self.engine.bytesRead, originStatistics = false
-                if let owner, let statistics = try? await MobileMediaServices.videoCacheStatistics(owner), !statistics.nativeFallback {
+                let statistics: MobileMediaServices.VideoCacheStatistics?
+                if let owner { statistics = try? await MobileMediaServices.videoCacheStatistics(owner) }
+                else { statistics = nil }
+                if let statistics, !statistics.nativeFallback {
                     bytes = statistics.networkBytes
                     originStatistics = true
                 }
                 guard !Task.isCancelled, self.generation == active, self.engine.inputRevision == input,
                       self.currentPrepared?.owner == owner else { return }
+                self.videoCacheUsage = statistics?.summary.usageText
+                self.cachedTimeRanges = statistics.map { self.engine.cachedTimeRanges($0.coverage) + $0.timeRanges } ?? []
+                if let statistics {
+                    self.videoCacheStatus = statistics.statusText
+                } else if self.isLive {
+                    self.videoCacheStatus = "直播不使用视频缓存"
+                } else if UserDefaults.standard.object(forKey: "local.videoCache.enabled") as? Bool == false {
+                    self.videoCacheStatus = "视频缓存已关闭"
+                } else {
+                    self.videoCacheStatus = owner == nil ? "当前直接播放，未使用视频缓存" : "缓存状态暂不可用"
+                }
                 if previousInput != input || previousOrigin != originStatistics {
                     rateIdentity = UUID(); previousInput = input; previousOrigin = originStatistics
                 }
@@ -419,7 +757,8 @@ import TVCore
                 self.transfer.received = bytes
                 self.transfer.required = self.engine.bitrate > 0 ? self.engine.bitrate / 8 : nil
                 if var throttle = self.throttle, !self.paused {
-                    throttle.update(ahead: max(0, self.engine.bufferedPosition - self.position), waiting: self.buffering)
+                    throttle.update(ahead: max(0, self.engine.bufferedPosition - self.position), waiting: self.buffering,
+                                    videoLag: self.engine.boostVideoLag)
                     self.throttle = throttle; self.applyBoost()
                 }
                 self.remoteSkip.tick(settings: self.skipSettings, duration: self.duration, chapters: self.engine.chapters,
@@ -433,7 +772,7 @@ import TVCore
         }
     }
     private func updateSkipping() {
-        guard !isLive, !editingSkip, !seekingSegment, !engine.seeking, pendingResume == nil, !restoringPosition, engine.isReady else { return }
+        guard iptv == nil, !isLive, !sleepFade.isActive, !editingSkip, !seekingSegment, !engine.seeking, pendingResume == nil, !restoringPosition, engine.isReady else { return }
         guard let action = remoteSkip.nextAction(time: position, duration: duration, playing: !paused && !buffering, enabled: skipSettings.enabled) else { return }
         seekingSegment = true
         let active = generation
@@ -445,21 +784,41 @@ import TVCore
     }
     private func finished(_ failure: Error?) {
         guard recovery == nil else { return }
+        if let failure = failure as? KSPlaybackFailure, deferVideoRecovery(failure) { return }
+        if failure == nil, !isLive, SleepTimer.shared.endsWithItem {
+            saveHistory(completed: true)
+            _ = SleepTimer.shared.itemEnded()
+            engine.pause()
+            return
+        }
+        if failure == nil, sleepFade.isActive {
+            sleepFade.cancel(); engine.pause(); saveHistory(completed: true)
+            return
+        }
+        if iptv != nil {
+            if failure != nil || isLive || iptvOutputAt == nil {
+                iptvFailed(networkOffline: IPTVNetworkPath.shared.offline)
+            }
+            return
+        }
         if let failure {
             Diagnostics.shared.record(.warning, "player.recovery", "event=failure code=\(PlaybackFailureDiagnostics.codes(failure)) attempts=\(recoveryAttempts) decoderAttempts=\(decoderRecoveryAttempts) \(engine.failureDiagnostic)")
             if failure is KSPlaybackFailure {
                 // First-open incompatibility needs another line/decoder. Only a
                 // decoder that already presented this input may be rebuilt once.
                 if engine.hasPresentedPicture, decoderRecoveryAttempts == 0,
-                   recoverPlayback(reusePrepared: true) { decoderRecoveryAttempts += 1; return }
+                   recoverPlayback(reusePrepared: true, decoderFailure: failure as? KSPlaybackFailure) { return }
             } else if recoverPlayback() { return }
             engine.pause()
             error = failure.localizedDescription; loading = false; buffering = false
             Diagnostics.shared.record(.error, "player.recovery", "event=terminal code=\(PlaybackFailureDiagnostics.codes(failure)) \(engine.failureDiagnostic)")
             return
         }
-        if looping { engine.seek(to: 0) { [weak self] ok in if ok { self?.engine.play() } }; return }
+        // play() seeks from EOF and its completion follows the latest engine
+        // intent. A delayed session callback must not override a later pause.
+        if looping { engine.play(); return }
         saveHistory(completed: true)
+        guard !manualEpisodeSelection else { return }
         if playsOn(), playUpcoming() { return }
         onPlaybackEnded?()
     }
@@ -470,7 +829,7 @@ import TVCore
     func choose(quality: Int?) {
         guard let channel = playing, quality != self.quality else { return }
         let sourceURL = sourceChannel?.url ?? channel.url, requested = quality
-        let savedPosition = position, wasPaused = paused
+        let savedPosition = position
         cancelDiscSelection()
         recovery?.cancel(); recovery = nil
         preparation?.cancel(); discardUpcoming(); saveHistory()
@@ -480,7 +839,13 @@ import TVCore
             defer { if self.generation == active { self.preparation = nil } }
             do {
                 var next: Channel
-                if let resolved = try await PlaybackQualityRegistry.resolve(for: sourceURL, quality: requested) {
+                var roomResult: (channel: Channel, qualities: [StreamQuality], current: Int?)?
+                if let room = IPTVRoomAddress(sourceURL) {
+                    let request = Channel(name: channel.name, group: channel.group, url: room.withQuality(requested).url)
+                    let resolved = try await LiveCatalog.resolve(request)
+                    roomResult = resolved
+                    next = resolved.channel
+                } else if let resolved = try await PlaybackQualityRegistry.resolve(for: sourceURL, quality: requested) {
                     next = Channel(name: channel.name, group: resolved.group, url: resolved.url, logo: channel.logo,
                                    headers: resolved.headers, skipScope: channel.skipScope, historyContext: channel.historyContext,
                                    resumePosition: savedPosition, subtitles: resolved.subtitles, playback: resolved.playback)
@@ -493,8 +858,9 @@ import TVCore
                 let prepared = try await self.prepare(next)
                 guard self.generation == active, !Task.isCancelled else { Self.release(next, prepared); return }
                 if let previous = self.currentPrepared { Self.release(channel, previous) }
-                self.pendingResume = savedPosition; self.restoringPosition = false; self.keepPausedAfterRestore = wasPaused
-                self.currentPrepared = prepared; self.quality = requested; self.playing = next
+                self.pendingResume = self.isLive ? nil : savedPosition; self.restoringPosition = false; self.keepPausedAfterRestore = self.paused
+                self.currentPrepared = prepared; self.quality = roomResult?.current ?? requested; self.playing = next
+                if let roomResult { self.qualities = roomResult.qualities }
                 self.externalSubtitles.begin(next, playing: prepared.url)
                 self.open(prepared, channel: next)
                 self.startSampler(generation: active)
@@ -510,6 +876,17 @@ import TVCore
         cancelDiscSelection()
         recovery?.cancel(); recovery = nil
         preparation?.cancel(); preparation = nil
+        if let choice = iptv {
+            // Decoder changes create a new input with the same station, catchup mode and pause intent.
+            // Re-arm the first-output deadline on this new input just like a manual line change.
+            guard let reference = sourceChannel else { return }
+            let resume = isLive ? nil : position
+            var next = choice
+            next.started = ProcessInfo.processInfo.systemUptime
+            next.attempted = []; next.refreshed = false
+            startIPTV(next, reference: reference, resume: resume, preservingPlaybackIntent: true)
+            return
+        }
         saveHistory(); pendingResume = position; keepPausedAfterRestore = paused
         let selections = engine.selections
         externalSubtitles.prepareForReopen()
@@ -517,6 +894,7 @@ import TVCore
         open(prepared, channel: channel, selections: selections); startSampler(generation: generation)
     }
     private func activateVideoCache() {
+        guard !manualEpisodeSelection else { return }
         if currentPrepared?.owner != nil { needsVideoCacheActivation = false; return }
         guard cachePreparation == nil, preparation == nil, recovery == nil, !isLive,
               !engine.pictureInPictureActive, !PictureInPicture.shared.busy, !engine.seeking, !restoringPosition,
@@ -569,7 +947,7 @@ import TVCore
         preparation?.cancel(); preparation = nil; discardUpcoming()
         startSampler(generation: generation)
         selectingDiscTitle = true
-        let active = generation, selection = discSelectionID, wasPaused = paused
+        let active = generation, selection = discSelectionID
         discSelection = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -578,6 +956,8 @@ import TVCore
             do {
                 let replacement = try await DiscPlayback.prepare(url: backing, headers: previous.backingHeaders, playlist: playlist)
                 guard self.generation == active, self.discSelectionID == selection, !Task.isCancelled else { replacement.close(); return }
+                self.settleSleepBeforeReopen()
+                let wasPaused = self.paused
                 self.engine.shutdown()
                 previous.disc?.close()
                 let prepared = Prepared(url: replacement.playbackURL, headers: [:], backingURL: backing,
@@ -600,6 +980,10 @@ import TVCore
         discSelectionID = UUID(); discSelection?.cancel(); discSelection = nil; selectingDiscTitle = false
     }
     func stop() {
+        backgroundHold?.cancel(); backgroundHold = nil; deferredVideoRecovery = nil
+        sleepFade.cancel(); sleepFadeRevision = nil; sleepFadeTransport = nil; sleepPendingTransport = nil
+        iptvWatch?.cancel(); iptvWatch = nil
+        iptv = nil; iptvOutputAt = nil; iptvAudioStart = nil
         updateRuntimePlaybackPins([])
         needsVideoCacheActivation = false
         cachePreparationID = UUID(); cachePreparation?.cancel(); cachePreparation = nil
@@ -620,38 +1004,94 @@ import TVCore
         sourceDanmakuGeneration = UUID()
         sourceDanmakuLoading?.cancel(); sourceDanmakuLoading = nil; sourceDanmakuLoaded = false
         if playing != nil { ErrorReports.shared.stoppedPlaying() }
-        playing = nil; sourceChannel = nil; activeChannelID = nil; historyContext = nil; pendingResume = nil
+        playing = nil; sourceChannel = nil; presentedChannel = nil; activeChannelID = nil; historyContext = nil; pendingResume = nil
         requestedResumePosition = nil; restoredPosition = nil; restoringPosition = false; keepPausedAfterRestore = false
         skipScope = nil; skipPass = EpisodeSkipPass(); skipSettings = EpisodeSkipSettings()
         editingSkip = false; resumeAfterEditing = false; seekingSegment = false
-        transfer = Transfer(); steps = []; switchNotice = nil; orientationPolicy = PlaybackOrientationPolicy()
+        transfer = Transfer(); videoCacheUsage = nil; videoCacheStatus = nil
+        cachedTimeRanges = []
+        steps = []; switchNotice = nil; orientationPolicy = PlaybackOrientationPolicy()
         qualities = []; quality = nil; showsPicture = false; buffering = false; loading = true
         onPlaybackEnded = nil; onUnplayableFile = nil; upcomingEpisode = nil; onAdvance = nil; playsOn = { false }
-        clearBoost(); healthyPrefetchSince = nil; upcomingAttempted = false; advancing = false
+        clearBoost(); healthyPrefetchSince = nil; upcomingAttempted = false; advancing = false; manualEpisodeSelection = false
+        manualEpisodeSelectionOwner = nil; interruptedEpisodePreparation = nil
+        episodeRecoveryIntent = nil; interruptedEpisodeRecovery = nil
+    }
+    private func scheduleBackgroundHold() {
+        backgroundHold?.cancel()
+        let active = generation, input = engine.inputRevision
+        backgroundHold = Task { @MainActor [weak self] in
+            // AVKit starts automatic PiP during the background transition.
+            // Give its willStart callback ownership before pausing an inline
+            // video whose display link can no longer produce pictures.
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            guard let self, self.generation == active, self.engine.inputRevision == input,
+                  UIApplication.shared.applicationState == .background,
+                  !PictureInPicture.shared.busy, !self.engine.pictureInPictureActive else { return }
+            self.backgroundHold = nil
+            self.engine.suspendForBackground()
+        }
+    }
+    private func deferVideoRecovery(_ failure: KSPlaybackFailure, position: Double? = nil, timeline: Int? = nil) -> Bool {
+        guard UIApplication.shared.applicationState != .active, currentPrepared != nil,
+              engine.mediaID != nil, !selectingDiscTitle,
+              preparation == nil || engine.mediaID == generation.uuidString,
+              playing != nil || sourceChannel != nil else { return false }
+        deferredVideoRecovery = (generation, engine.inputRevision, failure,
+                                 position ?? pendingResume ?? self.position, timeline ?? engine.timelineRevision)
+        engine.suspendForBackground()
+        error = nil; loading = false; buffering = false
+        Diagnostics.shared.record(.info, "player.recovery", "event=deferred-background \(engine.failureDiagnostic)")
+        return true
     }
     private func recoverAfterForeground() {
+        backgroundHold?.cancel(); backgroundHold = nil
         guard let prepared = currentPrepared, engine.mediaID != nil else { return }
+        if let deferred = deferredVideoRecovery {
+            deferredVideoRecovery = nil
+            if deferred.generation == generation, deferred.input == engine.inputRevision {
+                pendingResume = engine.timelineRevision == deferred.timeline ? deferred.position : position
+                // A failed native decoder stays stopped until its replacement
+                // can open in the foreground. Keep the same cached readers and
+                // the latest explicit pause/seek intent, including paused return.
+                if decoderRecoveryAttempts == 0,
+                   recoverPlayback(reusePrepared: true, decoderFailure: deferred.failure) { return }
+                finished(deferred.failure)
+                return
+            }
+        }
         // The cache, HLS proxy and disc reader intentionally use loopback URLs.
         // Returning from PiP changes the surface; it does not invalidate any of those readers.
         engine.resumeAfterForeground()
         guard !paused else { return }
-        if prepared.disc?.isAvailable == false || error != nil { _ = recoverPlayback() }
+        if prepared.disc?.isAvailable == false || error != nil {
+            if iptv != nil { iptvFailed(networkOffline: IPTVNetworkPath.shared.offline) }
+            else { _ = recoverPlayback() }
+        }
     }
-    @discardableResult private func recoverPlayback(reusePrepared: Bool = false) -> Bool {
-        guard recovery == nil, recoveryAttempts < 2, !selectingDiscTitle,
+    @discardableResult private func recoverPlayback(reusePrepared: Bool = false, decoderFailure: KSPlaybackFailure? = nil) -> Bool {
+        guard !manualEpisodeSelection, recovery == nil, recoveryAttempts < 2, !selectingDiscTitle,
               preparation == nil || engine.mediaID == generation.uuidString,
               let selected = playing ?? sourceChannel else { return false }
         let source: Channel
-        if !reusePrepared, let room = sourceChannel, LiveCatalog.isRoom(room.url) { source = room }
+        if !reusePrepared, let room = sourceChannel, let address = IPTVRoomAddress(room.url) {
+            source = Channel(name: room.name, group: room.group, url: address.withQuality(quality).url)
+        } else if !reusePrepared, let room = sourceChannel, LiveCatalog.isRoom(room.url) { source = room }
         else { source = selected }
         if reusePrepared, currentPrepared == nil { return false }
         if let lastRecovery, Date().timeIntervalSince(lastRecovery) < 2 { return false }
         saveHistory()
         cancelDiscSelection()
         preparation?.cancel(); preparation = nil; discardUpcoming()
+        let previousRecovery = lastRecovery
         recoveryAttempts += 1; lastRecovery = Date()
+        deferredVideoRecovery = nil
         Diagnostics.shared.record(.info, "player.recovery", "event=begin reuseInput=\(reusePrepared) attempt=\(recoveryAttempts) \(engine.failureDiagnostic)")
         let savedPosition = pendingResume ?? position, savedTimeline = engine.timelineRevision
+        if !isLive, iptv == nil, let presentedChannel {
+            episodeRecoveryIntent = EpisodeRecoveryIntent(channel: presentedChannel, position: savedPosition, timeline: savedTimeline,
+                reusePrepared: reusePrepared, failure: decoderFailure, previousRecovery: previousRecovery)
+        }
         generation = UUID(); let active = generation
         restoringPosition = false; seekingSegment = false; pendingResume = nil
         preparationStarted = Date()
@@ -659,6 +1099,17 @@ import TVCore
         steps = [reusePrepared ? "正在恢复视频解码" : "正在重新解析播放地址"]
         recovery = Task { [weak self] in
             guard let self, self.generation == active, !Task.isCancelled else { return }
+            defer { if self.generation == active { self.episodeRecoveryIntent = nil } }
+            if reusePrepared, UIApplication.shared.applicationState != .active {
+                // The app can leave the foreground after finished() schedules
+                // this task. A queued retry must not open hardware in that gap.
+                self.recovery = nil
+                self.recoveryAttempts = max(0, self.recoveryAttempts - 1)
+                self.lastRecovery = previousRecovery
+                _ = self.deferVideoRecovery(decoderFailure ?? KSPlaybackFailure(message: "视频解码暂不可用。"),
+                                            position: savedPosition, timeline: savedTimeline)
+                return
+            }
             do {
                 let channel = !reusePrepared && LiveCatalog.isRoom(source.url) ? try await LiveCatalog.resolve(source).0 : source
                 let prepared: Prepared
@@ -670,9 +1121,11 @@ import TVCore
                 }
                 // Take the latest intent: pause/seek can be used while network
                 // preparation runs. Shutdown callbacks belong to the old epoch.
+                self.settleSleepBeforeReopen()
                 let wasPaused = self.paused
                 let resume = self.engine.seeking || self.engine.timelineRevision != savedTimeline ? self.position : savedPosition
                 let selections = self.engine.selections
+                if reusePrepared { self.decoderRecoveryAttempts += 1 }
                 self.externalSubtitles.prepareForReopen()
                 self.engine.shutdown()
                 if !reusePrepared, let previous = self.currentPrepared { Self.release(source, previous) }
@@ -755,7 +1208,8 @@ import TVCore
         let prepared = try await MobileMediaServices.preparePlayable(next,
             cacheEnabled: UserDefaults.standard.object(forKey: "local.videoCache.enabled") as? Bool ?? true,
             sizeGB: max(1, min(4, UserDefaults.standard.integer(forKey: "local.videoCache.sizeGB"))),
-            adClean: UserDefaults.standard.object(forKey: "local.hlsAdClean") as? Bool ?? true, isLive: isLive)
+            adClean: UserDefaults.standard.object(forKey: "local.hlsAdClean") as? Bool ?? true, isLive: isLive,
+            scopeIPTVHeaders: iptv != nil || sourceChannel.flatMap { IPTVRoomAddress($0.url) } != nil)
         return Prepared(url: prepared.url, headers: prepared.headers, owner: prepared.ownerID, backingURL: address,
                         audioURL: prepared.audioURL, audioHeaders: prepared.audioHeaders,
                         cacheIOURL: prepared.cacheIOURL, audioCacheIOURL: prepared.audioCacheIOURL)
@@ -766,7 +1220,71 @@ import TVCore
         HongguoStreams.stop(channel.url)
         CloudStreams.stop(prepared.backingURL ?? prepared.url)
     }
+    /// A manual episode intent keeps at most a matching prepared next episode. The caller
+    /// waits for cancelled native work to finish before resolving its final swipe target.
+    func suspendEpisodePrefetch(for episode: Episode?, context: PlaybackHistoryContext, owner: UUID) -> [Task<Void, Never>] {
+        guard iptv == nil, !isLive else { return [] }
+        manualEpisodeSelection = true; manualEpisodeSelectionOwner = owner
+        healthyPrefetchSince = nil
+        let previous = [preparation, recovery, cachePreparation, upcomingTask, prefetchWarm].compactMap { $0 }
+        if preparation != nil, currentPrepared == nil { interruptedEpisodePreparation = presentedChannel }
+        if recovery != nil, let intent = episodeRecoveryIntent {
+            interruptedEpisodeRecovery = intent
+            interruptedEpisodePreparation = intent.channel
+            episodeRecoveryIntent = nil
+            recoveryAttempts = max(0, recoveryAttempts - 1); lastRecovery = intent.previousRecovery
+        }
+        for task in previous { task.cancel() }
+        preparation = nil; recovery = nil
+        cachePreparation = nil; cachePreparationID = UUID()
+        upcomingTask = nil; prefetchWarm = nil; prefetchWarmID = UUID()
+        if episode.map({ upcomingMatches($0, context: context) }) != true {
+            if let (channel, prepared) = upcoming { Self.release(channel, prepared) }
+            upcoming = nil; prefetchComplete = false
+        }
+        return previous
+    }
+
+    /// Return only this still-current cancelled preparation. The view checks that the player
+    /// is still presented before resuming it; closing the player must not restart playback.
+    func resumeEpisodePrefetch(owner: UUID) -> Channel? {
+        guard manualEpisodeSelection, manualEpisodeSelectionOwner == owner else { return nil }
+        manualEpisodeSelection = false; manualEpisodeSelectionOwner = nil
+        healthyPrefetchSince = nil; upcomingAttempted = false
+        defer { interruptedEpisodePreparation = nil }
+        guard preparation == nil, let interruptedEpisodePreparation,
+              interruptedEpisodePreparation == presentedChannel else { return nil }
+        if interruptedEpisodeRecovery != nil { return interruptedEpisodePreparation }
+        guard currentPrepared == nil else { return nil }
+        return interruptedEpisodePreparation
+    }
+
+    /// Called only after the cancelled task drained and Store confirmed this channel is
+    /// still presented. Resume through the bounded retry path to retain tracks and pause.
+    func resumeInterruptedEpisodeRecovery(_ channel: Channel) -> Bool {
+        guard let intent = interruptedEpisodeRecovery, intent.channel == channel,
+              presentedChannel == channel, !manualEpisodeSelection else { return false }
+        interruptedEpisodeRecovery = nil
+        pendingResume = engine.seeking || engine.timelineRevision != intent.timeline ? position : intent.position
+        if !recoverPlayback(reusePrepared: intent.reusePrepared, decoderFailure: intent.failure) {
+            error = "播放恢复已取消，请重试当前集。"; loading = false; buffering = false
+        }
+        return true
+    }
+
+    func playUpcoming(matching episode: Episode, context: PlaybackHistoryContext) -> Bool {
+        guard upcomingMatches(episode, context: context) else { return false }
+        return playUpcoming()
+    }
+
+    private func upcomingMatches(_ episode: Episode, context: PlaybackHistoryContext) -> Bool {
+        guard let next = upcoming?.0.historyContext else { return false }
+        return next.id == context.id && next.libraryScope == context.libraryScope &&
+            next.episodeFlag == episode.flag && next.episodeID == episode.id
+    }
+
     private func queueUpcomingIfDue() {
+        guard iptv == nil, !manualEpisodeSelection else { return }
         let enabled = UserDefaults.standard.object(forKey: "local.playback.prefetchNext") as? Bool ?? true
         let ahead = max(0, engine.bufferedPosition - position)
         let healthy = NextMediaPolicy.mayPrepare(enabled: enabled, paused: paused, buffering: buffering,
@@ -791,6 +1309,7 @@ import TVCore
         }
     }
     private func warmUpcomingIfSafe() {
+        guard !manualEpisodeSelection else { return }
         let healthy = NextMediaPolicy.mayPrepare(enabled: UserDefaults.standard.object(forKey: "local.playback.prefetchNext") as? Bool ?? true,
             paused: paused, buffering: buffering, seeking: engine.seeking || restoringPosition || seekingSegment,
             bufferedSeconds: max(0, engine.bufferedPosition - position), speed: Double(engine.speed))
@@ -817,7 +1336,7 @@ import TVCore
         advancing = true; upcoming = nil
         let advance = onAdvance, end = onPlaybackEnded, resolve = upcomingEpisode, shouldPlay = playsOn
         saveHistory()
-        stop(); begin(channel); sourceChannel = channel
+        stop(); begin(channel); sourceChannel = channel; presentedChannel = channel
         onAdvance = advance; onPlaybackEnded = end; upcomingEpisode = resolve; playsOn = shouldPlay
         playing = channel; currentPrepared = prepared; automatic = prepared.url; activeChannelID = channel.id
         open(prepared, channel: channel)

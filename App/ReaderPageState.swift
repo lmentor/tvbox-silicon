@@ -1,6 +1,42 @@
 import Foundation
 import CoreGraphics
 
+/// Layout is independent of scrolling direction and is shared by manga and catalog images.
+enum ReaderColumns: Int, CaseIterable, Identifiable, Sendable {
+    case single = 1, double = 2
+    static let preferenceKey = "reader.columns"
+    var id: Int { rawValue }
+    var title: String { self == .single ? "单列" : "双列" }
+
+    static func load(from defaults: UserDefaults = .standard) -> Self {
+        Self(rawValue: defaults.integer(forKey: preferenceKey)) ?? .single
+    }
+
+    func save(to defaults: UserDefaults = .standard) { defaults.set(rawValue, forKey: Self.preferenceKey) }
+}
+
+/// Every chapter owns its own pairs. A final single page never borrows the next chapter's image.
+struct ReaderPageLayout {
+    let pageCount: Int
+    let columns: ReaderColumns
+
+    var starts: [Int] { Array(stride(from: 0, to: max(0, pageCount), by: columns.rawValue)) }
+
+    func pages(containing page: Int) -> Range<Int> {
+        guard pageCount > 0 else { return 0..<0 }
+        let start = min(max(0, page), pageCount - 1) / columns.rawValue * columns.rawValue
+        return start..<min(pageCount, start + columns.rawValue)
+    }
+
+    /// At most three extra bitmaps regardless of column count or chapter length.
+    func prefetchPages(containing page: Int) -> [Int] {
+        let visible = pages(containing: page)
+        guard !visible.isEmpty else { return [] }
+        return [visible.upperBound, visible.upperBound + 1, visible.lowerBound - 1]
+            .filter { (0..<pageCount).contains($0) }
+    }
+}
+
 /// The requested page and the page actually on screen advance independently while an image loads.
 /// Tokens reject late successes and failures, including an earlier visit to the very same URL.
 struct ReaderPageHandoff<Page: Equatable, Value> {
@@ -57,25 +93,34 @@ struct ReaderPageIntent: Equatable {
     let chapter: Int
     let page: Int
     var fromEnd = false
+    var pageStride = 1
 
-    func stepped(_ distance: Int) -> Self { Self(chapter: chapter, page: page + distance, fromEnd: fromEnd) }
+    func stepped(_ distance: Int) -> Self {
+        Self(chapter: chapter, page: page + distance * max(1, pageStride), fromEnd: fromEnd, pageStride: pageStride)
+    }
 
     func normalizedBoundary() -> Self {
-        if !fromEnd && page < 0 { return Self(chapter: chapter - 1, page: page, fromEnd: true) }
-        if fromEnd && page >= 0 { return Self(chapter: chapter + 1, page: page) }
+        if !fromEnd && page < 0 { return Self(chapter: chapter - 1, page: page, fromEnd: true, pageStride: pageStride) }
+        if fromEnd && page >= 0 { return Self(chapter: chapter + 1, page: page, pageStride: pageStride) }
         return self
     }
 
     func resolve(pageCount: Int) -> Resolution {
         guard pageCount > 0 else { return .page(0) }
-        let index = fromEnd ? pageCount + page : page
-        if index < 0 { return .chapter(Self(chapter: chapter - 1, page: index, fromEnd: true)) }
-        if index >= pageCount { return .chapter(Self(chapter: chapter + 1, page: index - pageCount)) }
-        return .page(index)
+        // Pad only the navigation arithmetic: 1–2, 3–4, 5 is three turns, so
+        // next from page 5 goes to the following chapter's first pair, never its second page.
+        let step = max(1, pageStride)
+        let extent = ((pageCount - 1) / step + 1) * step
+        let index = fromEnd ? extent + page : page
+        if index < 0 { return .chapter(Self(chapter: chapter - 1, page: index, fromEnd: true, pageStride: step)) }
+        if index >= extent { return .chapter(Self(chapter: chapter + 1, page: index - extent, pageStride: step)) }
+        return .page(min(index, pageCount - 1) / step * step)
     }
 
     func clampedPage(pageCount: Int) -> Int {
-        min(max(0, fromEnd ? pageCount + page : page), max(0, pageCount - 1))
+        let step = max(1, pageStride)
+        let extent = pageCount > 0 ? ((pageCount - 1) / step + 1) * step : 0
+        return min(max(0, fromEnd ? extent + page : page), max(0, pageCount - 1)) / step * step
     }
 }
 
@@ -115,4 +160,23 @@ enum ReaderVerticalViewport {
                 return left.value.minY < right.value.minY
             }?.key
     }
+}
+
+/// A row's document coordinate changes when preceding lazy images resize. Offset changes
+/// from the user's finger cancel out, so correcting layout never cancels ordinary scrolling.
+struct ReaderVerticalAnchor<Page: Hashable> {
+    private var page: Page?
+    private var documentTop: CGFloat = 0
+
+    mutating func remember(page: Page, frame: CGRect, scrollOffset: CGFloat) {
+        self.page = page
+        documentTop = frame.minY + scrollOffset
+    }
+
+    func correction(frames: [Page: CGRect], scrollOffset: CGFloat) -> CGFloat {
+        guard let page, let frame = frames[page] else { return 0 }
+        return frame.minY + scrollOffset - documentTop
+    }
+
+    var anchoredPage: Page? { page }
 }

@@ -6,7 +6,7 @@ const maximumReferences = 20000;
 
 // Inspect complete boxes only. A regular MP4 or incomplete, large or
 // hierarchical index stays on the existing whole-resource path.
-export function inspectSegmentedMP4(bytes) {
+export function inspectSegmentedMP4(bytes, { includeRandomAccess = false } = {}) {
   let offset = 0, movie = false;
   const safe = value => value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : NaN;
   while (offset + 8 <= bytes.length) {
@@ -41,7 +41,12 @@ export function inspectSegmentedMP4(bytes) {
         const length = word & 0x7fffffff;
         if (word >>> 31 || !length || !duration || !Number.isSafeInteger(start + length)
           || !Number.isSafeInteger(time + duration)) return null;
-        segments.push({ start, end: start + length - 1, time, duration });
+        const sap = bytes.readUInt32BE(cursor + 8);
+        // Type 1 at delta zero has no leading-picture/reference dependency.
+        // A starts-with-SAP flag with undefined type 0 is not sufficient.
+        const randomAccess = (sap >>> 31) === 1 && ((sap >>> 28) & 7) === 1 && (sap & 0x0fffffff) === 0;
+        segments.push({ start, end: start + length - 1, time, duration,
+          ...(includeRandomAccess ? { randomAccess } : {}) });
         start += length; time += duration;
       }
       return { initializationEnd: offset - 1, timescale, segments };

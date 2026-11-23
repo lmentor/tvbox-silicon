@@ -29,16 +29,21 @@ enum MangaHTTP {
         var method = "GET"
         var headers: [String: String] = [:]
         var body: Data?
+        var cookies: MangaCookieJar = .shared
 
         func urlRequest() -> URLRequest {
             var request = URLRequest(url: url, timeoutInterval: 30)
             request.httpMethod = method
             request.httpShouldHandleCookies = false
             var fields = headers
+            if let browserAgent = cookies.clearanceUserAgent(for: url) {
+                fields = fields.filter { $0.key.lowercased() != "user-agent" }
+                fields["User-Agent"] = browserAgent
+            }
             if !fields.keys.contains(where: { $0.lowercased() == "user-agent" }) { fields["User-Agent"] = MangaHTTP.userAgent }
             let given = fields.first { $0.key.lowercased() == "cookie" }
             if let given { fields.removeValue(forKey: given.key) }
-            if let cookie = MangaCookieJar.shared.header(for: url, merging: given?.value) { fields["Cookie"] = cookie }
+            if let cookie = cookies.header(for: url, merging: given?.value) { fields["Cookie"] = cookie }
             for (field, value) in fields where !(field + value).contains(where: \.isNewline) {
                 // Dio sends headers as given; URLSession manages these itself.
                 if ["content-length", "host", "connection"].contains(field.lowercased()) { continue }
@@ -59,14 +64,12 @@ enum MangaHTTP {
     static let plainUserAgent = "Dart/3.5 (dart:io)"
 
     /// One request with the jar's cookies; the jar keeps what the answer sets.
-    static func data(_ request: Request, notes: Bool = false) async throws -> (Data, HTTPURLResponse) {
+    static func data(_ request: Request, notes: Bool = false, maximumBytes: Int = 20_000_000,
+                     retryChallenge: Bool = true) async throws -> (Data, HTTPURLResponse) {
         do {
-            let (data, http) = try await answer(request)
+            let (data, http) = try await answer(request, maximumBytes: maximumBytes, retryChallenge: retryChallenge)
             if notes, let kind = MangaSiteProblem.kind(http, data) {
                 MangaSiteProblem.note(MangaSiteProblem(kind: kind, host: request.url.host ?? "", status: http.statusCode))
-                #if DEBUG
-                if ProcessInfo.processInfo.environment["MANGA_HTTP_LOG"] != nil { NSLog("[mangahttp] problem %@", "\(kind)") }
-                #endif
             }
             return (data, http)
         } catch let error as URLError where notes && error.code != .cancelled {
@@ -75,29 +78,25 @@ enum MangaHTTP {
         }
     }
 
-    private static func answer(_ request: Request) async throws -> (Data, HTTPURLResponse) {
+    private static func answer(_ request: Request, maximumBytes: Int, retryChallenge: Bool) async throws -> (Data, HTTPURLResponse) {
+        try Task.checkCancellation()
         var request = request
         if let answer = signedOutFavorite(request) { return answer }
-        let chosenAgent = request.headers.keys.contains { $0.lowercased() == "user-agent" }
+        let chosenAgent = request.cookies.clearanceUserAgent(for: request.url) != nil || request.headers.keys.contains { $0.lowercased() == "user-agent" }
         let host = request.url.host ?? ""
         if !chosenAgent, plainHosts.contains(host) { request.headers["User-Agent"] = plainUserAgent }
-        var (data, response) = try await session.data(for: request.urlRequest())
+        var (data, response) = try await transport(request, maximumBytes: maximumBytes)
         guard var http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        MangaCookieJar.shared.store(http, for: http.url ?? request.url)
+        request.cookies.store(http, for: http.url ?? request.url)
         let challenged = http.url?.path.contains("challenge") == true || http.value(forHTTPHeaderField: "cf-mitigated") == "challenge"
-        if challenged, !chosenAgent, request.headers["User-Agent"] != plainUserAgent {
+        if retryChallenge, challenged, !chosenAgent, request.headers["User-Agent"] != plainUserAgent {
             plainHosts.insert(host)
             request.headers["User-Agent"] = plainUserAgent
-            (data, response) = try await session.data(for: request.urlRequest())
+            (data, response) = try await transport(request, maximumBytes: maximumBytes)
             guard let retried = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
             http = retried
-            MangaCookieJar.shared.store(http, for: http.url ?? request.url)
+            request.cookies.store(http, for: http.url ?? request.url)
         }
-        #if DEBUG
-        if ProcessInfo.processInfo.environment["MANGA_HTTP_LOG"] != nil {
-            NSLog("[mangahttp] %d %@ dev=%@ %@", http.statusCode, request.url.absoluteString, request.headers["device"] ?? "-", http.statusCode == 210 || http.statusCode >= 400 ? String(decoding: data.prefix(300), as: UTF8.self) : "")
-        }
-        #endif
         // 拷贝漫画 allows about 15 API requests a minute from one address, whatever made-up device each names, and
         // answers the rest 210: "Expected available in N seconds", or with no wait "update to the official
         // app…a cracked version". Asking again at once only adds to the count, so the wait it names (else 5, 10,
@@ -112,17 +111,27 @@ enum MangaHTTP {
             waited += pause
             tries += 1
             _ = MangaDevice.renew(&request.headers)
-            (data, response) = try await session.data(for: request.urlRequest())
+            (data, response) = try await transport(request, maximumBytes: maximumBytes)
             guard let again = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
             http = again
-            #if DEBUG
-            if ProcessInfo.processInfo.environment["MANGA_HTTP_LOG"] != nil {
-                NSLog("[mangahttp] retry %d %@ dev=%@", http.statusCode, request.url.absoluteString, request.headers["device"] ?? "-")
-            }
-            #endif
-            MangaCookieJar.shared.store(http, for: http.url ?? request.url)
+            request.cookies.store(http, for: http.url ?? request.url)
         }
         return (data, http)
+    }
+
+    private static func transport(_ request: Request, maximumBytes: Int) async throws -> (Data, URLResponse) {
+        let jar = request.cookies
+        return try await BoundedHTTPData.load(request.urlRequest(), session: session, maximumBytes: maximumBytes,
+            redirectHandler: { response, next in
+                if let url = response.url { jar.store(response, for: url) }
+                var next = next
+                // Recompute cookies for every redirect, including redirects to
+                // a host without matching cookies. Never carry the old header.
+                next.setValue(next.url.flatMap { jar.header(for: $0, merging: nil) }, forHTTPHeaderField: "Cookie")
+                if let url = next.url, let agent = jar.clearanceUserAgent(for: url) { next.setValue(agent, forHTTPHeaderField: "User-Agent") }
+                if response.url?.host != next.url?.host { next.setValue(nil, forHTTPHeaderField: "Authorization") }
+                return next
+            })
     }
 
     /// copy_manga.js asks whether a comic is in the account's favourites on every comic page, signed out too
@@ -147,26 +156,33 @@ enum MangaHTTP {
 
     /// `sendMessage({method: 'http'})` for the prelude: starts the request and hands `finish` the JSON answer
     /// {status, headers, text | base64} or {error}. Returns how to cancel it.
-    static func start(_ options: [String: Any], finish: @escaping @Sendable (String) -> Void) -> () -> Void {
+    static func start(_ options: [String: Any], maximumBytes: Int = 20_000_000, retryChallenge: Bool = true,
+                      cookies: MangaCookieJar = .shared,
+                      finish: @escaping @Sendable (String) -> Void) -> () -> Void {
         guard let address = options["url"] as? String, let url = URL(string: address) ?? address.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed).flatMap(URL.init(string:)),
               url.scheme == "http" || url.scheme == "https" else {
             finish(MangaHost.json(["error": "Invalid URL: \(options["url"] ?? "")"]) ?? "{}")
             return {}
         }
         var request = Request(url: url, method: (options["method"] as? String ?? "GET").uppercased())
+        request.cookies = cookies
         request.headers = (options["headers"] as? [String: Any] ?? [:]).compactMapValues { $0 as? String }
         if let body = options["body"] as? String { request.body = Data(base64Encoded: body) }
         let bytes = options["bytes"] as? Bool ?? false
         let task = Task {
             do {
-                let (data, response) = try await Self.data(request, notes: true)
+                let (data, response) = try await Self.data(request, notes: true, maximumBytes: maximumBytes, retryChallenge: retryChallenge)
+                try Task.checkCancellation()
                 var headers: [String: String] = [:]
                 for (field, value) in response.allHeaderFields { headers[String(describing: field).lowercased()] = String(describing: value) }
                 var answer: [String: Any] = ["status": response.statusCode, "headers": headers]
                 if bytes { answer["base64"] = data.base64EncodedString() } else { answer["text"] = text(data, contentType: headers["content-type"]) }
-                finish(MangaHost.json(answer) ?? "{}")
+                let encoded = MangaHost.json(answer) ?? "{}"
+                try Task.checkCancellation()
+                finish(encoded)
             } catch {
-                finish(MangaHost.json(["error": (error as? URLError)?.code == .cancelled ? "cancelled" : error.localizedDescription]) ?? "{}")
+                let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
+                finish(MangaHost.json(["error": cancelled ? "cancelled" : error.localizedDescription]) ?? "{}")
             }
         }
         return { task.cancel() }
@@ -185,28 +201,74 @@ enum MangaHTTP {
 /// Cookies of every comic source, kept across launches (Network.setCookies/getCookies/deleteCookies too).
 public final class MangaCookieJar: @unchecked Sendable {
     public static let shared = MangaCookieJar()
+    private static let sourceJars = SourceJars()
+    private final class SourceJars: @unchecked Sendable {
+        let lock = NSLock()
+        var jars: [String: MangaCookieJar] = [:]
+        func jar(_ key: String) -> MangaCookieJar {
+            lock.withLock {
+                if let jar = jars[key] { return jar }
+                let jar = MangaCookieJar(source: key); jars[key] = jar; return jar
+            }
+        }
+    }
     private let lock = NSLock()
     private var cookies: [HTTPCookie] = []
     private var loaded = false
+    private let source: String?
+    private let memoryOnly: Bool
+    private let browserAgent: String?
     private var file: URL { MangaLibrary.root.appendingPathComponent("cookies.json") }
 
+    init(source: String? = nil, cookies: [HTTPCookie]? = nil, userAgent: String? = nil) {
+        self.source = source; memoryOnly = cookies != nil; browserAgent = userAgent
+        if let cookies { self.cookies = cookies; loaded = true }
+    }
+
+    /// Keep legacy account jars intact. New browser credentials are source-owned
+    /// and never copied back to the historical shared domain jar.
+    static func forSource(_ key: String) -> MangaCookieJar {
+        MangaSourceData.shared.value(key, "_webCookies") != nil ? sourceJars.jar(key) : .shared
+    }
+
+    public static func webCookies(_ key: String) -> [HTTPCookie] { sourceJars.jar(key).allCookies() }
+
+    /// Browser challenge cookies are tied to the exact browser user agent. Keep
+    /// source-authored API agents on requests that do not carry that cookie.
+    func clearanceUserAgent(for url: URL) -> String? {
+        guard cookies(for: url).contains(where: { $0.name == "cf_clearance" }) else { return nil }
+        return source.flatMap { MangaSourceData.shared.value($0, "_webUserAgent") as? String } ?? browserAgent
+    }
+
+    func allCookies() -> [HTTPCookie] { lock.withLock { ensureLoaded(); return cookies.filter { $0.expiresDate.map { $0 > Date() } ?? true } } }
+    static func encoded(_ cookies: [HTTPCookie]) -> [[String: Any]] {
+        cookies.map { cookie in
+            var item: [String: Any] = ["name": cookie.name, "value": cookie.value, "domain": cookie.domain, "path": cookie.path,
+                                      "secure": cookie.isSecure, "httpOnly": cookie.isHTTPOnly]
+            if let expires = cookie.expiresDate { item["expires"] = expires.timeIntervalSince1970 }
+            return item
+        }
+    }
+
     private func ensureLoaded() {
-        guard !loaded else { return }
+        guard !loaded || source != nil else { return }
         loaded = true
-        guard let list = (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) as? [[String: Any]] else { return }
+        let saved: Any?
+        if let source { saved = MangaSourceData.shared.value(source, "_webCookies") }
+        else { saved = try? JSONSerialization.jsonObject(with: Data(contentsOf: file)) }
+        guard let list = saved as? [[String: Any]] else { cookies = []; return }
         cookies = list.compactMap { item in
             var properties: [HTTPCookiePropertyKey: Any] = [.name: item["name"] ?? "", .value: item["value"] ?? "", .domain: item["domain"] ?? "", .path: item["path"] ?? "/"]
             if let expires = item["expires"] as? Double { properties[.expires] = Date(timeIntervalSince1970: expires) }
             if item["secure"] as? Bool == true { properties[.secure] = "TRUE" }
+            if item["httpOnly"] as? Bool == true { properties[HTTPCookiePropertyKey("HttpOnly")] = "TRUE" }
             return HTTPCookie(properties: properties)
         }.filter { $0.expiresDate.map { $0 > Date() } ?? true }
     }
     private func save() {
-        let list: [[String: Any]] = cookies.filter { !$0.isSessionOnly || true }.map { cookie in
-            var item: [String: Any] = ["name": cookie.name, "value": cookie.value, "domain": cookie.domain, "path": cookie.path, "secure": cookie.isSecure]
-            if let expires = cookie.expiresDate { item["expires"] = expires.timeIntervalSince1970 }
-            return item
-        }
+        guard !memoryOnly else { return }
+        let list = Self.encoded(cookies)
+        if let source { MangaSourceData.shared.set(source, "_webCookies", list); return }
         try? FileManager.default.createDirectory(at: MangaLibrary.root, withIntermediateDirectories: true)
         if let data = try? JSONSerialization.data(withJSONObject: list) { try? data.write(to: file, options: .atomic) }
     }
@@ -218,9 +280,9 @@ public final class MangaCookieJar: @unchecked Sendable {
         var domain = cookie.domain.lowercased()
         let hostOnly = !domain.hasPrefix(".")
         if domain.hasPrefix(".") { domain.removeFirst() }
-        guard host == domain || (!hostOnly && host.hasSuffix("." + domain)) || host.hasSuffix("." + domain) else { return false }
+        guard host == domain || (!hostOnly && host.hasSuffix("." + domain)) else { return false }
         let path = url.path.isEmpty ? "/" : url.path
-        return path.hasPrefix(cookie.path) || cookie.path.isEmpty
+        return cookie.path.isEmpty || path == cookie.path || path.hasPrefix(cookie.path.hasSuffix("/") ? cookie.path : cookie.path + "/")
     }
 
     public func cookies(for url: URL) -> [HTTPCookie] { lock.withLock { ensureLoaded(); return cookies.filter { Self.matches($0, url) } } }
@@ -264,8 +326,12 @@ public final class MangaCookieJar: @unchecked Sendable {
         switch request["function"] as? String {
         case "set":
             let list = (request["cookies"] as? [[String: Any]] ?? []).compactMap { item -> HTTPCookie? in
-                HTTPCookie(properties: [.name: item["name"] as? String ?? "", .value: item["value"] as? String ?? "",
-                                        .domain: item["domain"] as? String ?? url.host ?? "", .path: "/"])
+                var properties: [HTTPCookiePropertyKey: Any] = [.name: item["name"] as? String ?? "", .value: item["value"] as? String ?? "",
+                                                               .domain: item["domain"] as? String ?? url.host ?? "", .path: item["path"] as? String ?? "/"]
+                if item["secure"] as? Bool == true { properties[.secure] = "TRUE" }
+                if item["httpOnly"] as? Bool == true { properties[HTTPCookiePropertyKey("HttpOnly")] = "TRUE" }
+                if let expires = item["expires"] as? Double { properties[.expires] = Date(timeIntervalSince1970: expires / 1000) }
+                return HTTPCookie(properties: properties)
             }
             add(list)
             return nil

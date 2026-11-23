@@ -2,8 +2,8 @@ import SwiftUI
 import Perception
 import TVCore
 
-/// Continue Watching keeps native tap/long-press arbitration and presents its
-/// actions on the same glass surface as the other homepage panels.
+/// Continue Watching gives one native responder ownership of tap/hold while the
+/// two surrounding scroll views retain their pan gestures.
 struct HistoryCard: View {
     @Environment(Store.self) private var store
     @Environment(\.isEnabled) private var isEnabled
@@ -13,6 +13,7 @@ struct HistoryCard: View {
     #if os(iOS)
     @Environment(\.isLocalPageActive) private var isPageActive
     @State private var actionsShown = false
+    @State private var pressing = false
     @State private var pendingAction: HistoryAction?
     #endif
     let entry: PlaybackHistoryEntry
@@ -27,12 +28,20 @@ struct HistoryCard: View {
 
     var body: some View {
         WithPerceptionTracking {
-            Button { resume() } label: { HistoryCardLabel(entry: entry) }
-                .cardButton()
-                #if os(iOS)
-                .highPriorityGesture(LongPressGesture(minimumDuration: 0.5, maximumDistance: 10).onEnded { _ in
-                    showActions()
-                })
+            #if os(iOS)
+            HistoryCardLabel(entry: entry)
+                .opacity(pressing ? 0.72 : 1)
+                .allowsHitTesting(false)
+                .overlay {
+                    LocalTouchSurface(enabled: canInteract && !actionsShown, holdDuration: 0.5,
+                                      tap: { resume() }, hold: showActions, pressing: { pressing = $0 })
+                        .id(entry.id)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(entry.context.displayTitle)
+                .accessibilityValue(entry.context.episodeName + " · " + HistoryFormat.status(entry))
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { resume() }
                 .accessibilityAction(named: Text("更多操作"), showActions)
                 .localGlassDialog(isPresented: $actionsShown, title: entry.context.displayTitle,
                                   maxWidth: 420, layout: .centered, onDismiss: performPendingAction) {
@@ -54,11 +63,17 @@ struct HistoryCard: View {
                 .appOnChange(of: canInteract) { _, active in
                     if !active { pendingAction = nil; actionsShown = false }
                 }
-                #else
-                .contextMenu { WithPerceptionTracking { menu } }
-                #endif
                 .disabled(!canInteract)
                 .accessibilityIdentifier("history.resume." + entry.context.videoID)
+            #else
+            Button { resume() } label: {
+                HistoryCardLabel(entry: entry).contentShape(Rectangle())
+            }
+                .cardButton()
+                .contextMenu { WithPerceptionTracking { menu } }
+                .disabled(!canInteract)
+                .accessibilityIdentifier("history.resume." + entry.context.videoID)
+            #endif
         }
     }
 

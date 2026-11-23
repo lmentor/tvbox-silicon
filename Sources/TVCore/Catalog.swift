@@ -96,6 +96,7 @@ public struct Video: Identifiable, Hashable, Sendable, Codable {
     public let area: String?
     public let director: String?
     public let actor: String?
+    public let panShare: SitePanShare?
     /// A plugin setting listed among titles (`action`, e.g. FTY's "LoginShow" or "quarkClean"): TVBox runs
     /// `Spider.action` for it instead of opening details, which the plugin can't answer for such an item.
     public let action: String?
@@ -103,11 +104,13 @@ public struct Video: Identifiable, Hashable, Sendable, Codable {
     private let folderChoices: [String: String]?
     public init(id: String, name: String, poster: URL? = nil, posterHeaders: [String: String] = [:], year: String? = nil,
                 remarks: String = "", synopsis: String = "", episodes: [Episode] = [], category: String? = nil, action: String? = nil,
-                folderCategoryID: String? = nil, folderFilters: [String: String] = [:], area: String? = nil, director: String? = nil, actor: String? = nil) {
+                folderCategoryID: String? = nil, folderFilters: [String: String] = [:], area: String? = nil, director: String? = nil, actor: String? = nil,
+                panShare: SitePanShare? = nil) {
         self.id = id; self.name = name; self.poster = poster; self.posterHeaders = posterHeaders
         self.year = year; self.remarks = remarks; self.synopsis = synopsis; self.episodes = episodes; self.category = category
         self.action = action
         self.area = area; self.director = director; self.actor = actor
+        self.panShare = panShare
         self.folderID = folderCategoryID; self.folderChoices = folderFilters.isEmpty ? nil : folderFilters
     }
     /// A folder of a drive source (AList, 小雅 and other cloud-drive spiders tag it `vod_tag: "folder"`). As in
@@ -121,7 +124,16 @@ public struct Video: Identifiable, Hashable, Sendable, Codable {
         guard self.poster == nil, let poster else { return self }
         return Video(id: id, name: name, poster: poster, posterHeaders: headers ?? [:], year: year,
                      remarks: remarks, synopsis: synopsis, episodes: episodes, category: category, action: action,
-                     folderCategoryID: folderID, folderFilters: folderFilters, area: area, director: director, actor: actor)
+                     folderCategoryID: folderID, folderFilters: folderFilters, area: area, director: director, actor: actor, panShare: panShare)
+    }
+    /// A category page or the same work's listing can supply metadata omitted by details.
+    /// Explicit provider types and folder identities always keep their original meaning.
+    public func keepingCategory(_ fallback: String?) -> Video {
+        guard !isFolder, let category = CatalogVideoCategory.retaining(category, fallback: fallback),
+              category != self.category else { return self }
+        return Video(id: id, name: name, poster: poster, posterHeaders: posterHeaders, year: year,
+                     remarks: remarks, synopsis: synopsis, episodes: episodes, category: category, action: action,
+                     folderCategoryID: folderID, folderFilters: folderFilters, area: area, director: director, actor: actor, panShare: panShare)
     }
     public init?(json: [String: JSONValue], origin: URL) {
         guard let id = json["vod_id"]?.string ?? json["id"]?.string ?? json["type_id"]?.string, !id.isEmpty else { return nil }
@@ -156,6 +168,7 @@ public struct Video: Identifiable, Hashable, Sendable, Codable {
         folderID = isDirectory ? (cate != nil ? cate?["id"]?.string ?? id : json["type_id"]?.string ?? id) : nil
         folderChoices = (cate?["filters"] ?? cate?["extend"] ?? json["categoryFilters"])?.object?.compactMapValues(\.string)
         action = json["action"]?.string.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        panShare = isDirectory ? nil : SitePanShare(json: json["panShare"]?.object)
         let flags = (json["vod_play_from"]?.string ?? "").components(separatedBy: "$$$")
         var groups: [[Episode]] = []
         for (groupIndex, group) in (json["vod_play_url"]?.string ?? "").components(separatedBy: "$$$").enumerated() {
@@ -247,6 +260,9 @@ public struct CatalogPage: Sendable {
     public let videos: [Video]
     public let pageCount: Int
     public let filters: [String: [CategoryFilter]]
+    public init(categories: [Category] = [], videos: [Video], pageCount: Int = 1, filters: [String: [CategoryFilter]] = [:]) {
+        self.categories = categories; self.videos = videos; self.pageCount = max(1, pageCount); self.filters = filters
+    }
     public init(json: [String: JSONValue], origin: URL, categoryID: String? = nil) {
         let filters = CategoryFilter.all(json["filters"] ?? json["filter"], categoryID: categoryID)
         self.filters = filters
@@ -260,11 +276,12 @@ public struct CatalogPage: Sendable {
             return Video(json: fields, origin: origin)
         }
         videos = directories + (json["list"]?.array ?? []).compactMap { $0.object.flatMap { Video(json: $0, origin: origin) } }
-        pageCount = max(1, json["pagecount"]?.int ?? 1)
+        pageCount = max(1, json["pagecount"]?.int ?? json["page"]?.object?["pagecount"]?.int ?? 1)
     }
 }
 
 public struct CatalogClient: Sendable {
+    var iptvHTTP: IPTVPlatformHTTP?
     public let site: Site
     public let origin: URL
     public let http: HTTPClient
@@ -323,21 +340,26 @@ public struct CatalogClient: Sendable {
         guard let url = parts.url else { throw TVError.invalidURL }
         return url
     }
-    /// Every answer, or failure, feeds the source's `SourceHealth`.
-    private func request(_ params: [String: String]) async throws -> [String: JSONValue] {
+    /// Global search records its selected answer (including its own deadline) once. Other
+    /// catalog requests record their health here.
+    private func request(_ params: [String: String], recordHealth: Bool = true) async throws -> [String: JSONValue] {
         let started = ContinuousClock.now
         do {
             let json = try await perform(params)
-            await SourceHealth.shared.record(site, origin: origin, seconds: started.duration(to: .now).seconds, error: nil)
+            try Task.checkCancellation()
+            if recordHealth {
+                await SourceHealth.shared.record(site, origin: origin, seconds: started.duration(to: .now).seconds, error: nil)
+            }
             return json
         } catch {
-            if !Task.isCancelled {
+            if recordHealth, !Task.isCancelled {
                 await SourceHealth.shared.record(site, origin: origin, seconds: started.duration(to: .now).seconds, error: error)
             }
             throw error
         }
     }
     private func perform(_ params: [String: String]) async throws -> [String: JSONValue] {
+        if let iptvHTTP { return try await iptvHTTP.send(params, client: self) }
         if site.isCloudFiles { return try await CloudFilesSource.request(site, params: params) }
         // Yingxia's own sources run in-process on every platform, the Mac's included.
         if site.runsInProcess {
@@ -409,8 +431,9 @@ public struct CatalogClient: Sendable {
                 throw crashed
             }
         }
-        let (data, _) = try await http.get(requestURL(params), headers: site.raw["header"]?.object?.compactMapValues(\.string) ?? [:])
-        do { return try JSONDecoder().decode([String: JSONValue].self, from: data) }
+        let (data, _) = try await http.get(requestURL(params), headers: site.raw["header"]?.object?.compactMapValues(\.string) ?? [:],
+                                         maximumBytes: params["wd"] == nil ? BoundedHTTPData.catalogBytes : BoundedHTTPData.searchBytes)
+        do { return try await CatalogResponseParser.decode(data, maximumBytes: params["wd"] == nil ? BoundedHTTPData.catalogBytes : BoundedHTTPData.searchBytes) }
         catch {
             // Dead or bot-protected sites answer with a web page; say that rather than a decoding error.
             let start = String(decoding: data.prefix(512), as: UTF8.self).lowercased()
@@ -468,19 +491,19 @@ public struct CatalogClient: Sendable {
         let json = try await homeJSON()
         var seen = Set<String>()
         let items = (json["list"]?.array ?? []).compactMap { entry in
-            entry.object.flatMap { Recommendation(json: $0, origin: origin, isIndex: (site.raw["indexs"]?.int ?? 0) == 1) }
+            entry.object.flatMap { Recommendation(json: $0, origin: origin, isIndex: site.isIndexSource) }
         }.filter { seen.insert($0.id).inserted }
         return (items, CatalogPage(json: json, origin: origin).categories)
     }
     /// A search (`query`) or one page of a category, narrowed by the category's filter `choices` (key to value).
-    public func list(category: String?, query: String, page: Int, filters choices: [String: String] = [:]) async throws -> CatalogPage {
+    public func list(category: String?, query: String, page: Int, filters choices: [String: String] = [:], recordHealth: Bool = true) async throws -> CatalogPage {
         var params = ["pg": String(page)]
         if !query.isEmpty { params["wd"] = query; params["quick"] = "false" }
         else {
             params["ac"] = "detail"; params["t"] = category
             params.merge(Self.filterParameters(choices, siteType: site.type)) { _, new in new }
         }
-        return CatalogPage(json: try await request(params), origin: origin, categoryID: category)
+        return CatalogPage(json: try await request(params, recordHealth: recordHealth), origin: origin, categoryID: category)
     }
 
     /// A category's filter choices as the source reads them, leaving out empty ("全部") values: as other TVBox clients
@@ -543,7 +566,7 @@ public struct CatalogClient: Sendable {
             return Video(id: video.id, name: video.name, poster: video.poster, posterHeaders: video.posterHeaders,
                          year: video.year, remarks: video.remarks, synopsis: video.synopsis, episodes: episodes,
                          category: video.category, action: video.action, folderCategoryID: video.isFolder ? video.folderCategoryID : nil, folderFilters: video.folderFilters,
-                         area: video.area, director: video.director, actor: video.actor)
+                         area: video.area, director: video.director, actor: video.actor, panShare: video.panShare)
         }
         return pushOnlyDetail(input)
     }

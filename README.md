@@ -1,8 +1,16 @@
 # 映匣 Yingxia · iOS
 
-映匣的独立 iOS 源码，面向 iPhone / iPad，最低 iOS 16.2。当前版本为 **1.8.13 / build01**，支持 Python、Node、QuickJS、FFmpeg、KSPlayer、原盘读取和离线语音字幕；iOS 不执行 JVM、JAR 或 DEX。
+映匣的独立 iOS 源码，面向 iPhone / iPad，最低 iOS 16.2。当前版本为 **1.8.13 / build06**，支持 Python、Node、QuickJS、FFmpeg、KSPlayer、原盘读取和离线语音字幕；iOS 不执行 JVM、JAR 或 DEX。
 
-本快照以 2026-11-17 的本地源码和 build01 为基础，包含最新的 Python 自动弹幕、首页轮播后台更新、HTML/Python 列表拖动排序，以及订阅配置网页导出到“文件”的修复。
+本快照于 **2026-11-23** 更新，与当前 build06 对应的维护源码同步。主要更新包括：
+
+- 全站搜索调度、结果排序、缩略图加载，以及快速详情中的线路和选集。
+- IPTV 频道、节目单和回看，频道面板与节目单的当前位置恢复。
+- 音乐首页恢复、失败音源切换、迷你播放器触摸响应及定时关闭。
+- 视频缓存预读、缓存时间区间显示、长按倍速恢复与播放器状态处理。
+- 漫画订阅与网页登录，图片阅读的滑动／翻页、单列／双列及阅读位置恢复。
+
+保留此前的 Python 自动弹幕、首页轮播后台更新、HTML/Python 列表排序和订阅配置导出。
 
 ## 内容
 
@@ -14,7 +22,7 @@
 - `Services/`、`website/`：可选服务和介绍网站；不参与 iOS IPA 编译。
 - `SOURCE-MANIFEST.json`：本次源码清单与 SHA-256。
 
-当前包不携带个人订阅、账号数据、API 凭据、签名证书、Git 历史、已编译 App 或大型依赖归档。先准备依赖，再编译 IPA；它不是开箱即编译的离线依赖全集。
+源码目录不包含开发用测试脚本、测试数据、测试说明、QA 启动参数、模拟器探针或 `Docs/`，也不携带个人订阅、账号数据、API 凭据、签名证书、已编译 App 或大型依赖归档。必要的构建说明集中在本 README，依赖的许可证与来源说明保留。先准备依赖，再编译 IPA；它不是开箱即编译的离线依赖全集。
 
 ## 编译环境
 
@@ -49,19 +57,19 @@ python3 Scripts/prepare-ios-dependencies.py --av3a-archive /path/to/av3a-pinned-
 ## 构建 IPA
 
 ```sh
-python3 Scripts/build-ios-ipa.py --check --build-number 1
-python3 Scripts/build-ios-ipa.py --build-number 1
+python3 Scripts/build-ios-ipa.py --check --build-number 6
+python3 Scripts/build-ios-ipa.py --build-number 6
 ```
 
 构建目标为 `TVBox-iOS`，Release，`generic/platform=iOS`，arm64，iPhone/iPad，最低 iOS 16.2。只检查条件时使用 `--check`，并行度可用 `--jobs 4` 调整。
 
-输出为未签名 IPA。构建号从 1 开始，文件名至少保留两位：
+输出为未签名 IPA。本快照的构建号为 6，文件名至少保留两位：
 
 ```text
-artifacts/latest/Yingxia-1.8.13-build01-iOS16.2-NoJava-unsigned.ipa
+artifacts/latest/Yingxia-1.8.13-build06-iOS16.2-NoJava-unsigned.ipa
 ```
 
-已有最新交付记录时，不指定 `--build-number` 会在它的基础上递增。只有归档、源码一致性、原生依赖、部署信息、Java 排除、ZIP 和校验和检查通过后，才更新 `artifacts/latest/`。安装需要自行签名。
+首次构建不指定 `--build-number` 时采用 `project.yml` 的构建号 6；已有最新交付记录时，在记录的构建号基础上递增。只有归档、源码一致性、原生依赖、部署信息、Java 排除、ZIP 和校验和检查通过后，才更新 `artifacts/latest/`。安装需要自行签名。
 
 工程文件和依赖缓存均为本机生成内容；保留 `Package.resolved`，通过脚本生成工程即可。构建工具能够从普通解压目录读取源码，不依赖父目录或既有 `.git` 历史。
 

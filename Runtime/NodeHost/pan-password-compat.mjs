@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createRequire, Module } from 'node:module';
 import { adaptProxyStartupBundle } from './proxy-startup.mjs';
+import { adaptBiliOfficialBundle } from './bili-official-quality.mjs';
 
 // This subscribed version drops independent share codes in three parsers. Keep
 // its files/checksums intact and use its own listing/playback APIs after parsing
@@ -35,8 +36,9 @@ export function loadPanPasswordBundle(bundle) {
   const original = fs.readFileSync(filename, 'utf8');
   const passwords = adaptPanPasswordBundle(original);
   const startup = adaptProxyStartupBundle(original);
-  const adapted = passwords.applied ? passwords : startup;
-  if (!adapted.applied) return require(filename);
+  const existing = passwords.applied ? passwords : startup;
+  const adapted = adaptBiliOfficialBundle(original, existing.source);
+  if (!existing.applied && !adapted.applied) return require(filename);
   const loaded = new Module(filename);
   loaded.filename = filename;
   loaded.paths = Module._nodeModulePaths(path.dirname(filename));

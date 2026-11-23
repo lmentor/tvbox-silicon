@@ -10,6 +10,7 @@ import { pushPlayBody, pushSupportResult, sourcePushPlayback } from './push-play
 import { BundleWorker } from './bundle-worker.mjs';
 import { BundlePool } from './bundle-pool.mjs';
 import { SourceFence } from './source-fence.mjs';
+import { sourceWebsite } from './source-website.mjs';
 import { setProxy } from './agents.mjs';
 import { request } from './http-request.mjs';
 import { installDiagnostics, log, thrownText } from './diagnostics.mjs';
@@ -307,7 +308,7 @@ async function shareAccounts(instance, accountsFile, profile) {
 async function sendFresh(send, route, body) {
     const started = Date.now();
     try { return await send(route, body); } catch (error) {
-        if (error.status !== 500 || !/socket hang up|ECONNRESET|EPIPE/.test(error.message) || Date.now() - started > 2500) throw error;
+        if (route.endsWith('/search') || error.status !== 500 || !/socket hang up|ECONNRESET|EPIPE/.test(error.message) || Date.now() - started > 2500) throw error;
         log('CATPAW_RETRY', route, error.message);
         return send(route, body);
     }
@@ -319,7 +320,8 @@ async function call(instance, params, signal, searchOperation) {
         await instance.update({ danmakuOwner: params.catDanmakuOwner });
     }
     const send = async (route, body) => {
-        const headers = 'wd' in params ? { 'x-yingxia-search': '1', 'x-yingxia-search-operation': searchOperation } : {};
+        const headers = 'wd' in params ? { 'x-yingxia-search': '1' } : {};
+        if (searchOperation) headers['x-yingxia-search-operation'] = searchOperation;
         if (params.catDanmakuOwner) headers['x-wincat-play-session'] = params.catDanmakuOwner;
         const init = body === undefined ? { headers } : { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(body) };
         const ask = () => instance.alive(request(`http://127.0.0.1:${instance.port}${route}`, { ...init,
@@ -352,7 +354,16 @@ async function call(instance, params, signal, searchOperation) {
     if (params.catWebsite) {
         // Wake/rebind the current bundle before returning the port used by the in-app web view.
         await send('/config');
-        return { result: JSON.stringify({ url: `http://127.0.0.1:${instance.port}/website` }) };
+        const base = `http://127.0.0.1:${instance.port}`;
+        if (instance.websiteBase !== base) {
+            const website = await instance.alive(sourceWebsite(base, {
+                signal: signal ? AbortSignal.any([signal, instance.controller.signal]) : instance.controller.signal,
+                headers: { 'user-agent': 'okhttp/4.12.0' },
+            }));
+            if (website) { instance.websiteBase = base; instance.website = website; }
+            else { instance.websiteBase = undefined; instance.website = ''; }
+        }
+        return { result: JSON.stringify({ url: instance.website || '' }) };
     }
     if (params.catDanmakuRoute) {
         const route = params.catDanmakuRoute;
@@ -496,7 +507,8 @@ const control = http.createServer(async (req, res) => {
             return;
         }
         if (typeof input.service === 'string') {
-            reply({ serviceResult: await mediaServices.dispatch(input.service, input.params || {}, input.operationId) });
+            if (input.operationId) finishSource = sourceFence.begin(input.operationId, controller);
+            reply({ serviceResult: await mediaServices.dispatch(input.service, input.params || {}, input.operationId, controller.signal) });
             return;
         }
         if (input.relocate) { reply({ result: await relocate(String(input.relocate)) }); return; }
@@ -505,7 +517,7 @@ const control = http.createServer(async (req, res) => {
         const key = JSON.stringify([input.bundle, input.profile]);
         const params = input.params || {};
         const releaseSearch = 'wd' in params ? await bundlePool.acquireSearch(key, controller.signal) : null;
-        const searchOperation = releaseSearch ? crypto.randomUUID() : null;
+        const searchOperation = input.operationId || releaseSearch ? crypto.randomUUID() : null;
         let lease;
         try {
             lease = await bundlePool.acquire(key, evict => start(input, evict), controller.signal);
@@ -516,7 +528,7 @@ const control = http.createServer(async (req, res) => {
             controller.signal.throwIfAborted();
             reply(await call(instance, params, controller.signal, searchOperation));
         } finally {
-            if (releaseSearch && lease && !lease.instance.closed) await lease.instance.waitForSearchIdle(searchOperation);
+            if (searchOperation && lease && !lease.instance.closed) await lease.instance.waitForSearchIdle(searchOperation);
             releaseSearch?.();
             await lease?.release();
         }
